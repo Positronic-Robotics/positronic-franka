@@ -40,9 +40,7 @@ pybind11_add_module(_franka
 target_include_directories(_franka PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(_franka PRIVATE Franka::Franka Eigen3::Eigen ruckig::ruckig)
 
-install(TARGETS _franka LIBRARY DESTINATION "positronic_franka")
-
-install(FILES
-    python/positronic_franka/__init__.py
-    DESTINATION "positronic_franka"
-)
+install(TARGETS _franka
+        LIBRARY DESTINATION "positronic/drivers/roboarm"
+        RUNTIME DESTINATION "positronic/drivers/roboarm"
+        ARCHIVE DESTINATION "positronic/drivers/roboarm")
