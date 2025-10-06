@@ -27,7 +27,15 @@ PYBIND11_MODULE(_franka, m) {
       .def_property_readonly(
           "end_effector_pose",
           [](const positronic_franka::State& s) { return s.end_effector_pose; },
-          "End-effector pose in robot frame as (tx,ty,tz,qw,qx,qy,qz)");
+          "End-effector pose in robot frame as (tx,ty,tz,qw,qx,qy,qz)")
+      .def_property_readonly(
+          "error",
+          [](const positronic_franka::State& s) { return s.error; },
+          "1 if robot reports any current error flags else 0")
+      .def_property_readonly(
+          "ee_wrench",
+          [](const positronic_franka::State& s) { return s.end_effector_wrench; },
+          "External wrench on stiffness frame (Fx,Fy,Fz,Mx,My,Mz)");
 
   py::class_<positronic_franka::Robot>(m, "Robot")
       .def(py::init<const std::string&, franka::RealtimeConfig, double>(),

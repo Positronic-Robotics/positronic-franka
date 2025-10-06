@@ -28,6 +28,7 @@ constexpr std::array<double, 7> PANDA_BASE_JERK_LIMITS = {5000.0, 5000.0, 5000.0
 
 // Common Eigen aliases
 using Vector7d = Eigen::Matrix<double, 7, 1>;
+using Vector6d = Eigen::Matrix<double, 6, 1>;
 using SpatialJacobian = Eigen::Matrix<double, 6, 7>;
 
 struct State {
@@ -35,6 +36,9 @@ struct State {
   Vector7d dq;
   // End-effector pose in base (robot) frame: [tx, ty, tz, qw, qx, qy, qz]
   Vector7d end_effector_pose;
+  int error = 0;
+  // External wrench (force, torque) on end-effector frame expressed in K frame.
+  Vector6d end_effector_wrench = Vector6d::Zero();
 };
 
 class Robot {
@@ -66,6 +70,9 @@ class Robot {
     st.q = Eigen::Map<const Vector7d>(rs.q.data());
     st.dq = Eigen::Map<const Vector7d>(rs.dq.data());
     st.end_effector_pose << t.x(), t.y(), t.z(), q.w(), q.x(), q.y(), q.z();
+    st.error = rs.current_errors ? 1 : 0;
+    // NOTE: This relies on the fact that we don't configure EE_T_K frame.
+    st.end_effector_wrench = Eigen::Map<const Vector6d>(rs.K_F_ext_hat_K.data());
     return st;
   }
 
