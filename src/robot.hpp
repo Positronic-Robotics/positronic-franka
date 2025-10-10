@@ -79,6 +79,10 @@ class Robot {
   void set_target_joints(const Eigen::Ref<const Vector7d>& q_target,
                          bool asynchronous = true) {
     if (!control_running_.load()) {
+      if (control_thread_.joinable()) {
+        control_thread_.join();
+      }
+      stop_requested_.store(false);
       control_running_.store(true);
       control_thread_ = std::thread([this] { this->run_joint_position_control_(); });
     }
