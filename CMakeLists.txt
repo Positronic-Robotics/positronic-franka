@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.15)
+cmake_minimum_required(VERSION 3.18)
 
 project(positronic_franka LANGUAGES CXX)
 
@@ -11,6 +11,7 @@ if (NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/external/pybind11/CMakeLists.txt")
 endif()
 set(PYBIND11_FINDPYTHON NEW)
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/external/pybind11)
+include(FetchContent)
 find_package(Franka CONFIG REQUIRED)
 find_package(Eigen3 CONFIG REQUIRED)
 
@@ -32,13 +33,41 @@ else()
   message(FATAL_ERROR "Ruckig not found. Expected at '${CMAKE_CURRENT_SOURCE_DIR}/external/ruckig'.")
 endif()
 
+set(OSQP_BUILD_SHARED_LIB OFF CACHE BOOL "" FORCE)
+set(OSQP_BUILD_STATIC_LIB ON CACHE BOOL "" FORCE)
+set(OSQP_ENABLE_DERIVATIVES OFF CACHE BOOL "" FORCE)
+set(OSQP_BUILD_UNITTESTS OFF CACHE BOOL "" FORCE)
+set(OSQP_BUILD_BENCHMARK OFF CACHE BOOL "" FORCE)
+set(OSQP_CODEGEN OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(osqp
+  GIT_REPOSITORY https://github.com/osqp/osqp.git
+  GIT_TAG v0.6.3
+  GIT_SHALLOW TRUE
+)
+FetchContent_MakeAvailable(osqp)
+
 pybind11_add_module(_franka
     src/bindings.cpp
     src/robot.hpp
 )
 
-target_include_directories(_franka PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_link_libraries(_franka PRIVATE Franka::Franka Eigen3::Eigen ruckig::ruckig)
+target_include_directories(_franka PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${osqp_SOURCE_DIR}/include
+    ${osqp_BINARY_DIR}/include
+)
+target_link_libraries(_franka PRIVATE Franka::Franka Eigen3::Eigen ruckig::ruckig osqpstatic)
+
+add_executable(ik_verifier
+    tests/ik_verifier.cpp
+    src/robot.hpp
+)
+target_include_directories(ik_verifier PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${osqp_SOURCE_DIR}/include
+    ${osqp_BINARY_DIR}/include
+)
+target_link_libraries(ik_verifier PRIVATE Franka::Franka Eigen3::Eigen ruckig::ruckig osqpstatic)
 
 install(TARGETS _franka
         LIBRARY DESTINATION "positronic/drivers/roboarm"
