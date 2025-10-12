@@ -1,10 +1,12 @@
 # Changelog
 
-## [0.2.0] - 2025-10-10
+## [0.2.1] - 2025-10-12
 
 ### Added
-- Fix control thread restart after reflex abort
+- Implement IK that respects robot limits in a hard way.
 
+### Fixed
+- Fix control thread restart after reflex abort
 
 ## [0.2.0] - 2025-10-07
 
