@@ -145,7 +145,9 @@ class Robot {
       int line_search_max_steps = 20) {
     // Target
     const Eigen::Vector3d t_tgt = target_pose_wxyz.head<3>();
-    const Eigen::Quaterniond q_tgt(target_pose_wxyz(3), target_pose_wxyz(4), target_pose_wxyz(5), target_pose_wxyz(6));
+    Eigen::Quaterniond q_tgt(target_pose_wxyz(3), target_pose_wxyz(4), target_pose_wxyz(5), target_pose_wxyz(6));
+    q_tgt.normalize();
+    const Eigen::Matrix3d R_tgt = q_tgt.toRotationMatrix();
 
     // Base state for frames (F_T_EE, EE_T_K). We'll vary q only.
     franka::RobotState base = read_robot_state_();
@@ -158,7 +160,7 @@ class Robot {
 
       // Pose and error
       const Eigen::Matrix4d T_cur = ee_pose_matrix_(st);
-      const Eigen::Matrix<double, 6, 1> e = cartesian_error_(T_cur, t_tgt, q_tgt);
+      const Eigen::Matrix<double, 6, 1> e = cartesian_error_(T_cur, t_tgt, R_tgt);
       const double err_norm = e.norm();
       if (err_norm < tol) break;
 
@@ -177,7 +179,7 @@ class Robot {
         const Vector7d q_trial = q + step * dq;
         st.q = to_std_array7_(q_trial);
         const Eigen::Matrix4d T_trial = ee_pose_matrix_(st);
-        const double err_trial = cartesian_error_(T_trial, t_tgt, q_tgt).norm();
+        const double err_trial = cartesian_error_(T_trial, t_tgt, R_tgt).norm();
         if (err_trial < best_err) {
           best_err = err_trial;
           q = q_trial;
@@ -190,7 +192,7 @@ class Robot {
     // Print final Cartesian error (translation in mm, rotation in degrees) to stderr
     st.q = to_std_array7_(q);
     const Eigen::Matrix4d T_final = ee_pose_matrix_(st);
-    const Eigen::Matrix<double, 6, 1> e_final = cartesian_error_(T_final, t_tgt, q_tgt);
+    const Eigen::Matrix<double, 6, 1> e_final = cartesian_error_(T_final, t_tgt, R_tgt);
     const double trans_err_mm = 1000.0 * e_final.head<3>().norm();
     const double rot_err_deg = (180.0 / M_PI) * e_final.tail<3>().norm();
     return q;
@@ -218,8 +220,10 @@ class Robot {
     static_cast<void>(line_search_max_steps);
 
     const Eigen::Vector3d t_tgt = target_pose_wxyz.head<3>();
-    const Eigen::Quaterniond q_tgt(target_pose_wxyz(3), target_pose_wxyz(4), target_pose_wxyz(5),
-                                   target_pose_wxyz(6));
+    Eigen::Quaterniond q_tgt(target_pose_wxyz(3), target_pose_wxyz(4), target_pose_wxyz(5),
+                             target_pose_wxyz(6));
+    q_tgt.normalize();
+    const Eigen::Matrix3d R_tgt = q_tgt.toRotationMatrix();
 
     franka::RobotState base = read_robot_state_();
     franka::RobotState st = base;
@@ -253,7 +257,7 @@ class Robot {
     for (int it = 0; it < max_iters; ++it) {
       st.q = to_std_array7_(q);
       const Eigen::Matrix4d T_cur = ee_pose_matrix_(st);
-      const Eigen::Matrix<double, 6, 1> e = cartesian_error_(T_cur, t_tgt, q_tgt);
+      const Eigen::Matrix<double, 6, 1> e = cartesian_error_(T_cur, t_tgt, R_tgt);
       const double err_norm = e.norm();
       if (err_norm < tol)
         break;
@@ -428,7 +432,7 @@ class Robot {
 
     st.q = to_std_array7_(q);
     const Eigen::Matrix4d T_final = ee_pose_matrix_(st);
-    const Eigen::Matrix<double, 6, 1> e_final = cartesian_error_(T_final, t_tgt, q_tgt);
+    const Eigen::Matrix<double, 6, 1> e_final = cartesian_error_(T_final, t_tgt, R_tgt);
     const double trans_err_mm = 1000.0 * e_final.head<3>().norm();
     const double rot_err_deg = (180.0 / M_PI) * e_final.tail<3>().norm();
     static_cast<void>(trans_err_mm);
@@ -457,11 +461,11 @@ private:
 
   static Eigen::Matrix<double, 6, 1> cartesian_error_(const Eigen::Matrix4d& T_cur,
                                                       const Eigen::Vector3d& t_tgt,
-                                                      const Eigen::Quaterniond& q_tgt) {
+                                                      const Eigen::Matrix3d& R_tgt) {
     const Eigen::Vector3d t_cur = T_cur.block<3, 1>(0, 3);
     const Eigen::Matrix3d R_cur = T_cur.block<3, 3>(0, 0);
     const Eigen::Vector3d e_pos = t_cur - t_tgt;
-    const Eigen::Matrix3d R_rel = R_cur.transpose() * q_tgt.toRotationMatrix();
+    const Eigen::Matrix3d R_rel = R_cur.transpose() * R_tgt;
     const Eigen::AngleAxisd aa(R_rel);
     const Eigen::Vector3d w = aa.angle() * aa.axis();
     const Eigen::Vector3d e_rot = -R_cur * w;
