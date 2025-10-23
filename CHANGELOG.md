@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.2.2] - 2025-10-23
+
+### Fixed
+- Normalise quaternion before solving IK. Minor performance optimisation.
+
 ## [0.2.1] - 2025-10-12
 
 ### Added
