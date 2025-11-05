@@ -70,6 +70,10 @@ target_include_directories(ik_verifier PRIVATE
 target_link_libraries(ik_verifier PRIVATE Franka::Franka Eigen3::Eigen ruckig::ruckig osqpstatic)
 
 install(TARGETS _franka
-        LIBRARY DESTINATION "positronic/drivers/roboarm"
-        RUNTIME DESTINATION "positronic/drivers/roboarm"
-        ARCHIVE DESTINATION "positronic/drivers/roboarm")
+        LIBRARY DESTINATION "positronic_franka"
+        RUNTIME DESTINATION "positronic_franka"
+        ARCHIVE DESTINATION "positronic_franka")
+
+# Install package __init__.py
+install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/python/positronic_franka/__init__.py"
+        DESTINATION "positronic_franka")
