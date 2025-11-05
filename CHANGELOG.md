@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.0] - 2025-11-05
+
+### Changed
+- **BREAKING**: Package now installs under `positronic_franka` namespace instead of `positronic.drivers.roboarm`
+- This eliminates namespace package complexity and makes the package structure cleaner and more maintainable
+- Import path changed from `from positronic.drivers.roboarm import _franka` to `import positronic_franka._franka`
+
 ## [0.2.2] - 2025-10-23
 
 ### Fixed
