@@ -44,8 +44,88 @@ struct State {
   // End-effector pose in base (robot) frame: [tx, ty, tz, qw, qx, qy, qz]
   Vector7d end_effector_pose;
   int error = 0;
+  std::string error_message;
   // External wrench (force, torque) on end-effector frame expressed in K frame.
   Vector6d end_effector_wrench = Vector6d::Zero();
+};
+
+// Smooth trajectory generator that tracks real elapsed time.
+// Uses Ruckig for trajectory computation but evaluates positions at actual
+// wall-clock offsets (from libfranka's period) rather than fixed 1ms steps.
+// This prevents velocity/acceleration discontinuity errors under non-RT scheduling.
+class TrajectoryGenerator {
+ public:
+  static constexpr double NOMINAL_DT = 1.0 / 1000.0;
+
+  explicit TrajectoryGenerator(double dynamics_factor) {
+    input_.synchronization = ruckig::Synchronization::Time;
+    input_.target_velocity.fill(0.0);
+    input_.target_acceleration.fill(0.0);
+    for (size_t i = 0; i < 7; ++i) {
+      input_.max_velocity[i] = PANDA_BASE_VELOCITY_LIMITS[i] * dynamics_factor;
+      input_.max_acceleration[i] = PANDA_BASE_ACCELERATION_LIMITS[i] * dynamics_factor;
+      input_.max_jerk[i] = PANDA_BASE_JERK_LIMITS[i] * dynamics_factor;
+    }
+  }
+
+  void initialize(const franka::RobotState& st) {
+    for (size_t i = 0; i < 7; ++i) {
+      input_.current_position[i] = st.q[i];
+      input_.current_velocity[i] = st.dq[i];
+      input_.current_acceleration[i] = 0.0;
+      input_.target_position[i] = st.q[i];
+    }
+    replan_();
+  }
+
+  void set_target(const Vector7d& target) {
+    for (size_t i = 0; i < 7; ++i) input_.target_position[i] = target[i];
+    replan_();
+  }
+
+  void stop_at_current() {
+    input_.target_position = input_.current_position;
+    replan_();
+  }
+
+  // Advance trajectory by actual elapsed time and return the position.
+  std::array<double, 7> step(franka::Duration period) {
+    double dt = period.toSec();
+    if (dt <= 0.0) dt = NOMINAL_DT;
+    cumulative_time_ += dt;
+
+    double t = std::min(cumulative_time_, duration_);
+    std::array<double, 7> pos, vel, acc;
+    trajectory_.at_time(t, pos, vel, acc);
+
+    input_.current_position = pos;
+    input_.current_velocity = vel;
+    input_.current_acceleration = acc;
+
+    if (cumulative_time_ >= duration_) active_ = false;
+    return pos;
+  }
+
+  bool active() const { return active_; }
+
+ private:
+  void replan_() {
+    auto result = otg_.calculate(input_, trajectory_);
+    if (result < 0) {
+      std::cerr << "Ruckig trajectory planning failed (error " << static_cast<int>(result) << ")" << std::endl;
+      return;
+    }
+    cumulative_time_ = 0.0;
+    duration_ = trajectory_.get_duration();
+    active_ = true;
+  }
+
+  ruckig::Ruckig<7> otg_{NOMINAL_DT};
+  ruckig::InputParameter<7> input_;
+  ruckig::Trajectory<7> trajectory_;
+  double cumulative_time_ = 0.0;
+  double duration_ = 0.0;
+  bool active_ = false;
 };
 
 class Robot {
@@ -76,6 +156,9 @@ class Robot {
     st.dq = Eigen::Map<const Vector7d>(rs.dq.data());
     st.end_effector_pose << t.x(), t.y(), t.z(), q.w(), q.x(), q.y(), q.z();
     st.error = rs.current_errors ? 1 : 0;
+    if (st.error) {
+      st.error_message = static_cast<std::string>(rs.current_errors);
+    }
     // NOTE: This relies on the fact that we don't configure EE_T_K frame.
     st.end_effector_wrench = Eigen::Map<const Vector6d>(rs.K_F_ext_hat_K.data());
     return st;
@@ -486,87 +569,53 @@ private:
  private:
   void run_joint_position_control_() {
     try {
-      // Initialize Ruckig OTG
-      constexpr double control_rate_hz = 1000.0;
-      ruckig::Ruckig<7> otg(1.0 / control_rate_hz);
-      ruckig::InputParameter<7> ip;
-      ruckig::OutputParameter<7> op;
-
-      {
-        std::lock_guard<std::mutex> lk(target_mutex_);
-        for (size_t i = 0; i < 7; ++i) ip.target_position[i] = target_q_[i];
-        ip.target_velocity.fill(0.0);
-        ip.target_acceleration.fill(0.0);
-      }
-      // Encourage smooth, time-synchronized motion
-      ip.synchronization = ruckig::Synchronization::Time;
-
-      // Apply scaled limits once; they remain constant for this motion
-      for (size_t i = 0; i < 7; ++i) {
-        ip.max_velocity[i] = PANDA_BASE_VELOCITY_LIMITS[i] * relative_dynamics_factor_;
-        ip.max_acceleration[i] = PANDA_BASE_ACCELERATION_LIMITS[i] * relative_dynamics_factor_;
-        ip.max_jerk[i] = PANDA_BASE_JERK_LIMITS[i] * relative_dynamics_factor_;
-      }
+      TrajectoryGenerator traj(relative_dynamics_factor_);
 
       robot_->control(
         [&, this,
          first = true,
          sync_in_flight = false,
-         stopping = false,
-         result = ruckig::Result::Finished](const franka::RobotState& st, franka::Duration /*period*/) mutable -> franka::JointPositions {
+         stopping = false](const franka::RobotState& st, franka::Duration period) mutable -> franka::JointPositions {
           {
             std::lock_guard<std::mutex> lk(last_state_mutex_);
             last_state_ = std::make_unique<franka::RobotState>(st);
           }
+
           if (first) {
-            for (size_t i = 0; i < 7; ++i) {
-              ip.current_position[i] = st.q[i];
-              ip.current_velocity[i] = st.dq[i];
-              ip.current_acceleration[i] = 0.0;
-              ip.target_position[i] = st.q[i];
-              ip.target_velocity[i] = 0.0;
-            }
-            // It is important to set the result to Working here, so that if robot is in motion, we will safely stop it
-            result = ruckig::Result::Working;
+            traj.initialize(st);
             first = false;
           } else if (!stopping && stop_requested_.load()) {
             stopping = true;
             has_target_.store(false);
-            for (size_t i = 0; i < 7; ++i) {
-              ip.target_position[i] = ip.current_position[i];
-              ip.target_velocity[i] = 0.0;
-              ip.target_acceleration[i] = 0.0;
-            }
-            result = ruckig::Result::Working;
+            traj.stop_at_current();
           }
 
-          if (!stopping && has_target_.load()) {  // Update target if changed
+          if (!stopping && has_target_.load()) {
             std::lock_guard<std::mutex> lk(target_mutex_);
-            for (size_t i = 0; i < 7; ++i) {
-              ip.target_position[i] = target_q_[i];
-            }
-            result = ruckig::Result::Working;
+            traj.set_target(target_q_);
             has_target_.store(false);
             sync_in_flight = sync_request_next_.exchange(false);
           }
 
-          if (result == ruckig::Result::Working) {
-            result = otg.update(ip, op);
-            op.pass_to_input(ip);
-            return franka::JointPositions(op.new_position);;
-          }
-          if (sync_in_flight) {
-            {
-              std::lock_guard<std::mutex> lk(goal_mutex_);
-              goal_completed_ = true;
+          auto pos = traj.step(period);
+
+          if (!traj.active()) {
+            if (sync_in_flight) {
+              {
+                std::lock_guard<std::mutex> lk(goal_mutex_);
+                goal_completed_ = true;
+              }
+              goal_cv_.notify_all();
+              sync_in_flight = false;
             }
-            goal_cv_.notify_all();
-            sync_in_flight = false;
+            if (stopping) {
+              auto cmd = franka::JointPositions(pos);
+              cmd.motion_finished = true;
+              return cmd;
+            }
           }
-          auto cmd = franka::JointPositions(op.new_position);
-          if (stopping)
-            cmd.motion_finished = true;
-          return cmd;
+
+          return franka::JointPositions(pos);
         });
     } catch (const std::exception& e) {
       std::cerr << "Joint control thread error: " << e.what() << std::endl;

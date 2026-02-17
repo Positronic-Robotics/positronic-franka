@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.3.1] - 2026-02-17
+
+### Added
+- Expose `error_message` on `State` — string description of current error flags (e.g. `[cartesian_reflex]`)
+
+### Fixed
+- Replace fixed-timestep Ruckig updates with cumulative wall-clock timing (`TrajectoryGenerator`). Prevents velocity/acceleration discontinuity errors when control thread doesn't run at exactly 1kHz.
+
 ## [0.3.0] - 2025-11-05
 
 ### Changed

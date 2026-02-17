@@ -33,6 +33,10 @@ PYBIND11_MODULE(_franka, m) {
           [](const positronic_franka::State& s) { return s.error; },
           "1 if robot reports any current error flags else 0")
       .def_property_readonly(
+          "error_message",
+          [](const positronic_franka::State& s) { return s.error_message; },
+          "String representation of current error flags, e.g. '[cartesian_reflex]'")
+      .def_property_readonly(
           "ee_wrench",
           [](const positronic_franka::State& s) { return s.end_effector_wrench; },
           "External wrench on stiffness frame (Fx,Fy,Fz,Mx,My,Mz)");
