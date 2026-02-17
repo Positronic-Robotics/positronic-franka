@@ -110,7 +110,11 @@ class TrajectoryGenerator {
 
  private:
   void replan_() {
-    otg_.calculate(input_, trajectory_);
+    auto result = otg_.calculate(input_, trajectory_);
+    if (result < 0) {
+      std::cerr << "Ruckig trajectory planning failed (error " << static_cast<int>(result) << ")" << std::endl;
+      return;
+    }
     cumulative_time_ = 0.0;
     duration_ = trajectory_.get_duration();
     active_ = true;
