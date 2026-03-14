@@ -658,6 +658,10 @@ private:
     robot_->setLoad(mass, F_x_Cload, I_x_Cload);
   }
 
+  std::string getRobotModel() {
+    return robot_->getRobotModel();
+  }
+
   bool recover_from_errors() {
     stop_control_loop_();
     stop_requested_.store(false);
