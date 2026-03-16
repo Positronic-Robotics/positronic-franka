@@ -667,7 +667,7 @@ private:
     // This accounts for the mounted gripper/tool and is used by libfranka's
     // model->pose(kEndEffector) for FK and IK. The base URDF from
     // robot->getRobotModel() only describes kinematics up to the flange
-    // (panda_link8), so we append a fixed joint + link to complete the chain.
+    // (link8), so we append a fixed joint + link to complete the chain.
     auto state = read_robot_state_();
     Eigen::Map<const Eigen::Matrix4d> F_T_EE(state.F_T_EE.data());
     const Eigen::Vector3d t = F_T_EE.block<3, 1>(0, 3);
@@ -676,6 +676,21 @@ private:
     // URDF fixed-axis RPY (extrinsic XYZ = intrinsic ZYX reversed)
     const Eigen::Vector3d zyx = R.eulerAngles(2, 1, 0);
     const double roll = zyx(2), pitch = zyx(1), yaw = zyx(0);
+
+    // Find the flange link name dynamically (last <link name="..."> before </robot>).
+    // Panda URDFs use "panda_link8", FR3 URDFs use "link8".
+    std::string flange_link = "link8";
+    auto robot_end = urdf.rfind("</robot>");
+    if (robot_end != std::string::npos) {
+      auto last_link = urdf.rfind("<link name=\"", robot_end);
+      if (last_link != std::string::npos) {
+        auto name_start = last_link + 12;  // length of '<link name="'
+        auto name_end = urdf.find('"', name_start);
+        if (name_end != std::string::npos) {
+          flange_link = urdf.substr(name_start, name_end - name_start);
+        }
+      }
+    }
 
     std::ostringstream snippet;
     snippet << std::setprecision(10)
@@ -687,15 +702,14 @@ private:
             << "       matches the full kinematic chain used by the driver's runtime IK. -->\n"
             << "  <link name=\"end_effector\"/>\n"
             << "  <joint name=\"flange_to_end_effector\" type=\"fixed\">\n"
-            << "    <parent link=\"panda_link8\"/>\n"
+            << "    <parent link=\"" << flange_link << "\"/>\n"
             << "    <child link=\"end_effector\"/>\n"
             << "    <origin xyz=\"" << t.x() << " " << t.y() << " " << t.z() << "\""
             << " rpy=\"" << roll << " " << pitch << " " << yaw << "\"/>\n"
             << "  </joint>\n";
 
-    auto pos = urdf.rfind("</robot>");
-    if (pos != std::string::npos) {
-      urdf.insert(pos, snippet.str());
+    if (robot_end != std::string::npos) {
+      urdf.insert(robot_end, snippet.str());
     }
     return urdf;
   }
