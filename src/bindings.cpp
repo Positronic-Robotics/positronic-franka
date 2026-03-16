@@ -124,5 +124,5 @@ PYBIND11_MODULE(_franka, m) {
       .def("recover_from_errors", &positronic_franka::Robot::recover_from_errors,
            "Stop active control and attempt libfranka automaticErrorRecovery(); returns True if cleared")
       .def("get_robot_model", [](positronic_franka::Robot& r) { return r.getRobotModel(); },
-           "Return MuJoCo XML model of the robot for offline IK computation");
+           "Return URDF of the robot with F_T_EE (end-effector frame) appended for offline IK");
 }

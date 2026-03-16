@@ -8,7 +8,9 @@
 #include <array>
 #include <cmath>
 #include <algorithm>
+#include <iomanip>
 #include <iostream>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <atomic>
@@ -659,7 +661,43 @@ private:
   }
 
   std::string getRobotModel() {
-    return robot_->getRobotModel();
+    std::string urdf = robot_->getRobotModel();
+
+    // Read F_T_EE (flange-to-end-effector transform) from current robot state.
+    // This accounts for the mounted gripper/tool and is used by libfranka's
+    // model->pose(kEndEffector) for FK and IK. The base URDF from
+    // robot->getRobotModel() only describes kinematics up to the flange
+    // (panda_link8), so we append a fixed joint + link to complete the chain.
+    auto state = read_robot_state_();
+    Eigen::Map<const Eigen::Matrix4d> F_T_EE(state.F_T_EE.data());
+    const Eigen::Vector3d t = F_T_EE.block<3, 1>(0, 3);
+    const Eigen::Matrix3d R = F_T_EE.block<3, 3>(0, 0);
+
+    // URDF fixed-axis RPY (extrinsic XYZ = intrinsic ZYX reversed)
+    const Eigen::Vector3d zyx = R.eulerAngles(2, 1, 0);
+    const double roll = zyx(2), pitch = zyx(1), yaw = zyx(0);
+
+    std::ostringstream snippet;
+    snippet << std::setprecision(10)
+            << "\n"
+            << "  <!-- WARNING: This link and joint were appended by positronic-franka,\n"
+            << "       NOT part of the original URDF from libfranka getRobotModel().\n"
+            << "       They encode F_T_EE (flange-to-end-effector transform) read from\n"
+            << "       franka::RobotState at the time of this call, so that the URDF\n"
+            << "       matches the full kinematic chain used by the driver's runtime IK. -->\n"
+            << "  <link name=\"end_effector\"/>\n"
+            << "  <joint name=\"flange_to_end_effector\" type=\"fixed\">\n"
+            << "    <parent link=\"panda_link8\"/>\n"
+            << "    <child link=\"end_effector\"/>\n"
+            << "    <origin xyz=\"" << t.x() << " " << t.y() << " " << t.z() << "\""
+            << " rpy=\"" << roll << " " << pitch << " " << yaw << "\"/>\n"
+            << "  </joint>\n";
+
+    auto pos = urdf.rfind("</robot>");
+    if (pos != std::string::npos) {
+      urdf.insert(pos, snippet.str());
+    }
+    return urdf;
   }
 
   bool recover_from_errors() {
