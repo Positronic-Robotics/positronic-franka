@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.4.0] - 2026-03-17
+
+### Added
+- Expose `get_robot_model()` — returns the robot's URDF with `F_T_EE` (flange-to-end-effector transform) baked in as a fixed joint, so the URDF matches the full kinematic chain used by the driver's runtime IK.
+
 ## [0.3.1] - 2026-02-17
 
 ### Added
