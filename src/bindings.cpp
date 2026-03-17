@@ -122,5 +122,7 @@ PYBIND11_MODULE(_franka, m) {
            py::arg("mass"), py::arg("F_x_Cload"), py::arg("I_x_Cload"),
            "Set tool load: mass [kg], center of mass (3,), inertia (row-major 3x3)")
       .def("recover_from_errors", &positronic_franka::Robot::recover_from_errors,
-           "Stop active control and attempt libfranka automaticErrorRecovery(); returns True if cleared");
+           "Stop active control and attempt libfranka automaticErrorRecovery(); returns True if cleared")
+      .def("get_robot_model", [](positronic_franka::Robot& r) { return r.getRobotModel(); },
+           "Return URDF of the robot with F_T_EE (end-effector frame) appended for offline IK");
 }
