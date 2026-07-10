@@ -3,7 +3,7 @@
 ## [0.5.0] - 2026-07-10
 
 ### Added
-- `positronic_franka.desk.Desk` — a Franka Desk web API client for headless control the FCI cannot perform: taking robot control, opening/closing the brakes, activating the FCI, and running the TD2 safety self-test. Used as a context manager it takes control on entry and always releases it on exit, and refuses (rather than force-seizes) control held by another session.
+- `positronic_franka.desk.Desk` — a Franka Desk web API client for headless control the FCI cannot perform: taking robot control, opening/closing the brakes, activating/deactivating the FCI, and running the TD2 safety self-test. Used as a context manager it takes control on entry and always releases it on exit, and refuses (rather than force-seizes) control held by another session.
 
 ## [0.4.0] - 2026-03-17
 

@@ -28,16 +28,19 @@ SELF_TEST_LEAD_SEC = 3600
 # operation, which runs far longer than a normal request.
 _BRAKE_OP_TIMEOUT_SEC = 60.0
 _BRAKE_TIMEOUT_SEC = 20.0
+_FCI_TIMEOUT_SEC = 15.0
 _SELF_TEST_TIMEOUT_SEC = 180.0
 _POLL_INTERVAL_SEC = 0.5
 
-_CONTROL_HELD_MSG = "Another session holds robot control. Open Franka Desk at https://{host}, release control there, then start again."
+_CONTROL_HELD_MSG = (
+    'Another session holds robot control. Open Franka Desk at https://{host}, release control there, then start again.'
+)
 
 
 def encode_password(login: str, password: str) -> str:
     """Encode a Desk password the way the Desk web client does: base64 of the comma-joined sha256 digest bytes."""
-    digest = hashlib.sha256(f"{password}#{login}@franka".encode()).digest()
-    return base64.b64encode(",".join(str(b) for b in digest).encode()).decode()
+    digest = hashlib.sha256(f'{password}#{login}@franka'.encode()).digest()
+    return base64.b64encode(','.join(str(b) for b in digest).encode()).decode()
 
 
 class Desk:
@@ -52,16 +55,12 @@ class Desk:
         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
     def _request(self, method: str, path: str, **kwargs) -> requests.Response:
-        headers = kwargs.pop("headers", {})
-        timeout = kwargs.pop("timeout", self._timeout)
+        headers = kwargs.pop('headers', {})
+        timeout = kwargs.pop('timeout', self._timeout)
         if self._control_token is not None:
-            headers["X-Control-Token"] = self._control_token
+            headers['X-Control-Token'] = self._control_token
         response = self._session.request(
-            method,
-            f"https://{self.host}{path}",
-            headers=headers,
-            timeout=timeout,
-            **kwargs,
+            method, f'https://{self.host}{path}', headers=headers, timeout=timeout, **kwargs
         )
         response.raise_for_status()
         return response
@@ -69,100 +68,103 @@ class Desk:
     def _authenticate(self) -> None:
         encoded = encode_password(self._login, self._password)
         response = self._session.post(
-            f"https://{self.host}/admin/api/login",
-            json={"login": self._login, "password": encoded},
+            f'https://{self.host}/admin/api/login',
+            json={'login': self._login, 'password': encoded},
             timeout=self._timeout,
         )
         response.raise_for_status()
-        self._session.cookies.set("authorization", response.text.strip())
+        self._session.cookies.set('authorization', response.text.strip())
 
     def _take_control(self) -> None:
         # A request made while control is held becomes a pending token that Desk promotes to active once the holder
         # releases, silently transferring control here. Refuse up front if control is held; and if control is taken
         # in the race between that check and our request, drop the pending token rather than keep it.
-        if (
-            self._request("GET", "/admin/api/control-token").json()["activeToken"]
-            is not None
-        ):
+        if self._token_state()['activeToken'] is not None:
             raise RuntimeError(_CONTROL_HELD_MSG.format(host=self.host))
-        request = self._request(
-            "POST",
-            "/admin/api/control-token/request",
-            json={"requestedBy": self._login},
-        ).json()
-        active = self._request("GET", "/admin/api/control-token").json()["activeToken"]
-        if active is None or active["id"] != request["id"]:
+        request = self._request('POST', '/admin/api/control-token/request', json={'requestedBy': self._login}).json()
+        active = self._token_state()['activeToken']
+        if active is None or active['id'] != request['id']:
             self._request(
-                "DELETE",
-                f"/admin/api/control-token/request/{request['id']}",
-                json={"token": request["token"]},
-                headers={"X-Control-Token": request["token"]},
+                'DELETE',
+                f'/admin/api/control-token/request/{request["id"]}',
+                json={'token': request['token']},
+                headers={'X-Control-Token': request['token']},
             )
             raise RuntimeError(_CONTROL_HELD_MSG.format(host=self.host))
-        self._control_token = request["token"]
+        self._control_token = request['token']
 
     def _release_control(self) -> None:
         if self._control_token is None:
             return
-        self._request(
-            "DELETE", "/admin/api/control-token", json={"token": self._control_token}
-        )
+        self._request('DELETE', '/admin/api/control-token', json={'token': self._control_token})
         self._control_token = None
 
+    def _token_state(self) -> dict:
+        return self._request('GET', '/admin/api/control-token').json()
+
     def safety_status(self) -> dict:
-        return self._request("GET", "/admin/api/safety/status").json()
+        return self._request('GET', '/admin/api/safety/status').json()
 
     def _wait_for_brakes(self, state: str) -> None:
         deadline = time.monotonic() + _BRAKE_TIMEOUT_SEC
         while time.monotonic() < deadline:
-            if all(brake == state for brake in self.safety_status()["brakeState"]):
+            if all(brake == state for brake in self.safety_status()['brakeState']):
                 return
             time.sleep(_POLL_INTERVAL_SEC)
-        raise TimeoutError(
-            f"Brakes did not reach {state!r} within {_BRAKE_TIMEOUT_SEC}s"
-        )
+        raise TimeoutError(f'Brakes did not reach {state!r} within {_BRAKE_TIMEOUT_SEC}s')
 
     def open_brakes(self) -> None:
-        self._request("POST", "/desk/api/joints/unlock", timeout=_BRAKE_OP_TIMEOUT_SEC)
-        self._wait_for_brakes("Unlocked")
+        self._request('POST', '/desk/api/joints/unlock', timeout=_BRAKE_OP_TIMEOUT_SEC)
+        self._wait_for_brakes('Unlocked')
 
     def close_brakes(self) -> None:
-        self._request("POST", "/desk/api/joints/lock", timeout=_BRAKE_OP_TIMEOUT_SEC)
-        self._wait_for_brakes("Locked")
+        self._request('POST', '/desk/api/joints/lock', timeout=_BRAKE_OP_TIMEOUT_SEC)
+        self._wait_for_brakes('Locked')
 
     def activate_fci(self) -> None:
+        # Desk acknowledges the POST before FCI mode is actually up; connecting libfranka in that window is
+        # refused, so wait until Desk reports FCI active.
         encoded = base64.b64encode(self._control_token.encode()).decode()
-        self._request("POST", "/desk/api/system/fci", data={"token": encoded})
-
-    def run_self_test(self) -> None:
-        self._request("POST", "/admin/api/safety/td2-tests/execute")
-        deadline = time.monotonic() + _SELF_TEST_TIMEOUT_SEC
+        self._request('POST', '/desk/api/system/fci', data={'token': encoded})
+        deadline = time.monotonic() + _FCI_TIMEOUT_SEC
         while time.monotonic() < deadline:
-            if self.safety_status()["timeToTd2"] > SELF_TEST_LEAD_SEC:
+            if self._token_state()['fciActive']:
                 return
             time.sleep(_POLL_INTERVAL_SEC)
-        raise TimeoutError(
-            f"TD2 self-test did not complete within {_SELF_TEST_TIMEOUT_SEC}s"
-        )
+        raise TimeoutError(f'FCI did not activate within {_FCI_TIMEOUT_SEC}s')
+
+    def deactivate_fci(self) -> None:
+        self._request('DELETE', '/admin/api/control-token/fci', json={'token': self._control_token})
+
+    def run_self_test(self) -> None:
+        self._request('POST', '/admin/api/safety/td2-tests/execute')
+        deadline = time.monotonic() + _SELF_TEST_TIMEOUT_SEC
+        while time.monotonic() < deadline:
+            if self.safety_status()['timeToTd2'] > SELF_TEST_LEAD_SEC:
+                return
+            time.sleep(_POLL_INTERVAL_SEC)
+        raise TimeoutError(f'TD2 self-test did not complete within {_SELF_TEST_TIMEOUT_SEC}s')
 
     def prepare(self) -> None:
         """Run the TD2 self-test if one is due soon, open the brakes, and activate FCI. Requires held control."""
-        if self.safety_status()["timeToTd2"] <= SELF_TEST_LEAD_SEC:
-            logger.info(
-                "TD2 self-test due within %ds, running it now", SELF_TEST_LEAD_SEC
-            )
+        if self.safety_status()['timeToTd2'] <= SELF_TEST_LEAD_SEC:
+            logger.info('TD2 self-test due within %ds, running it now', SELF_TEST_LEAD_SEC)
             self.run_self_test()
         self.open_brakes()
         self.activate_fci()
 
-    def __enter__(self) -> "Desk":
+    def __enter__(self) -> 'Desk':
         self._authenticate()
         self._take_control()
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
+        # Desk refuses task execution (including locking joints) while FCI holds the one-client slot, so FCI must
+        # be deactivated before the brakes can close.
         try:
-            if any(brake == "Unlocked" for brake in self.safety_status()["brakeState"]):
+            if self._token_state()['fciActive']:
+                self.deactivate_fci()
+            if any(brake == 'Unlocked' for brake in self.safety_status()['brakeState']):
                 self.close_brakes()
         finally:
             self._release_control()
