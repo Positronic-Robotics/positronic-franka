@@ -159,8 +159,6 @@ class Desk:
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
-        # Desk refuses task execution (including locking joints) while FCI holds the one-client slot, so FCI must
-        # be deactivated before the brakes can close.
         try:
             if self._token_state()['fciActive']:
                 self.deactivate_fci()
