@@ -1,0 +1,143 @@
+"""Franka Desk web API client for headless brake, FCI, and self-test control.
+
+libfranka (the ``_franka`` bindings) cannot open brakes, activate the FCI, or run the periodic TD2 safety
+self-test; those live only behind Desk's HTTPS/JSON API on the robot's web port. ``Desk`` speaks that API. Used
+as a context manager it takes robot control on entry and always releases it on exit, so a crashed or failing
+session never strands control:
+
+    with Desk(host, login, password) as desk:
+        desk.prepare()  # self-test if due, open brakes, activate FCI
+        ...             # run the arm over libfranka
+"""
+
+import base64
+import hashlib
+import logging
+import time
+
+import requests
+import urllib3
+
+logger = logging.getLogger(__name__)
+
+# The TD2 safety self-test must run every 24h; run it proactively when the next one is due within this window
+# so a session never stalls waiting for a mandatory test mid-run.
+SELF_TEST_LEAD_SEC = 3600
+
+# Unlocking/locking physically releases or engages the 7 joint brakes; Desk holds the POST open for the whole
+# operation, which runs far longer than a normal request.
+_BRAKE_OP_TIMEOUT_SEC = 60.0
+_BRAKE_TIMEOUT_SEC = 20.0
+_SELF_TEST_TIMEOUT_SEC = 180.0
+_POLL_INTERVAL_SEC = 0.5
+
+
+def encode_password(login: str, password: str) -> str:
+    """Encode a Desk password the way the Desk web client does: base64 of the comma-joined sha256 digest bytes."""
+    digest = hashlib.sha256(f'{password}#{login}@franka'.encode()).digest()
+    return base64.b64encode(','.join(str(b) for b in digest).encode()).decode()
+
+
+class Desk:
+    def __init__(self, host: str, login: str, password: str, timeout: float = 10.0):
+        self.host = host
+        self._login = login
+        self._password = password
+        self._timeout = timeout
+        self._session = requests.Session()
+        self._session.verify = False
+        self._control_token: str | None = None
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+    def _request(self, method: str, path: str, **kwargs) -> requests.Response:
+        headers = kwargs.pop('headers', {})
+        timeout = kwargs.pop('timeout', self._timeout)
+        if self._control_token is not None:
+            headers['X-Control-Token'] = self._control_token
+        response = self._session.request(
+            method, f'https://{self.host}{path}', headers=headers, timeout=timeout, **kwargs
+        )
+        response.raise_for_status()
+        return response
+
+    def _authenticate(self) -> None:
+        encoded = encode_password(self._login, self._password)
+        response = self._session.post(
+            f'https://{self.host}/admin/api/login',
+            json={'login': self._login, 'password': encoded},
+            timeout=self._timeout,
+        )
+        response.raise_for_status()
+        self._session.cookies.set('authorization', response.text.strip())
+
+    def _take_control(self) -> None:
+        # Check before requesting: a request made while control is held becomes a pending token that Desk later
+        # promotes to active when the holder releases, silently stealing control. Bail first so we never queue one.
+        if self._request('GET', '/admin/api/control-token').json()['activeToken'] is not None:
+            raise RuntimeError('Another session holds robot control; release it in Franka Desk before starting.')
+        request = self._request('POST', '/admin/api/control-token/request', json={'requestedBy': self._login}).json()
+        self._control_token = request['token']
+
+    def _release_control(self) -> None:
+        if self._control_token is None:
+            return
+        token = self._control_token
+        self._control_token = None
+        self._session.delete(
+            f'https://{self.host}/admin/api/control-token',
+            json={'token': token},
+            headers={'X-Control-Token': token},
+            timeout=self._timeout,
+        ).raise_for_status()
+
+    def safety_status(self) -> dict:
+        return self._request('GET', '/admin/api/safety/status').json()
+
+    def _wait_for_brakes(self, state: str) -> None:
+        deadline = time.monotonic() + _BRAKE_TIMEOUT_SEC
+        while time.monotonic() < deadline:
+            if all(brake == state for brake in self.safety_status()['brakeState']):
+                return
+            time.sleep(_POLL_INTERVAL_SEC)
+        raise TimeoutError(f'Brakes did not reach {state!r} within {_BRAKE_TIMEOUT_SEC}s')
+
+    def open_brakes(self) -> None:
+        self._request('POST', '/desk/api/joints/unlock', timeout=_BRAKE_OP_TIMEOUT_SEC)
+        self._wait_for_brakes('Unlocked')
+
+    def close_brakes(self) -> None:
+        self._request('POST', '/desk/api/joints/lock', timeout=_BRAKE_OP_TIMEOUT_SEC)
+        self._wait_for_brakes('Locked')
+
+    def activate_fci(self) -> None:
+        encoded = base64.b64encode(self._control_token.encode()).decode()
+        self._request('POST', '/desk/api/system/fci', data={'token': encoded})
+
+    def run_self_test(self) -> None:
+        self._request('POST', '/admin/api/safety/td2-tests/execute')
+        deadline = time.monotonic() + _SELF_TEST_TIMEOUT_SEC
+        while time.monotonic() < deadline:
+            if self.safety_status()['timeToTd2'] > SELF_TEST_LEAD_SEC:
+                return
+            time.sleep(_POLL_INTERVAL_SEC)
+        raise TimeoutError(f'TD2 self-test did not complete within {_SELF_TEST_TIMEOUT_SEC}s')
+
+    def prepare(self) -> None:
+        """Run the TD2 self-test if one is due soon, open the brakes, and activate FCI. Requires held control."""
+        if self.safety_status()['timeToTd2'] <= SELF_TEST_LEAD_SEC:
+            logger.info('TD2 self-test due within %ds, running it now', SELF_TEST_LEAD_SEC)
+            self.run_self_test()
+        self.open_brakes()
+        self.activate_fci()
+
+    def __enter__(self) -> 'Desk':
+        self._authenticate()
+        self._take_control()
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        try:
+            if any(brake == 'Unlocked' for brake in self.safety_status()['brakeState']):
+                self.close_brakes()
+        finally:
+            self._release_control()
