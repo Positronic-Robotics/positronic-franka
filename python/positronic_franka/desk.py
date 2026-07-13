@@ -36,6 +36,15 @@ _CONTROL_HELD_MSG = (
     'Another session holds robot control. Open Franka Desk at https://{host}, release control there, then start again.'
 )
 
+# An active recoverable safety error puts the safety controller into Recovery, where Desk refuses every action
+# (424 ActionUnavailable/RecoverableErrorActive) — including unlocking the brakes and running the self-test — until
+# the error is acknowledged. Maps the flags Desk reports to the error ids its acknowledge endpoint expects.
+_ACKNOWLEDGEABLE_ERRORS = {'td2Timeout': 'TD2Timeout', 'genericJointError': 'GenericJointError'}
+
+
+def _acknowledgeable_errors(status: dict) -> list[str]:
+    return [error_id for flag, error_id in _ACKNOWLEDGEABLE_ERRORS.items() if status['recoverableErrors'][flag]]
+
 
 def encode_password(login: str, password: str) -> str:
     """Encode a Desk password the way the Desk web client does: base64 of the comma-joined sha256 digest bytes."""
@@ -137,6 +146,11 @@ class Desk:
         self._request('DELETE', '/admin/api/control-token/fci', json={'token': self._control_token})
 
     def run_self_test(self) -> None:
+        """Acknowledge any recoverable safety error, then run the TD2 self-test. Mirrors Desk's "Acknowledge &
+        Execute": once the tests are overdue the error must be acknowledged before Desk allows anything else."""
+        for error_id in _acknowledgeable_errors(self.safety_status()):
+            logger.info('Acknowledging recoverable safety error %s', error_id)
+            self._request('POST', f'/admin/api/safety/recoverable-safety-errors/acknowledge?error_id={error_id}')
         self._request('POST', '/admin/api/safety/td2-tests/execute')
         deadline = time.monotonic() + _SELF_TEST_TIMEOUT_SEC
         while time.monotonic() < deadline:
@@ -146,8 +160,9 @@ class Desk:
         raise TimeoutError(f'TD2 self-test did not complete within {_SELF_TEST_TIMEOUT_SEC}s')
 
     def prepare(self) -> None:
-        """Run the TD2 self-test if one is due soon, open the brakes, and activate FCI. Requires held control."""
-        if self.safety_status()['timeToTd2'] <= SELF_TEST_LEAD_SEC:
+        """Run the TD2 self-test if one is due or overdue, open the brakes, and activate FCI. Requires held control."""
+        status = self.safety_status()
+        if status['timeToTd2'] <= SELF_TEST_LEAD_SEC or _acknowledgeable_errors(status):
             logger.info('TD2 self-test due within %ds, running it now', SELF_TEST_LEAD_SEC)
             self.run_self_test()
         self.open_brakes()
