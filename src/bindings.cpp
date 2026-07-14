@@ -121,6 +121,8 @@ PYBIND11_MODULE(_franka, m) {
       .def("set_load", &positronic_franka::Robot::set_load,
            py::arg("mass"), py::arg("F_x_Cload"), py::arg("I_x_Cload"),
            "Set tool load: mass [kg], center of mass (3,), inertia (row-major 3x3)")
+      .def("stop", &positronic_franka::Robot::stop,
+           "Ramp motion to a halt and join the joint control thread; a later set_target_joints restarts it")
       .def("recover_from_errors", &positronic_franka::Robot::recover_from_errors,
            "Stop active control and attempt libfranka automaticErrorRecovery(); returns True if cleared")
       .def("get_robot_model", [](positronic_franka::Robot& r) { return r.getRobotModel(); },

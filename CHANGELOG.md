@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.5.0] - 2026-07-10
+
+### Added
+- Expose `Robot.stop()` — ramp motion to a halt and join the joint control thread, so a session can stop control cleanly before deactivating the FCI.
+- `positronic_franka.desk.Desk` — a Franka Desk web API client for headless control the FCI cannot perform: taking robot control, opening/closing the brakes, activating/deactivating the FCI, and running the TD2 safety self-test (acknowledging the overdue-test safety error first, the way Desk's "Acknowledge & Execute" does). Used as a context manager it takes control on entry and always releases it on exit, and refuses (rather than force-seizes) control held by another session.
+
 ## [0.4.0] - 2026-03-17
 
 ### Added
