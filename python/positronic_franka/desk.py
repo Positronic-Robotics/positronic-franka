@@ -91,8 +91,17 @@ class Desk:
         if self._token_state()['activeToken'] is not None:
             raise RuntimeError(_CONTROL_HELD_MSG.format(host=self.host))
         request = self._request('POST', '/admin/api/control-token/request', json={'requestedBy': self._login}).json()
-        active = self._token_state()['activeToken']
+        self._control_token = request['token']
+        try:
+            active = self._token_state()['activeToken']
+        except Exception:
+            # The POST most likely granted us the token; release it rather than strand it, then surface the
+            # original error.
+            with contextlib.suppress(Exception):
+                self._release_control()
+            raise
         if active is None or active['id'] != request['id']:
+            self._control_token = None
             self._request(
                 'DELETE',
                 f'/admin/api/control-token/request/{request["id"]}',
@@ -100,7 +109,6 @@ class Desk:
                 headers={'X-Control-Token': request['token']},
             )
             raise RuntimeError(_CONTROL_HELD_MSG.format(host=self.host))
-        self._control_token = request['token']
 
     def _release_control(self) -> None:
         if self._control_token is None:
@@ -174,10 +182,14 @@ class Desk:
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
+        # Each teardown step is attempted even if the previous one fails: leaving the brakes open or the control
+        # token held is worse than any single failed request.
         try:
-            if self._token_state()['fciActive']:
-                self.deactivate_fci()
-            if any(brake == 'Unlocked' for brake in self.safety_status()['brakeState']):
-                self.close_brakes()
+            try:
+                if self._token_state()['fciActive']:
+                    self.deactivate_fci()
+            finally:
+                if any(brake == 'Unlocked' for brake in self.safety_status()['brakeState']):
+                    self.close_brakes()
         finally:
             self._release_control()
