@@ -722,6 +722,10 @@ private:
     return !static_cast<bool>(state.current_errors);
   }
 
+  void stop() {
+    stop_control_loop_();
+  }
+
  private:
   franka::RobotState read_robot_state_() {
     if (control_running_.load()) {
