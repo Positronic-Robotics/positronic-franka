@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.6.0] - 2026-07-17
+
+### Added
+- Control modes: `InternalImpedance(k_theta)` (built-in joint impedance controller, Ruckig-shaped references — previous behavior) and `SoftwareImpedance(kq, kqd, kx, kxd)` (polymetis hybrid impedance law `tau = (J^T Kx J + Kq)(q_d - q) - (J^T Kxd J + Kqd) dq + coriolis` over the torque interface, `limit_rate` on, 100 Hz cutoff — DROID execution semantics). `Robot` takes the initial mode in its constructor; `set_control_mode()` stops the control loop and switches, and the next motion command starts the matching loop. Under `SoftwareImpedance`, async `set_target_joints` steps the reference instantly; sync calls shape it with Ruckig, tracked by the same law. Defaults are the factory stiffness and DROID's polymetis gains.
+- Expose `q_d` (commanded reference), `tau_J` (measured joint torques), and `time` (controller clock) on `State`.
+
+### Fixed
+- A control thread that dies (reflex, exception) now wakes a blocked synchronous `set_target_joints` caller instead of leaving it deadlocked.
+- A failed Ruckig replan no longer leaves a stale/default trajectory in place — evaluating one fed NaN positions into libfranka ("lowpass-filter: … NaN") and killed the control thread. The previous plan keeps playing instead.
+
 ## [0.5.0] - 2026-07-10
 
 ### Added

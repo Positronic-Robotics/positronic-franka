@@ -17,6 +17,7 @@
 #include <mutex>
 #include <condition_variable>
 #include <cstring>
+#include <variant>
 #include <Eigen/Core>
 #include <Eigen/Geometry>
 #include <ruckig/ruckig.hpp>
@@ -38,13 +39,38 @@ constexpr std::array<double, 7> PANDA_JOINT_UPPER_LIMITS = {
 // Common Eigen aliases
 using Vector7d = Eigen::Matrix<double, 7, 1>;
 using Vector6d = Eigen::Matrix<double, 6, 1>;
+using Matrix7d = Eigen::Matrix<double, 7, 7>;
 using SpatialJacobian = Eigen::Matrix<double, 6, 7>;
+
+// Control modes. InternalImpedance drives the robot's built-in joint impedance controller through the
+// joint position motion generator with Ruckig-shaped references. SoftwareImpedance owns the impedance law
+// itself: it runs the polymetis hybrid joint/Cartesian impedance over the torque interface, with async
+// targets applied as instantly-stepped references (DROID execution semantics) and sync targets shaped by
+// Ruckig. Defaults are the factory joint stiffness and DROID's polymetis gains respectively.
+struct InternalImpedance {
+  std::array<double, 7> k_theta{3000.0, 3000.0, 3000.0, 2500.0, 2500.0, 2000.0, 2000.0};
+};
+
+struct SoftwareImpedance {
+  std::array<double, 7> kq{40.0, 30.0, 50.0, 25.0, 35.0, 25.0, 10.0};
+  std::array<double, 7> kqd{4.0, 6.0, 5.0, 5.0, 3.0, 2.0, 1.0};
+  std::array<double, 6> kx{750.0, 750.0, 750.0, 15.0, 15.0, 15.0};
+  std::array<double, 6> kxd{37.0, 37.0, 37.0, 2.0, 2.0, 2.0};
+};
+
+using ControlMode = std::variant<InternalImpedance, SoftwareImpedance>;
 
 struct State {
   Vector7d q;
   Vector7d dq;
+  // Last commanded joint positions (the reference the internal controller tracks).
+  Vector7d q_d;
+  // Measured link-side joint torques.
+  Vector7d tau_J;
   // End-effector pose in base (robot) frame: [tx, ty, tz, qw, qx, qy, qz]
   Vector7d end_effector_pose;
+  // Robot controller time since start, seconds.
+  double time = 0.0;
   int error = 0;
   std::string error_message;
   // External wrench (force, torque) on end-effector frame expressed in K frame.
@@ -80,6 +106,18 @@ class TrajectoryGenerator {
     replan_();
   }
 
+  // Restart the generator from a reference position at rest (torque mode shapes segments from the
+  // stepped reference, not from measured robot state).
+  void reset(const Vector7d& pos) {
+    for (size_t i = 0; i < 7; ++i) {
+      input_.current_position[i] = pos[i];
+      input_.current_velocity[i] = 0.0;
+      input_.current_acceleration[i] = 0.0;
+      input_.target_position[i] = pos[i];
+    }
+    replan_();
+  }
+
   void set_target(const Vector7d& target) {
     for (size_t i = 0; i < 7; ++i) input_.target_position[i] = target[i];
     replan_();
@@ -92,6 +130,8 @@ class TrajectoryGenerator {
 
   // Advance trajectory by actual elapsed time and return the position.
   std::array<double, 7> step(franka::Duration period) {
+    if (!planned_) return input_.current_position;
+
     double dt = period.toSec();
     if (dt <= 0.0) dt = NOMINAL_DT;
     cumulative_time_ += dt;
@@ -112,11 +152,17 @@ class TrajectoryGenerator {
 
  private:
   void replan_() {
-    auto result = otg_.calculate(input_, trajectory_);
+    // Calculate into a scratch trajectory and swap only on success: a failed calculate must not leave a
+    // default-constructed/stale trajectory in place — evaluating one feeds garbage (NaN) into libfranka
+    // and kills the control thread. On failure the previous plan keeps playing.
+    ruckig::Trajectory<7> next;
+    auto result = otg_.calculate(input_, next);
     if (result < 0) {
       std::cerr << "Ruckig trajectory planning failed (error " << static_cast<int>(result) << ")" << std::endl;
       return;
     }
+    trajectory_ = next;
+    planned_ = true;
     cumulative_time_ = 0.0;
     duration_ = trajectory_.get_duration();
     active_ = true;
@@ -128,16 +174,19 @@ class TrajectoryGenerator {
   double cumulative_time_ = 0.0;
   double duration_ = 0.0;
   bool active_ = false;
+  bool planned_ = false;
 };
 
 class Robot {
  public:
   explicit Robot(const std::string& ip,
                  franka::RealtimeConfig realtime_config = franka::RealtimeConfig::kIgnore,
-                 double relative_dynamics_factor = 1.0)
+                 double relative_dynamics_factor = 1.0,
+                 ControlMode control_mode = InternalImpedance{})
       : ip_(ip),
         robot_(std::make_unique<franka::Robot>(ip, realtime_config)),
-        relative_dynamics_factor_(std::clamp(relative_dynamics_factor, 0.0001, 1.0)) {
+        relative_dynamics_factor_(std::clamp(relative_dynamics_factor, 0.0001, 1.0)),
+        control_mode_(control_mode) {
     model_ = std::make_unique<franka::Model>(robot_->loadModel());
   }
 
@@ -156,7 +205,10 @@ class Robot {
     State st{};
     st.q = Eigen::Map<const Vector7d>(rs.q.data());
     st.dq = Eigen::Map<const Vector7d>(rs.dq.data());
+    st.q_d = Eigen::Map<const Vector7d>(rs.q_d.data());
+    st.tau_J = Eigen::Map<const Vector7d>(rs.tau_J.data());
     st.end_effector_pose << t.x(), t.y(), t.z(), q.w(), q.x(), q.y(), q.z();
+    st.time = rs.time.toSec();
     st.error = rs.current_errors ? 1 : 0;
     if (st.error) {
       st.error_message = static_cast<std::string>(rs.current_errors);
@@ -166,6 +218,19 @@ class Robot {
     return st;
   }
 
+  // Stop the control loop and switch the impedance backend. The new loop starts lazily on the next
+  // motion command. For InternalImpedance the joint stiffness is pushed to the robot here; SoftwareImpedance
+  // gains live purely in the torque loop.
+  void set_control_mode(const ControlMode& mode) {
+    stop_control_loop_();
+    control_mode_ = mode;
+    if (const auto* internal = std::get_if<InternalImpedance>(&control_mode_)) {
+      robot_->setJointImpedance(internal->k_theta);
+    }
+  }
+
+  ControlMode control_mode() const { return control_mode_; }
+
   void set_target_joints(const Eigen::Ref<const Vector7d>& q_target,
                          bool asynchronous = true) {
     if (!control_running_.load()) {
@@ -174,7 +239,13 @@ class Robot {
       }
       stop_requested_.store(false);
       control_running_.store(true);
-      control_thread_ = std::thread([this] { this->run_joint_position_control_(); });
+      control_thread_ = std::thread([this] {
+        if (const auto* software = std::get_if<SoftwareImpedance>(&control_mode_)) {
+          this->run_joint_torque_control_(*software);
+        } else {
+          this->run_joint_position_control_();
+        }
+      });
     }
     if (!asynchronous) {
       // Prepare synchronous wait before publishing the target to avoid races.
@@ -188,8 +259,10 @@ class Robot {
       has_target_.store(true);
     }
     if (!asynchronous) {
+      // Also wake when the control thread dies (reflex, exception): a dead thread can never complete
+      // the goal, and finish_control_thread_ notifies after clearing control_running_.
       std::unique_lock<std::mutex> lk(goal_mutex_);
-      goal_cv_.wait(lk, [&]{ return goal_completed_; });
+      goal_cv_.wait(lk, [&]{ return goal_completed_ || !control_running_.load(); });
     }
   }
 
@@ -622,7 +695,118 @@ private:
     } catch (const std::exception& e) {
       std::cerr << "Joint control thread error: " << e.what() << std::endl;
     }
+    finish_control_thread_();
+  }
+
+  // Torque-interface control loop running the polymetis hybrid impedance law:
+  //   tau = (J^T Kx J + Kq)(q_d - q) - (J^T Kxd J + Kqd) dq + coriolis
+  // Gravity is compensated by libfranka underneath the torque command. Shares the target/stop/sync
+  // machinery with the position loop; only the reference semantics differ: async targets step the
+  // reference q_d instantly (DROID execution semantics), sync targets are Ruckig-shaped and tracked
+  // by the same law.
+  void run_joint_torque_control_(SoftwareImpedance imp) {
+    const Vector7d Kq = Eigen::Map<const Vector7d>(imp.kq.data());
+    const Vector7d Kqd = Eigen::Map<const Vector7d>(imp.kqd.data());
+    const Vector6d Kx = Eigen::Map<const Vector6d>(imp.kx.data());
+    const Vector6d Kxd = Eigen::Map<const Vector6d>(imp.kxd.data());
+    try {
+      TrajectoryGenerator traj(relative_dynamics_factor_);
+
+      robot_->control(
+        [&, this,
+         first = true,
+         sync_in_flight = false,
+         shaped = false,
+         stopping = false,
+         stop_ticks = 0,
+         ref = Vector7d(Vector7d::Zero())](const franka::RobotState& st,
+                                           franka::Duration period) mutable -> franka::Torques {
+          {
+            std::lock_guard<std::mutex> lk(last_state_mutex_);
+            last_state_ = std::make_unique<franka::RobotState>(st);
+          }
+
+          const Vector7d q = Eigen::Map<const Vector7d>(st.q.data());
+          const Vector7d dq = Eigen::Map<const Vector7d>(st.dq.data());
+
+          if (first) {
+            ref = q;
+            first = false;
+          } else if (!stopping && stop_requested_.load()) {
+            stopping = true;
+            has_target_.store(false);
+            shaped = false;
+            ref = q;
+          }
+
+          if (!stopping && has_target_.load()) {
+            std::lock_guard<std::mutex> lk(target_mutex_);
+            const bool sync = sync_request_next_.exchange(false);
+            if (sync) {
+              traj.reset(ref);
+              traj.set_target(target_q_);
+              shaped = true;
+              sync_in_flight = true;
+            } else {
+              ref = target_q_;
+              shaped = false;
+            }
+            has_target_.store(false);
+          }
+
+          if (shaped) {
+            const auto pos = traj.step(period);
+            ref = Eigen::Map<const Vector7d>(pos.data());
+            if (!traj.active()) {
+              shaped = false;
+              if (sync_in_flight) {
+                {
+                  std::lock_guard<std::mutex> lk(goal_mutex_);
+                  goal_completed_ = true;
+                }
+                goal_cv_.notify_all();
+                sync_in_flight = false;
+              }
+            }
+          }
+
+          const auto J_arr = model_->zeroJacobian(franka::Frame::kEndEffector, st);
+          const SpatialJacobian J = Eigen::Map<const SpatialJacobian>(J_arr.data());
+          const auto cor = model_->coriolis(st);
+
+          const Matrix7d Kp = J.transpose() * Kx.asDiagonal() * J + Matrix7d(Kq.asDiagonal());
+          const Matrix7d Kd = J.transpose() * Kxd.asDiagonal() * J + Matrix7d(Kqd.asDiagonal());
+          const Vector7d tau = Kp * (ref - q) - Kd * dq + Eigen::Map<const Vector7d>(cor.data());
+
+          std::array<double, 7> tau_arr;
+          Eigen::Map<Vector7d>(tau_arr.data()) = tau;
+          franka::Torques cmd(tau_arr);
+
+          if (stopping) {
+            // The spring at ref = q plus damping brings the arm to rest; finish once quiet (1 s cap).
+            ++stop_ticks;
+            if (dq.cwiseAbs().maxCoeff() < 0.05 || stop_ticks >= 1000) {
+              cmd.motion_finished = true;
+            }
+          }
+          return cmd;
+        },
+        true /* limit_rate */, 100.0 /* cutoff_frequency */);
+    } catch (const std::exception& e) {
+      std::cerr << "Torque control thread error: " << e.what() << std::endl;
+    }
+    finish_control_thread_();
+  }
+
+  // Every control-thread exit path must clear control_running_ and then wake any synchronous waiter:
+  // a thread that died mid-goal (reflex, NaN, connection loss) otherwise leaves the waiter blocked forever.
+  void finish_control_thread_() {
     control_running_.store(false);
+    {
+      std::lock_guard<std::mutex> lk(goal_mutex_);
+      goal_completed_ = true;
+    }
+    goal_cv_.notify_all();
   }
 
  public:
@@ -754,6 +938,9 @@ private:
   std::unique_ptr<franka::RobotState> last_state_;
 
   const double relative_dynamics_factor_{1.0};
+  // Written only while the control loop is idle (constructor, set_control_mode after stop); read when
+  // a motion command starts the loop.
+  ControlMode control_mode_;
   std::mutex target_mutex_;
   Vector7d target_q_ = Vector7d::Zero();
 

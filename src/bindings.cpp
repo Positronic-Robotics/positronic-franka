@@ -15,6 +15,32 @@ PYBIND11_MODULE(_franka, m) {
       .value("Ignore", franka::RealtimeConfig::kIgnore)
       .export_values();
 
+  py::class_<positronic_franka::InternalImpedance>(m, "InternalImpedance",
+      "Robot's built-in joint impedance controller fed by Ruckig-shaped joint position references. "
+      "k_theta is the joint stiffness (7,), default factory-stiff; damping is managed internally.")
+      .def(py::init([](std::array<double, 7> k_theta) {
+             return positronic_franka::InternalImpedance{k_theta};
+           }),
+           py::arg("k_theta") = positronic_franka::InternalImpedance{}.k_theta)
+      .def_readwrite("k_theta", &positronic_franka::InternalImpedance::k_theta);
+
+  py::class_<positronic_franka::SoftwareImpedance>(m, "SoftwareImpedance",
+      "Software impedance law on the torque interface (polymetis HybridJointImpedanceControl): "
+      "tau = (J^T Kx J + Kq)(q_d - q) - (J^T Kxd J + Kqd) dq + coriolis. Async targets step the "
+      "reference instantly; sync targets are Ruckig-shaped. Defaults are DROID's polymetis gains.")
+      .def(py::init([](std::array<double, 7> kq, std::array<double, 7> kqd,
+                       std::array<double, 6> kx, std::array<double, 6> kxd) {
+             return positronic_franka::SoftwareImpedance{kq, kqd, kx, kxd};
+           }),
+           py::arg("kq") = positronic_franka::SoftwareImpedance{}.kq,
+           py::arg("kqd") = positronic_franka::SoftwareImpedance{}.kqd,
+           py::arg("kx") = positronic_franka::SoftwareImpedance{}.kx,
+           py::arg("kxd") = positronic_franka::SoftwareImpedance{}.kxd)
+      .def_readwrite("kq", &positronic_franka::SoftwareImpedance::kq)
+      .def_readwrite("kqd", &positronic_franka::SoftwareImpedance::kqd)
+      .def_readwrite("kx", &positronic_franka::SoftwareImpedance::kx)
+      .def_readwrite("kxd", &positronic_franka::SoftwareImpedance::kxd);
+
   py::class_<positronic_franka::State>(m, "State")
       .def_property_readonly(
           "q",
@@ -25,9 +51,21 @@ PYBIND11_MODULE(_franka, m) {
           [](const positronic_franka::State& s) { return s.dq; },
           "Measured joint velocities (7,) as numpy array")
       .def_property_readonly(
+          "q_d",
+          [](const positronic_franka::State& s) { return s.q_d; },
+          "Last commanded joint positions (7,) — the reference the internal controller tracks")
+      .def_property_readonly(
+          "tau_J",
+          [](const positronic_franka::State& s) { return s.tau_J; },
+          "Measured link-side joint torques (7,) as numpy array")
+      .def_property_readonly(
           "end_effector_pose",
           [](const positronic_franka::State& s) { return s.end_effector_pose; },
           "End-effector pose in robot frame as (tx,ty,tz,qw,qx,qy,qz)")
+      .def_property_readonly(
+          "time",
+          [](const positronic_franka::State& s) { return s.time; },
+          "Robot controller time since start, seconds")
       .def_property_readonly(
           "error",
           [](const positronic_franka::State& s) { return s.error; },
@@ -42,10 +80,17 @@ PYBIND11_MODULE(_franka, m) {
           "External wrench on stiffness frame (Fx,Fy,Fz,Mx,My,Mz)");
 
   py::class_<positronic_franka::Robot>(m, "Robot")
-      .def(py::init<const std::string&, franka::RealtimeConfig, double>(),
+      .def(py::init<const std::string&, franka::RealtimeConfig, double, positronic_franka::ControlMode>(),
            py::arg("ip"),
            py::arg("realtime_config") = franka::RealtimeConfig::kIgnore,
-           py::arg("relative_dynamics_factor") = 1.0)
+           py::arg("relative_dynamics_factor") = 1.0,
+           py::arg("control_mode") = positronic_franka::ControlMode(positronic_franka::InternalImpedance{}))
+      .def("set_control_mode", &positronic_franka::Robot::set_control_mode,
+           py::arg("mode"),
+           "Stop the control loop and switch backend (InternalImpedance | SoftwareImpedance); the next "
+           "motion command starts the matching loop")
+      .def_property_readonly("control_mode", &positronic_franka::Robot::control_mode,
+                             "Active control mode (InternalImpedance | SoftwareImpedance)")
       .def("state", &positronic_franka::Robot::state,
            "Returns a State with q and dq")
       .def(
