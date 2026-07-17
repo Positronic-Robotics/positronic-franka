@@ -67,6 +67,8 @@ struct State {
   Vector7d q_d;
   // Measured link-side joint torques.
   Vector7d tau_J;
+  // Last commanded joint torques (after rate limiting/filtering), without gravity.
+  Vector7d tau_J_d;
   // End-effector pose in base (robot) frame: [tx, ty, tz, qw, qx, qy, qz]
   Vector7d end_effector_pose;
   // Robot controller time since start, seconds.
@@ -205,8 +207,15 @@ class Robot {
     State st{};
     st.q = Eigen::Map<const Vector7d>(rs.q.data());
     st.dq = Eigen::Map<const Vector7d>(rs.dq.data());
+    // Under torque control the reference lives in the software loop, not in the robot's q_d; report
+    // whichever reference the active controller tracks.
     st.q_d = Eigen::Map<const Vector7d>(rs.q_d.data());
+    {
+      std::lock_guard<std::mutex> lk(last_state_mutex_);
+      if (last_software_ref_ != nullptr) st.q_d = *last_software_ref_;
+    }
     st.tau_J = Eigen::Map<const Vector7d>(rs.tau_J.data());
+    st.tau_J_d = Eigen::Map<const Vector7d>(rs.tau_J_d.data());
     st.end_effector_pose << t.x(), t.y(), t.z(), q.w(), q.x(), q.y(), q.z();
     st.time = rs.time.toSec();
     st.error = rs.current_errors ? 1 : 0;
@@ -281,6 +290,23 @@ class Robot {
     Vector7d pose;
     pose << t.x(), t.y(), t.z(), quat.w(), quat.x(), quat.y(), quat.z();
     return pose;
+  }
+
+  // Model terms at explicit joint values, using the connected robot's current frames and load
+  // configuration. These mirror the exact terms the SoftwareImpedance loop uses, so logged traces can
+  // be validated offline against the implemented law.
+  SpatialJacobian zero_jacobian(const Eigen::Ref<const Vector7d>& q) {
+    franka::RobotState st = read_robot_state_();
+    st.q = to_std_array7_(q);
+    return ee_jacobian_(st);
+  }
+
+  Vector7d coriolis(const Eigen::Ref<const Vector7d>& q, const Eigen::Ref<const Vector7d>& dq) {
+    franka::RobotState st = read_robot_state_();
+    st.q = to_std_array7_(q);
+    st.dq = to_std_array7_(dq);
+    const auto cor = model_->coriolis(st);
+    return Eigen::Map<const Vector7d>(cor.data());
   }
 
   // Inverse Kinematics to EndEffector pose in base frame (tx, ty, tz, qw, qx, qy, qz)
@@ -770,6 +796,11 @@ private:
             }
           }
 
+          {
+            std::lock_guard<std::mutex> lk(last_state_mutex_);
+            last_software_ref_ = std::make_unique<Vector7d>(ref);
+          }
+
           const auto J_arr = model_->zeroJacobian(franka::Frame::kEndEffector, st);
           const SpatialJacobian J = Eigen::Map<const SpatialJacobian>(J_arr.data());
           const auto cor = model_->coriolis(st);
@@ -802,6 +833,10 @@ private:
   // a thread that died mid-goal (reflex, NaN, connection loss) otherwise leaves the waiter blocked forever.
   void finish_control_thread_() {
     control_running_.store(false);
+    {
+      std::lock_guard<std::mutex> lk(last_state_mutex_);
+      last_software_ref_.reset();
+    }
     {
       std::lock_guard<std::mutex> lk(goal_mutex_);
       goal_completed_ = true;
@@ -936,6 +971,9 @@ private:
 
   std::mutex last_state_mutex_;
   std::unique_ptr<franka::RobotState> last_state_;
+  // The software-impedance loop's reference, published so state() can report the tracked q_d; null
+  // whenever the torque loop is not running.
+  std::unique_ptr<Vector7d> last_software_ref_;
 
   const double relative_dynamics_factor_{1.0};
   // Written only while the control loop is idle (constructor, set_control_mode after stop); read when

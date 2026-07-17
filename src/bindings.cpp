@@ -59,6 +59,10 @@ PYBIND11_MODULE(_franka, m) {
           [](const positronic_franka::State& s) { return s.tau_J; },
           "Measured link-side joint torques (7,) as numpy array")
       .def_property_readonly(
+          "tau_J_d",
+          [](const positronic_franka::State& s) { return s.tau_J_d; },
+          "Last commanded joint torques (7,) after rate limiting/filtering, without gravity")
+      .def_property_readonly(
           "end_effector_pose",
           [](const positronic_franka::State& s) { return s.end_effector_pose; },
           "End-effector pose in robot frame as (tx,ty,tz,qw,qx,qy,qz)")
@@ -100,6 +104,18 @@ PYBIND11_MODULE(_franka, m) {
           },
           py::arg("q"),
           "FK from joint vector (7,) to EE pose (tx,ty,tz,qw,qx,qy,qz) in base frame")
+      .def(
+          "zero_jacobian",
+          [](positronic_franka::Robot& r, const positronic_franka::Vector7d& q) { return r.zero_jacobian(q); },
+          py::arg("q"),
+          "End-effector zero Jacobian (6x7) at joint values q, with the robot's current frames — the "
+          "J the SoftwareImpedance law uses")
+      .def(
+          "coriolis",
+          [](positronic_franka::Robot& r, const positronic_franka::Vector7d& q,
+             const positronic_franka::Vector7d& dq) { return r.coriolis(q, dq); },
+          py::arg("q"), py::arg("dq"),
+          "Coriolis torques (7,) at explicit q, dq with the robot's current load configuration")
       .def(
           "inverse_kinematics",
           [](positronic_franka::Robot& r, const positronic_franka::Vector7d& target_pose_wxyz) {
