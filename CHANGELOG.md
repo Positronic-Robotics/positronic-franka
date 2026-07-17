@@ -3,9 +3,12 @@
 ## [0.6.0] - 2026-07-17
 
 ### Added
-- Control modes: `InternalImpedance(k_theta)` (built-in joint impedance controller, Ruckig-shaped references — previous behavior) and `SoftwareImpedance(kq, kqd, kx, kxd)` (polymetis hybrid impedance law `tau = (J^T Kx J + Kq)(q_d - q) - (J^T Kxd J + Kqd) dq + coriolis` over the torque interface, `limit_rate` on, 100 Hz cutoff — DROID execution semantics). `Robot` takes the initial mode in its constructor; `set_control_mode()` stops the control loop and switches, and the next motion command starts the matching loop. Under `SoftwareImpedance`, async `set_target_joints` steps the reference instantly; sync calls shape it with Ruckig, tracked by the same law. Defaults are the factory stiffness and DROID's polymetis gains.
+- Control modes: `InternalImpedance(k_theta)` (built-in joint impedance controller, Ruckig-shaped references — previous behavior) and `SoftwareImpedance(kq, kqd, kx, kxd)` (polymetis hybrid impedance law `tau = (J^T Kx J + Kq)(q_d - q) - (J^T Kxd J + Kqd) dq + coriolis` over the torque interface, `limit_rate` on, 100 Hz cutoff — DROID execution semantics). `Robot` applies the initial mode in its constructor; `set_control_mode()` stops the control loop and switches, and the next motion command starts the matching loop. Under `SoftwareImpedance`, async `set_target_joints` steps the reference instantly; sync calls shape it with Ruckig, tracked by the same law. Defaults are the factory stiffness and DROID's polymetis gains.
 - Expose `q_d` (commanded reference; under `SoftwareImpedance` the loop's stepped/shaped reference), `tau_J` (measured joint torques), `tau_J_d` (commanded torque after rate limiting/filtering, gravity-free), and `time` (controller clock) on `State`.
 - `zero_jacobian(q)` and `coriolis(q, dq)` — the exact model terms the torque loop uses, for offline validation of a logged trace against the law.
+
+### Removed
+- `set_joint_impedance` — joint stiffness is owned by the `InternalImpedance` control mode; pass it to the `Robot` constructor or `set_control_mode()`.
 
 ### Fixed
 - A control thread that dies (reflex, exception) now wakes a blocked synchronous `set_target_joints` caller instead of leaving it deadlocked.

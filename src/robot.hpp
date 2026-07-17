@@ -17,6 +17,7 @@
 #include <mutex>
 #include <condition_variable>
 #include <cstring>
+#include <optional>
 #include <variant>
 #include <Eigen/Core>
 #include <Eigen/Geometry>
@@ -187,9 +188,9 @@ class Robot {
                  ControlMode control_mode = InternalImpedance{})
       : ip_(ip),
         robot_(std::make_unique<franka::Robot>(ip, realtime_config)),
-        relative_dynamics_factor_(std::clamp(relative_dynamics_factor, 0.0001, 1.0)),
-        control_mode_(control_mode) {
+        relative_dynamics_factor_(std::clamp(relative_dynamics_factor, 0.0001, 1.0)) {
     model_ = std::make_unique<franka::Model>(robot_->loadModel());
+    set_control_mode(control_mode);
   }
 
   ~Robot() {
@@ -212,7 +213,7 @@ class Robot {
     st.q_d = Eigen::Map<const Vector7d>(rs.q_d.data());
     {
       std::lock_guard<std::mutex> lk(last_state_mutex_);
-      if (last_software_ref_ != nullptr) st.q_d = *last_software_ref_;
+      if (last_software_ref_) st.q_d = *last_software_ref_;
     }
     st.tau_J = Eigen::Map<const Vector7d>(rs.tau_J.data());
     st.tau_J_d = Eigen::Map<const Vector7d>(rs.tau_J_d.data());
@@ -798,7 +799,7 @@ private:
 
           {
             std::lock_guard<std::mutex> lk(last_state_mutex_);
-            last_software_ref_ = std::make_unique<Vector7d>(ref);
+            last_software_ref_ = ref;
           }
 
           const auto J_arr = model_->zeroJacobian(franka::Frame::kEndEffector, st);
@@ -845,10 +846,6 @@ private:
   }
 
  public:
-  void set_joint_impedance(const std::array<double, 7>& joint_stiffness) {
-    robot_->setJointImpedance(joint_stiffness);
-  }
-
   void set_cartesian_impedance(const std::array<double, 6>& cartesian_stiffness) {
     robot_->setCartesianImpedance(cartesian_stiffness);
   }
@@ -971,9 +968,9 @@ private:
 
   std::mutex last_state_mutex_;
   std::unique_ptr<franka::RobotState> last_state_;
-  // The software-impedance loop's reference, published so state() can report the tracked q_d; null
+  // The software-impedance loop's reference, published so state() can report the tracked q_d; empty
   // whenever the torque loop is not running.
-  std::unique_ptr<Vector7d> last_software_ref_;
+  std::optional<Vector7d> last_software_ref_;
 
   const double relative_dynamics_factor_{1.0};
   // Written only while the control loop is idle (constructor, set_control_mode after stop); read when

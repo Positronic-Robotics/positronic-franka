@@ -152,9 +152,6 @@ PYBIND11_MODULE(_franka, m) {
       .def_property_readonly("relative_dynamics_factor",
                              &positronic_franka::Robot::relative_dynamics_factor,
                              "Fixed factor scaling max vel/acc/jerk for Ruckig (0.05..1.0)")
-      .def("set_joint_impedance", &positronic_franka::Robot::set_joint_impedance,
-           py::arg("joint_stiffness"),
-           "Set joint stiffness (7,) in N·m/rad")
       .def("set_cartesian_impedance", &positronic_franka::Robot::set_cartesian_impedance,
            py::arg("cartesian_stiffness"),
            "Set Cartesian stiffness (6,) [Fx,Fy,Fz,Mx,My,Mz]")
