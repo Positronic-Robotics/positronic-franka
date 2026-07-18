@@ -248,8 +248,7 @@ class Robot {
                  franka::RealtimeConfig realtime_config = franka::RealtimeConfig::kIgnore,
                  double relative_dynamics_factor = 1.0,
                  ControlMode control_mode = InternalImpedance{})
-      : ip_(ip),
-        robot_(std::make_unique<franka::Robot>(ip, realtime_config)),
+      : robot_(std::make_unique<franka::Robot>(ip, realtime_config)),
         relative_dynamics_factor_(std::clamp(relative_dynamics_factor, 0.0001, 1.0)) {
     model_ = std::make_unique<franka::Model>(robot_->loadModel());
     // Force-apply: the equality guard in set_control_mode must not skip pushing k_theta when the
@@ -455,12 +454,6 @@ class Robot {
       }
       if (best_err >= err_norm - 1e-9) break;  // No meaningful improvement, terminate
     }
-    // Print final Cartesian error (translation in mm, rotation in degrees) to stderr
-    st.q = to_std_array7_(q);
-    const Eigen::Matrix4d T_final = ee_pose_matrix_(st);
-    const Eigen::Matrix<double, 6, 1> e_final = cartesian_error_(T_final, t_tgt, R_tgt);
-    const double trans_err_mm = 1000.0 * e_final.head<3>().norm();
-    const double rot_err_deg = (180.0 / M_PI) * e_final.tail<3>().norm();
     return q;
   }
 
@@ -695,14 +688,6 @@ class Robot {
         break;
       q = q_next;
     }
-
-    st.q = to_std_array7_(q);
-    const Eigen::Matrix4d T_final = ee_pose_matrix_(st);
-    const Eigen::Matrix<double, 6, 1> e_final = cartesian_error_(T_final, t_tgt, R_tgt);
-    const double trans_err_mm = 1000.0 * e_final.head<3>().norm();
-    const double rot_err_deg = (180.0 / M_PI) * e_final.tail<3>().norm();
-    static_cast<void>(trans_err_mm);
-    static_cast<void>(rot_err_deg);
     return q;
   }
 
@@ -1082,7 +1067,6 @@ private:
     return {robot_->readOnce(), std::nullopt};
   }
 
-  std::string ip_;
   std::unique_ptr<franka::Robot> robot_;
   std::unique_ptr<franka::Model> model_;
   std::thread control_thread_;

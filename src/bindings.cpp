@@ -9,7 +9,7 @@
 namespace py = pybind11;
 
 PYBIND11_MODULE(_franka, m) {
-  m.doc() = "Franka driver stub";
+  m.doc() = "Franka robot driver";
 
   py::enum_<franka::RealtimeConfig>(m, "RealtimeConfig")
       .value("Enforce", franka::RealtimeConfig::kEnforce)
