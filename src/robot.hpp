@@ -52,6 +52,10 @@ struct InternalImpedance {
   std::array<double, 7> k_theta{3000.0, 3000.0, 3000.0, 2500.0, 2500.0, 2000.0, 2000.0};
 };
 
+// Gain defaults are the metadata defaults of DROID's polymetis deployment — fairo
+// polymetis/conf/robot_client/franka_hardware.yaml, loaded by DROID's `launch_robot.py
+// robot_client=franka_hardware` — i.e. the exact configuration HybridJointImpedanceControl runs with
+// in the DROID data-collection stack.
 struct SoftwareImpedance {
   std::array<double, 7> kq{40.0, 30.0, 50.0, 25.0, 35.0, 25.0, 10.0};
   std::array<double, 7> kqd{4.0, 6.0, 5.0, 5.0, 3.0, 2.0, 1.0};

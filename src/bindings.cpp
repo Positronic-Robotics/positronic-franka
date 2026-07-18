@@ -8,6 +8,53 @@
 
 namespace py = pybind11;
 
+namespace {
+
+template <size_t N>
+bool all_zero(const std::array<double, N>& v) {
+  for (double x : v) {
+    if (x != 0.0) return false;
+  }
+  return true;
+}
+
+template <size_t N>
+bool all_positive(const std::array<double, N>& v) {
+  for (double x : v) {
+    if (!(x > 0.0)) return false;  // NaN fails the comparison too
+  }
+  return true;
+}
+
+// A gain space is either disabled (stiffness and damping all zero) or a damped spring (both strictly
+// positive); anything in between is a configuration error.
+template <size_t N>
+void validate_half(const std::array<double, N>& k, const std::array<double, N>& kd, const char* name) {
+  if (all_zero(k) && all_zero(kd)) return;
+  if (all_positive(k) && all_positive(kd)) return;
+  throw py::value_error(std::string(name) +
+                        " stiffness and damping must be either all zero (half disabled) or strictly positive");
+}
+
+positronic_franka::InternalImpedance make_internal_impedance(const std::array<double, 7>& k_theta) {
+  if (!all_positive(k_theta)) throw py::value_error("k_theta must be strictly positive");
+  return positronic_franka::InternalImpedance{k_theta};
+}
+
+positronic_franka::SoftwareImpedance make_software_impedance(const std::array<double, 7>& kq,
+                                                             const std::array<double, 7>& kqd,
+                                                             const std::array<double, 6>& kx,
+                                                             const std::array<double, 6>& kxd) {
+  validate_half(kq, kqd, "joint (kq/kqd)");
+  validate_half(kx, kxd, "Cartesian (kx/kxd)");
+  if (all_zero(kq) && all_zero(kx)) {
+    throw py::value_error("at least one of the joint or Cartesian halves must be active");
+  }
+  return positronic_franka::SoftwareImpedance{kq, kqd, kx, kxd};
+}
+
+}  // namespace
+
 PYBIND11_MODULE(_franka, m) {
   m.doc() = "Franka driver stub";
 
@@ -18,30 +65,27 @@ PYBIND11_MODULE(_franka, m) {
 
   py::class_<positronic_franka::InternalImpedance>(m, "InternalImpedance",
       "Robot's built-in joint impedance controller fed by Ruckig-shaped joint position references. "
-      "k_theta is the joint stiffness (7,), default factory-stiff; damping is managed internally.")
-      .def(py::init([](std::array<double, 7> k_theta) {
-             return positronic_franka::InternalImpedance{k_theta};
-           }),
+      "k_theta is the joint stiffness (7,), strictly positive, default factory-stiff; damping is "
+      "managed internally.")
+      .def(py::init(&make_internal_impedance),
            py::arg("k_theta") = positronic_franka::InternalImpedance{}.k_theta)
-      .def_readwrite("k_theta", &positronic_franka::InternalImpedance::k_theta)
+      .def_readonly("k_theta", &positronic_franka::InternalImpedance::k_theta)
       .def(py::self == py::self);
 
   py::class_<positronic_franka::SoftwareImpedance>(m, "SoftwareImpedance",
       "Software impedance law on the torque interface (polymetis HybridJointImpedanceControl): "
       "tau = (J^T Kx J + Kq)(q_d - q) - (J^T Kxd J + Kqd) dq + coriolis. Async targets step the "
-      "reference instantly; sync targets are Ruckig-shaped. Defaults are DROID's polymetis gains.")
-      .def(py::init([](std::array<double, 7> kq, std::array<double, 7> kqd,
-                       std::array<double, 6> kx, std::array<double, 6> kxd) {
-             return positronic_franka::SoftwareImpedance{kq, kqd, kx, kxd};
-           }),
-           py::arg("kq") = positronic_franka::SoftwareImpedance{}.kq,
-           py::arg("kqd") = positronic_franka::SoftwareImpedance{}.kqd,
-           py::arg("kx") = positronic_franka::SoftwareImpedance{}.kx,
-           py::arg("kxd") = positronic_franka::SoftwareImpedance{}.kxd)
-      .def_readwrite("kq", &positronic_franka::SoftwareImpedance::kq)
-      .def_readwrite("kqd", &positronic_franka::SoftwareImpedance::kqd)
-      .def_readwrite("kx", &positronic_franka::SoftwareImpedance::kx)
-      .def_readwrite("kxd", &positronic_franka::SoftwareImpedance::kxd)
+      "reference instantly; sync targets are Ruckig-shaped. Constructed with no arguments it carries "
+      "the gains DROID's polymetis deployment uses; otherwise all four must be passed together, and "
+      "each half (joint kq/kqd, Cartesian kx/kxd) is either all zero — disabled — or strictly positive, "
+      "with at least one half active.")
+      .def(py::init([]() { return positronic_franka::SoftwareImpedance{}; }))
+      .def(py::init(&make_software_impedance),
+           py::arg("kq"), py::arg("kqd"), py::arg("kx"), py::arg("kxd"))
+      .def_readonly("kq", &positronic_franka::SoftwareImpedance::kq)
+      .def_readonly("kqd", &positronic_franka::SoftwareImpedance::kqd)
+      .def_readonly("kx", &positronic_franka::SoftwareImpedance::kx)
+      .def_readonly("kxd", &positronic_franka::SoftwareImpedance::kxd)
       .def(py::self == py::self);
 
   py::class_<positronic_franka::State>(m, "State")
