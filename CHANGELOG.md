@@ -9,6 +9,7 @@
 
 ### Removed
 - `set_joint_impedance` — joint stiffness is owned by the `InternalImpedance` control mode; pass it to the `Robot` constructor or `set_control_mode()`.
+- `set_cartesian_impedance` — it parameterizes the robot's internal *Cartesian* impedance controller, which this driver never activates (motion-generator sessions run in the default joint-impedance controller mode, and the torque loop bypasses internal impedance entirely), so the setting was dead configuration. If internal Cartesian control is ever wanted, it becomes a new `ControlMode` alternative owning that stiffness.
 
 ### Fixed
 - A control thread that dies (reflex, exception) now wakes a blocked synchronous `set_target_joints` caller instead of leaving it deadlocked.

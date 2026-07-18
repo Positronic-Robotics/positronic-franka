@@ -846,10 +846,6 @@ private:
   }
 
  public:
-  void set_cartesian_impedance(const std::array<double, 6>& cartesian_stiffness) {
-    robot_->setCartesianImpedance(cartesian_stiffness);
-  }
-
   void set_collision_behavior(
       const std::array<double, 7>& lower_torque_thresholds_acceleration,
       const std::array<double, 7>& upper_torque_thresholds_acceleration,
