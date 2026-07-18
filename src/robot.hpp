@@ -257,6 +257,11 @@ class Robot {
         control_thread_.join();
       }
       stop_requested_.store(false);
+      // A target or sync request stranded by a dead loop must not feed the replacement loop's first
+      // ticks — those can run before this command publishes its own target below. Anything queued here
+      // is stale: no loop consumed it, and the caller's publish comes after (callers are serialized).
+      has_target_.store(false);
+      sync_request_next_.store(false);
       control_running_.store(true);
       // Snapshot the mode here: the caller is GIL-serialized with set_control_mode, while the thread
       // body would race a concurrent gains handoff writing control_mode_.
