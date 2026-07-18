@@ -4,6 +4,8 @@
 #include <pybind11/eigen.h>
 #include <pybind11/operators.h>
 
+#include <cmath>
+
 #include "robot.hpp"
 
 namespace py = pybind11;
@@ -21,7 +23,7 @@ bool all_zero(const std::array<double, N>& v) {
 template <size_t N>
 bool all_positive(const std::array<double, N>& v) {
   for (double x : v) {
-    if (!(x > 0.0)) return false;  // NaN fails the comparison too
+    if (!(x > 0.0) || !std::isfinite(x)) return false;  // NaN fails the comparison, inf fails isfinite
   }
   return true;
 }
