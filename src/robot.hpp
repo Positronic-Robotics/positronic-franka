@@ -257,8 +257,6 @@ class Robot {
         control_thread_.join();
       }
       stop_requested_.store(false);
-      // A sync request whose loop died before pickup must not shape this fresh target.
-      sync_request_next_.store(false);
       control_running_.store(true);
       // Snapshot the mode here: the caller is GIL-serialized with set_control_mode, while the thread
       // body would race a concurrent gains handoff writing control_mode_.
@@ -279,6 +277,9 @@ class Robot {
     }
     {
       std::lock_guard<std::mutex> lk(target_mutex_);
+      // An async target cancels any queued sync request it overwrites (including one stranded by a dead
+      // loop) and releases its waiter — the goal that request belonged to can no longer complete.
+      if (asynchronous && sync_request_next_.exchange(false)) complete_goal_();
       target_q_ = q_target;
       has_target_.store(true);
     }
