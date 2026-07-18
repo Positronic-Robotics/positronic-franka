@@ -770,11 +770,6 @@ private:
          stop_ticks = 0,
          ref = Vector7d(Vector7d::Zero())](const franka::RobotState& st,
                                            franka::Duration period) mutable -> franka::Torques {
-          {
-            std::lock_guard<std::mutex> lk(last_state_mutex_);
-            last_state_ = std::make_unique<franka::RobotState>(st);
-          }
-
           const Vector7d q = Eigen::Map<const Vector7d>(st.q.data());
           const Vector7d dq = Eigen::Map<const Vector7d>(st.dq.data());
 
@@ -845,8 +840,11 @@ private:
             }
           }
 
+          // Publish the state and this tick's final reference in one critical section, so a state()
+          // snapshot can never pair them from different ticks.
           {
             std::lock_guard<std::mutex> lk(last_state_mutex_);
+            last_state_ = std::make_unique<franka::RobotState>(st);
             last_software_ref_ = ref;
           }
 
