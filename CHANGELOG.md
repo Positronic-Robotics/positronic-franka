@@ -16,6 +16,7 @@
 - A failed Ruckig replan no longer leaves a stale/default trajectory in place — evaluating one fed NaN positions into libfranka ("lowpass-filter: … NaN") and killed the control thread. The previous plan keeps playing instead.
 - An asynchronous target that supersedes a synchronous goal still in flight now releases the blocked caller instead of leaving it waiting for an unrelated goal.
 - An asynchronous target that overwrites a still-queued synchronous request cancels it and releases its waiter — the stale request no longer Ruckig-shapes the async target (including a request stranded by a dead control loop).
+- A synchronous `set_target_joints` under `SoftwareImpedance` completes only once the measured joints settle near the reference (1 s cap), not as soon as the shaped reference is exhausted.
 
 ## [0.5.0] - 2026-07-10
 

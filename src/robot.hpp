@@ -759,6 +759,8 @@ private:
          first = true,
          sync_in_flight = false,
          shaped = false,
+         settling = false,
+         settle_ticks = 0,
          stopping = false,
          stop_ticks = 0,
          ref = Vector7d(Vector7d::Zero())](const franka::RobotState& st,
@@ -778,11 +780,13 @@ private:
             stopping = true;
             has_target_.store(false);
             shaped = false;
+            settling = false;
             ref = q;
           }
 
           if (!stopping && has_target_.load()) {
             std::lock_guard<std::mutex> lk(target_mutex_);
+            settling = false;
             const bool sync = sync_request_next_.exchange(false);
             if (sync) {
               traj.reset(ref);
@@ -817,9 +821,22 @@ private:
             if (!traj.active()) {
               shaped = false;
               if (sync_in_flight) {
-                complete_goal_();
-                sync_in_flight = false;
+                settling = true;
+                settle_ticks = 0;
               }
+            }
+          }
+
+          // An exhausted reference is not arrival: the loop is a compliant spring, and under load the
+          // measured joints settle well after ref reaches the target. Complete the sync goal once q/dq
+          // are close (1 s cap so contact can never hang the caller).
+          if (settling) {
+            ++settle_ticks;
+            const bool close = (ref - q).cwiseAbs().maxCoeff() < 0.05 && dq.cwiseAbs().maxCoeff() < 0.05;
+            if (close || settle_ticks >= 1000) {
+              settling = false;
+              sync_in_flight = false;
+              complete_goal_();
             }
           }
 
@@ -987,7 +1004,9 @@ private:
   std::atomic<bool> stop_requested_{false};
   std::atomic<bool> has_target_{false};
 
-  // Synchronization for synchronous set_target_joints
+  // Synchronization for synchronous set_target_joints. The goal machinery assumes callers are
+  // serialized — the Python bindings hold the GIL, and a synchronous caller keeps it through its whole
+  // publish-and-wait — so concurrent C++ callers are not supported.
   std::mutex goal_mutex_;
   std::condition_variable goal_cv_;
   bool goal_completed_ = false;
