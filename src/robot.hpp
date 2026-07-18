@@ -301,9 +301,12 @@ class Robot {
       // the goal, and finish_control_thread_ notifies after clearing control_running_.
       std::unique_lock<std::mutex> lk(goal_mutex_);
       goal_cv_.wait(lk, [&]{ return goal_completed_ || !control_running_.load(); });
-      if (goal_failed_) {
+      // Waking without a completed goal means the loop died between our publish and its bookkeeping.
+      if (goal_failed_ || !goal_completed_) {
+        const std::string reason =
+            goal_failed_ ? goal_error_ : "control loop stopped before the joint target was reached";
         goal_failed_ = false;
-        throw std::runtime_error("joint target rejected by the trajectory planner");
+        throw std::runtime_error(reason);
       }
     }
   }
@@ -734,7 +737,7 @@ private:
             if (sync_in_flight && !sync) complete_goal_();
             sync_in_flight = sync && planned;
             // A rejected plan must not let the old trajectory finish this goal as if reached.
-            if (sync && !planned) fail_goal_();
+            if (sync && !planned) fail_goal_("joint target rejected by the trajectory planner");
           }
 
           auto pos = traj.step(period);
@@ -809,7 +812,7 @@ private:
                 sync_in_flight = true;
               } else {
                 // A rejected plan must not let settling at the old reference report the goal reached.
-                fail_goal_();
+                fail_goal_("joint target rejected by the trajectory planner");
               }
             } else {
               ref = target_q_;
@@ -904,24 +907,34 @@ private:
   }
 
   // Wake the synchronous waiter with a failure: its set_target_joints raises instead of returning.
-  void fail_goal_() {
+  void fail_goal_(const char* reason) {
     {
       std::lock_guard<std::mutex> lk(goal_mutex_);
       goal_completed_ = true;
       goal_failed_ = true;
+      goal_error_ = reason;
     }
     goal_cv_.notify_all();
   }
 
   // Every control-thread exit path must clear control_running_ and then wake any synchronous waiter:
-  // a thread that died mid-goal (reflex, NaN, connection loss) otherwise leaves the waiter blocked forever.
+  // a thread that died mid-goal (reflex, NaN, connection loss) otherwise leaves the waiter blocked
+  // forever — and a goal still pending at exit was aborted, not reached, so that waiter raises.
   void finish_control_thread_() {
     control_running_.store(false);
     {
       std::lock_guard<std::mutex> lk(last_state_mutex_);
       last_software_ref_.reset();
     }
-    complete_goal_();
+    {
+      std::lock_guard<std::mutex> lk(goal_mutex_);
+      if (!goal_completed_) {
+        goal_failed_ = true;
+        goal_error_ = "control loop stopped before the joint target was reached";
+      }
+      goal_completed_ = true;
+    }
+    goal_cv_.notify_all();
   }
 
  public:
@@ -1045,6 +1058,7 @@ private:
   std::condition_variable goal_cv_;
   bool goal_completed_ = false;
   bool goal_failed_ = false;
+  std::string goal_error_;
   std::atomic<bool> sync_request_next_{false};
 
   std::mutex last_state_mutex_;

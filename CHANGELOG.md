@@ -21,6 +21,7 @@
 - `state()` copies the cached robot state and the software reference under one lock, and the torque loop publishes them under one lock, so `q`/`dq`/`tau_J_d` and `q_d` always come from the same control tick.
 - A target stranded by a dead control loop is cleared before the replacement loop starts, so its first ticks cannot move toward a stale goal.
 - `set_target_joints` rejects non-finite targets up front (an async torque-mode target becomes the reference verbatim, so a NaN would have become NaN torques), and a synchronous target whose trajectory plan is rejected raises instead of reporting the goal reached at the old reference.
+- A synchronous `set_target_joints` interrupted by a dying control loop (reflex, exception) raises instead of returning as if the target was reached.
 
 ## [0.5.0] - 2026-07-10
 
