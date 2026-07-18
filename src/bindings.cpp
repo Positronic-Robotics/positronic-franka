@@ -99,7 +99,8 @@ PYBIND11_MODULE(_franka, m) {
       .def_property_readonly("control_mode", &positronic_franka::Robot::control_mode,
                              "Active control mode (InternalImpedance | SoftwareImpedance)")
       .def("state", &positronic_franka::Robot::state,
-           "Returns a State with q and dq")
+           "State snapshot from one control tick: measured q/dq/tau_J, tracked reference q_d, commanded "
+           "tau_J_d, EE pose, time, errors, wrench")
       .def(
           "forward_kinematics",
           [](positronic_franka::Robot& r, const positronic_franka::Vector7d& q) {

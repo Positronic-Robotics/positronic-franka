@@ -16,7 +16,6 @@
 #include <atomic>
 #include <mutex>
 #include <condition_variable>
-#include <cmath>
 #include <cstring>
 #include <optional>
 #include <stdexcept>
@@ -26,7 +25,6 @@
 #include <ruckig/ruckig.hpp>
 #include <ruckig/input_parameter.hpp>
 #include <osqp.h>
-#include <stdexcept>
 
 namespace positronic_franka {
 
@@ -38,6 +36,12 @@ constexpr std::array<double, 7> PANDA_JOINT_LOWER_LIMITS = {
     -2.8973, -1.7628, -2.8973, -3.0718, -2.8973, -0.0175, -2.8973};
 constexpr std::array<double, 7> PANDA_JOINT_UPPER_LIMITS = {
     2.8973, 1.7628, 2.8973, 3.0718, 2.8973, 3.7525, 2.8973};
+
+// Rest detection for the software-impedance loop: position/velocity tolerances and the tick cap (1 kHz
+// ticks, so 1 s) bounding how long a waiter can be held.
+constexpr double SETTLE_POSITION_TOLERANCE = 0.05;  // rad
+constexpr double SETTLE_VELOCITY_TOLERANCE = 0.05;  // rad/s
+constexpr int SETTLE_TICKS_CAP = 1000;
 
 // Common Eigen aliases
 using Vector7d = Eigen::Matrix<double, 7, 1>;
@@ -347,10 +351,8 @@ class Robot {
       goal_cv_.wait(lk, [&]{ return goal_completed_ || !control_running_.load(); });
       // Waking without a completed goal means the loop died between our publish and its bookkeeping.
       if (goal_failed_ || !goal_completed_) {
-        const std::string reason =
-            goal_failed_ ? goal_error_ : "control loop stopped before the joint target was reached";
-        goal_failed_ = false;
-        throw std::runtime_error(reason);
+        throw std::runtime_error(goal_failed_ ? goal_error_
+                                              : "control loop stopped before the joint target was reached");
       }
     }
   }
@@ -823,7 +825,6 @@ private:
       robot_->control(
         [&, this,
          first = true,
-         sync_in_flight = false,
          shaped = false,
          settling = false,
          settle_ticks = 0,
@@ -847,13 +848,12 @@ private:
 
           if (!stopping && has_target_.load()) {
             std::lock_guard<std::mutex> lk(target_mutex_);
+            const bool sync_in_flight = shaped || settling;
             settling = false;
-            const bool sync = sync_request_next_.exchange(false);
-            if (sync) {
+            if (sync_request_next_.exchange(false)) {
               traj.reset(ref);
               if (traj.set_target(target_q_)) {
                 shaped = true;
-                sync_in_flight = true;
               } else {
                 // A rejected plan must not let settling at the old reference report the goal reached.
                 fail_goal_("joint target rejected by the trajectory planner");
@@ -863,10 +863,7 @@ private:
               shaped = false;
               // A step target supersedes a sync goal still in flight; release its waiter rather than
               // leave it blocked until some unrelated goal completes.
-              if (sync_in_flight) {
-                complete_goal_();
-                sync_in_flight = false;
-              }
+              if (sync_in_flight) complete_goal_();
             }
             has_target_.store(false);
           }
@@ -885,22 +882,20 @@ private:
             ref = Eigen::Map<const Vector7d>(pos.data());
             if (!traj.active()) {
               shaped = false;
-              if (sync_in_flight) {
-                settling = true;
-                settle_ticks = 0;
-              }
+              settling = true;
+              settle_ticks = 0;
             }
           }
 
           // An exhausted reference is not arrival: the loop is a compliant spring, and under load the
           // measured joints settle well after ref reaches the target. Complete the sync goal once q/dq
-          // are close (1 s cap so contact can never hang the caller).
+          // are close (capped so contact can never hang the caller).
           if (settling) {
             ++settle_ticks;
-            const bool close = (ref - q).cwiseAbs().maxCoeff() < 0.05 && dq.cwiseAbs().maxCoeff() < 0.05;
-            if (close || settle_ticks >= 1000) {
+            const bool close = (ref - q).cwiseAbs().maxCoeff() < SETTLE_POSITION_TOLERANCE &&
+                               dq.cwiseAbs().maxCoeff() < SETTLE_VELOCITY_TOLERANCE;
+            if (close || settle_ticks >= SETTLE_TICKS_CAP) {
               settling = false;
-              sync_in_flight = false;
               complete_goal_();
             }
           }
@@ -926,9 +921,9 @@ private:
           franka::Torques cmd(tau_arr);
 
           if (stopping) {
-            // The spring at ref = q plus damping brings the arm to rest; finish once quiet (1 s cap).
+            // The spring at ref = q plus damping brings the arm to rest; finish once quiet (capped).
             ++stop_ticks;
-            if (dq.cwiseAbs().maxCoeff() < 0.05 || stop_ticks >= 1000) {
+            if (dq.cwiseAbs().maxCoeff() < SETTLE_VELOCITY_TOLERANCE || stop_ticks >= SETTLE_TICKS_CAP) {
               cmd.motion_finished = true;
             }
           }
