@@ -257,6 +257,8 @@ class Robot {
         control_thread_.join();
       }
       stop_requested_.store(false);
+      // A sync request whose loop died before pickup must not shape this fresh target.
+      sync_request_next_.store(false);
       control_running_.store(true);
       // Snapshot the mode here: the caller is GIL-serialized with set_control_mode, while the thread
       // body would race a concurrent gains handoff writing control_mode_.
@@ -708,18 +710,18 @@ private:
             std::lock_guard<std::mutex> lk(target_mutex_);
             traj.set_target(target_q_);
             has_target_.store(false);
-            sync_in_flight = sync_request_next_.exchange(false);
+            const bool sync = sync_request_next_.exchange(false);
+            // An async target supersedes a sync goal still in flight; release its waiter rather than
+            // leave it blocked until some unrelated goal completes.
+            if (sync_in_flight && !sync) complete_goal_();
+            sync_in_flight = sync;
           }
 
           auto pos = traj.step(period);
 
           if (!traj.active()) {
             if (sync_in_flight) {
-              {
-                std::lock_guard<std::mutex> lk(goal_mutex_);
-                goal_completed_ = true;
-              }
-              goal_cv_.notify_all();
+              complete_goal_();
               sync_in_flight = false;
             }
             if (stopping) {
@@ -789,6 +791,12 @@ private:
             } else {
               ref = target_q_;
               shaped = false;
+              // A step target supersedes a sync goal still in flight; release its waiter rather than
+              // leave it blocked until some unrelated goal completes.
+              if (sync_in_flight) {
+                complete_goal_();
+                sync_in_flight = false;
+              }
             }
             has_target_.store(false);
           }
@@ -808,11 +816,7 @@ private:
             if (!traj.active()) {
               shaped = false;
               if (sync_in_flight) {
-                {
-                  std::lock_guard<std::mutex> lk(goal_mutex_);
-                  goal_completed_ = true;
-                }
-                goal_cv_.notify_all();
+                complete_goal_();
                 sync_in_flight = false;
               }
             }
@@ -851,6 +855,15 @@ private:
     finish_control_thread_();
   }
 
+  // Wake any synchronous set_target_joints waiter.
+  void complete_goal_() {
+    {
+      std::lock_guard<std::mutex> lk(goal_mutex_);
+      goal_completed_ = true;
+    }
+    goal_cv_.notify_all();
+  }
+
   // Every control-thread exit path must clear control_running_ and then wake any synchronous waiter:
   // a thread that died mid-goal (reflex, NaN, connection loss) otherwise leaves the waiter blocked forever.
   void finish_control_thread_() {
@@ -859,11 +872,7 @@ private:
       std::lock_guard<std::mutex> lk(last_state_mutex_);
       last_software_ref_.reset();
     }
-    {
-      std::lock_guard<std::mutex> lk(goal_mutex_);
-      goal_completed_ = true;
-    }
-    goal_cv_.notify_all();
+    complete_goal_();
   }
 
  public:
@@ -1023,11 +1032,7 @@ private:
     }
     control_running_.store(false);
     has_target_.store(false);
-    {
-      std::lock_guard<std::mutex> lk(goal_mutex_);
-      goal_completed_ = true;
-    }
-    goal_cv_.notify_all();
+    complete_goal_();
     stop_requested_.store(false);
   }
 };
