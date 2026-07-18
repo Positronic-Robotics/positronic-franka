@@ -4,58 +4,9 @@
 #include <pybind11/eigen.h>
 #include <pybind11/operators.h>
 
-#include <cmath>
-
 #include "robot.hpp"
 
 namespace py = pybind11;
-
-namespace {
-
-template <size_t N>
-bool all_zero(const std::array<double, N>& v) {
-  for (double x : v) {
-    if (x != 0.0) return false;
-  }
-  return true;
-}
-
-template <size_t N>
-bool all_positive(const std::array<double, N>& v) {
-  for (double x : v) {
-    if (!(x > 0.0) || !std::isfinite(x)) return false;  // NaN fails the comparison, inf fails isfinite
-  }
-  return true;
-}
-
-// A gain space is either disabled (stiffness and damping all zero) or a damped spring (both strictly
-// positive); anything in between is a configuration error.
-template <size_t N>
-void validate_half(const std::array<double, N>& k, const std::array<double, N>& kd, const char* name) {
-  if (all_zero(k) && all_zero(kd)) return;
-  if (all_positive(k) && all_positive(kd)) return;
-  throw py::value_error(std::string(name) +
-                        " stiffness and damping must be either all zero (half disabled) or strictly positive");
-}
-
-positronic_franka::InternalImpedance make_internal_impedance(const std::array<double, 7>& k_theta) {
-  if (!all_positive(k_theta)) throw py::value_error("k_theta must be strictly positive");
-  return positronic_franka::InternalImpedance{k_theta};
-}
-
-positronic_franka::SoftwareImpedance make_software_impedance(const std::array<double, 7>& kq,
-                                                             const std::array<double, 7>& kqd,
-                                                             const std::array<double, 6>& kx,
-                                                             const std::array<double, 6>& kxd) {
-  validate_half(kq, kqd, "joint (kq/kqd)");
-  validate_half(kx, kxd, "Cartesian (kx/kxd)");
-  if (all_zero(kq) && all_zero(kx)) {
-    throw py::value_error("at least one of the joint or Cartesian halves must be active");
-  }
-  return positronic_franka::SoftwareImpedance{kq, kqd, kx, kxd};
-}
-
-}  // namespace
 
 PYBIND11_MODULE(_franka, m) {
   m.doc() = "Franka driver stub";
@@ -69,7 +20,7 @@ PYBIND11_MODULE(_franka, m) {
       "Robot's built-in joint impedance controller fed by Ruckig-shaped joint position references. "
       "k_theta is the joint stiffness (7,), strictly positive, default factory-stiff; damping is "
       "managed internally.")
-      .def(py::init(&make_internal_impedance),
+      .def(py::init<const std::array<double, 7>&>(),
            py::arg("k_theta") = positronic_franka::InternalImpedance{}.k_theta)
       .def_readonly("k_theta", &positronic_franka::InternalImpedance::k_theta)
       .def(py::self == py::self);
@@ -81,8 +32,9 @@ PYBIND11_MODULE(_franka, m) {
       "the gains DROID's polymetis deployment uses; otherwise all four must be passed together, and "
       "each half (joint kq/kqd, Cartesian kx/kxd) is either all zero — disabled — or strictly positive, "
       "with at least one half active.")
-      .def(py::init([]() { return positronic_franka::SoftwareImpedance{}; }))
-      .def(py::init(&make_software_impedance),
+      .def(py::init<>())
+      .def(py::init<const std::array<double, 7>&, const std::array<double, 7>&,
+                    const std::array<double, 6>&, const std::array<double, 6>&>(),
            py::arg("kq"), py::arg("kqd"), py::arg("kx"), py::arg("kxd"))
       .def_readonly("kq", &positronic_franka::SoftwareImpedance::kq)
       .def_readonly("kqd", &positronic_franka::SoftwareImpedance::kqd)

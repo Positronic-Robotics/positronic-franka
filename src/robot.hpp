@@ -16,8 +16,10 @@
 #include <atomic>
 #include <mutex>
 #include <condition_variable>
+#include <cmath>
 #include <cstring>
 #include <optional>
+#include <stdexcept>
 #include <variant>
 #include <Eigen/Core>
 #include <Eigen/Geometry>
@@ -48,8 +50,39 @@ using SpatialJacobian = Eigen::Matrix<double, 6, 7>;
 // itself: it runs the polymetis hybrid joint/Cartesian impedance over the torque interface, with async
 // targets applied as instantly-stepped references (DROID execution semantics) and sync targets shaped by
 // Ruckig. Defaults are the factory joint stiffness and DROID's polymetis gains respectively.
+template <size_t N>
+bool all_zero(const std::array<double, N>& v) {
+  for (double x : v) {
+    if (x != 0.0) return false;
+  }
+  return true;
+}
+
+template <size_t N>
+bool all_positive(const std::array<double, N>& v) {
+  for (double x : v) {
+    if (!(x > 0.0) || !std::isfinite(x)) return false;  // NaN fails the comparison, inf fails isfinite
+  }
+  return true;
+}
+
+// A gain space is either disabled (stiffness and damping all zero) or a damped spring (both strictly
+// positive); anything in between is a configuration error.
+template <size_t N>
+void validate_half(const std::array<double, N>& k, const std::array<double, N>& kd, const char* name) {
+  if (all_zero(k) && all_zero(kd)) return;
+  if (all_positive(k) && all_positive(kd)) return;
+  throw std::invalid_argument(std::string(name) +
+                              " stiffness and damping must be either all zero (half disabled) or strictly positive");
+}
+
 struct InternalImpedance {
   std::array<double, 7> k_theta{3000.0, 3000.0, 3000.0, 2500.0, 2500.0, 2000.0, 2000.0};
+
+  InternalImpedance() = default;
+  explicit InternalImpedance(const std::array<double, 7>& k_theta_in) : k_theta(k_theta_in) {
+    if (!all_positive(k_theta)) throw std::invalid_argument("k_theta must be finite and strictly positive");
+  }
 };
 
 // Gain defaults are the metadata defaults of DROID's polymetis deployment — fairo
@@ -61,6 +94,17 @@ struct SoftwareImpedance {
   std::array<double, 7> kqd{4.0, 6.0, 5.0, 5.0, 3.0, 2.0, 1.0};
   std::array<double, 6> kx{750.0, 750.0, 750.0, 15.0, 15.0, 15.0};
   std::array<double, 6> kxd{37.0, 37.0, 37.0, 2.0, 2.0, 2.0};
+
+  SoftwareImpedance() = default;
+  SoftwareImpedance(const std::array<double, 7>& kq_in, const std::array<double, 7>& kqd_in,
+                    const std::array<double, 6>& kx_in, const std::array<double, 6>& kxd_in)
+      : kq(kq_in), kqd(kqd_in), kx(kx_in), kxd(kxd_in) {
+    validate_half(kq, kqd, "joint (kq/kqd)");
+    validate_half(kx, kxd, "Cartesian (kx/kxd)");
+    if (all_zero(kq) && all_zero(kx)) {
+      throw std::invalid_argument("at least one of the joint or Cartesian halves must be active");
+    }
+  }
 };
 
 inline bool operator==(const InternalImpedance& a, const InternalImpedance& b) {
