@@ -2,6 +2,7 @@
 #include <pybind11/stl.h>
 #include <pybind11/numpy.h>
 #include <pybind11/eigen.h>
+#include <pybind11/operators.h>
 
 #include "robot.hpp"
 
@@ -22,7 +23,8 @@ PYBIND11_MODULE(_franka, m) {
              return positronic_franka::InternalImpedance{k_theta};
            }),
            py::arg("k_theta") = positronic_franka::InternalImpedance{}.k_theta)
-      .def_readwrite("k_theta", &positronic_franka::InternalImpedance::k_theta);
+      .def_readwrite("k_theta", &positronic_franka::InternalImpedance::k_theta)
+      .def(py::self == py::self);
 
   py::class_<positronic_franka::SoftwareImpedance>(m, "SoftwareImpedance",
       "Software impedance law on the torque interface (polymetis HybridJointImpedanceControl): "
@@ -39,7 +41,8 @@ PYBIND11_MODULE(_franka, m) {
       .def_readwrite("kq", &positronic_franka::SoftwareImpedance::kq)
       .def_readwrite("kqd", &positronic_franka::SoftwareImpedance::kqd)
       .def_readwrite("kx", &positronic_franka::SoftwareImpedance::kx)
-      .def_readwrite("kxd", &positronic_franka::SoftwareImpedance::kxd);
+      .def_readwrite("kxd", &positronic_franka::SoftwareImpedance::kxd)
+      .def(py::self == py::self);
 
   py::class_<positronic_franka::State>(m, "State")
       .def_property_readonly(
@@ -91,8 +94,10 @@ PYBIND11_MODULE(_franka, m) {
            py::arg("control_mode") = positronic_franka::ControlMode(positronic_franka::InternalImpedance{}))
       .def("set_control_mode", &positronic_franka::Robot::set_control_mode,
            py::arg("mode"),
-           "Stop the control loop and switch backend (InternalImpedance | SoftwareImpedance); the next "
-           "motion command starts the matching loop")
+           "Apply a control mode (InternalImpedance | SoftwareImpedance): an equal mode is a no-op; a "
+           "gains-only SoftwareImpedance change reaches the running torque loop without interrupting "
+           "motion; any other change stops the control loop and the next motion command starts the "
+           "matching one")
       .def_property_readonly("control_mode", &positronic_franka::Robot::control_mode,
                              "Active control mode (InternalImpedance | SoftwareImpedance)")
       .def("state", &positronic_franka::Robot::state,

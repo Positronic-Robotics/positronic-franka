@@ -59,6 +59,14 @@ struct SoftwareImpedance {
   std::array<double, 6> kxd{37.0, 37.0, 37.0, 2.0, 2.0, 2.0};
 };
 
+inline bool operator==(const InternalImpedance& a, const InternalImpedance& b) {
+  return a.k_theta == b.k_theta;
+}
+
+inline bool operator==(const SoftwareImpedance& a, const SoftwareImpedance& b) {
+  return a.kq == b.kq && a.kqd == b.kqd && a.kx == b.kx && a.kxd == b.kxd;
+}
+
 using ControlMode = std::variant<InternalImpedance, SoftwareImpedance>;
 
 struct State {
@@ -190,7 +198,9 @@ class Robot {
         robot_(std::make_unique<franka::Robot>(ip, realtime_config)),
         relative_dynamics_factor_(std::clamp(relative_dynamics_factor, 0.0001, 1.0)) {
     model_ = std::make_unique<franka::Model>(robot_->loadModel());
-    set_control_mode(control_mode);
+    // Force-apply: the equality guard in set_control_mode must not skip pushing k_theta when the
+    // requested mode happens to equal the default — the robot may persist stiffness from past sessions.
+    apply_control_mode_(control_mode);
   }
 
   ~Robot() {
@@ -228,15 +238,14 @@ class Robot {
     return st;
   }
 
-  // Stop the control loop and switch the impedance backend. The new loop starts lazily on the next
-  // motion command. For InternalImpedance the joint stiffness is pushed to the robot here; SoftwareImpedance
-  // gains live purely in the torque loop.
+  // Apply a control mode with the least interruption the change allows: an equal mode is a no-op; a
+  // gains-only SoftwareImpedance change is handed to the running torque loop without interrupting motion;
+  // any other change stops the control loop (clearing the pending target) and the next motion command
+  // starts the matching loop. k_theta is pushed to the robot (the internal controller reads robot-side
+  // config); software gains live purely in the torque loop.
   void set_control_mode(const ControlMode& mode) {
-    stop_control_loop_();
-    control_mode_ = mode;
-    if (const auto* internal = std::get_if<InternalImpedance>(&control_mode_)) {
-      robot_->setJointImpedance(internal->k_theta);
-    }
+    if (mode == control_mode_) return;
+    apply_control_mode_(mode);
   }
 
   ControlMode control_mode() const { return control_mode_; }
@@ -249,8 +258,11 @@ class Robot {
       }
       stop_requested_.store(false);
       control_running_.store(true);
-      control_thread_ = std::thread([this] {
-        if (const auto* software = std::get_if<SoftwareImpedance>(&control_mode_)) {
+      // Snapshot the mode here: the caller is GIL-serialized with set_control_mode, while the thread
+      // body would race a concurrent gains handoff writing control_mode_.
+      const ControlMode mode = control_mode_;
+      control_thread_ = std::thread([this, mode] {
+        if (const auto* software = std::get_if<SoftwareImpedance>(&mode)) {
           this->run_joint_torque_control_(*software);
         } else {
           this->run_joint_position_control_();
@@ -732,10 +744,10 @@ private:
   // reference q_d instantly (DROID execution semantics), sync targets are Ruckig-shaped and tracked
   // by the same law.
   void run_joint_torque_control_(SoftwareImpedance imp) {
-    const Vector7d Kq = Eigen::Map<const Vector7d>(imp.kq.data());
-    const Vector7d Kqd = Eigen::Map<const Vector7d>(imp.kqd.data());
-    const Vector6d Kx = Eigen::Map<const Vector6d>(imp.kx.data());
-    const Vector6d Kxd = Eigen::Map<const Vector6d>(imp.kxd.data());
+    Vector7d Kq = Eigen::Map<const Vector7d>(imp.kq.data());
+    Vector7d Kqd = Eigen::Map<const Vector7d>(imp.kqd.data());
+    Vector6d Kx = Eigen::Map<const Vector6d>(imp.kx.data());
+    Vector6d Kxd = Eigen::Map<const Vector6d>(imp.kxd.data());
     try {
       TrajectoryGenerator traj(relative_dynamics_factor_);
 
@@ -779,6 +791,15 @@ private:
               shaped = false;
             }
             has_target_.store(false);
+          }
+
+          if (has_new_gains_.load()) {
+            std::lock_guard<std::mutex> lk(target_mutex_);
+            Kq = Eigen::Map<const Vector7d>(new_gains_.kq.data());
+            Kqd = Eigen::Map<const Vector7d>(new_gains_.kqd.data());
+            Kx = Eigen::Map<const Vector6d>(new_gains_.kx.data());
+            Kxd = Eigen::Map<const Vector6d>(new_gains_.kxd.data());
+            has_new_gains_.store(false);
           }
 
           if (shaped) {
@@ -969,11 +990,31 @@ private:
   std::optional<Vector7d> last_software_ref_;
 
   const double relative_dynamics_factor_{1.0};
-  // Written only while the control loop is idle (constructor, set_control_mode after stop); read when
-  // a motion command starts the loop.
+  // Read when a motion command starts the loop; the running loop never reads it — a software gains
+  // change reaches the loop via new_gains_. Callers are serialized by the Python GIL.
   ControlMode control_mode_;
   std::mutex target_mutex_;
   Vector7d target_q_ = Vector7d::Zero();
+  // A gains-only SoftwareImpedance change, picked up by the running torque loop mid-session.
+  SoftwareImpedance new_gains_;
+  std::atomic<bool> has_new_gains_{false};
+
+  // The unconditional half of set_control_mode; the constructor uses it to force-apply the initial mode.
+  void apply_control_mode_(const ControlMode& mode) {
+    // A software→software change is absorbed by the running torque loop (the rate limiter and lowpass
+    // smooth the gain step, as with reference steps); every other change needs the backend torn down.
+    const bool gains_handoff = std::holds_alternative<SoftwareImpedance>(mode) &&
+                               std::holds_alternative<SoftwareImpedance>(control_mode_);
+    if (!gains_handoff) stop_control_loop_();
+    control_mode_ = mode;
+    if (const auto* internal = std::get_if<InternalImpedance>(&control_mode_)) {
+      robot_->setJointImpedance(internal->k_theta);
+    } else {
+      std::lock_guard<std::mutex> lk(target_mutex_);
+      new_gains_ = std::get<SoftwareImpedance>(control_mode_);
+      has_new_gains_.store(true);
+    }
+  }
 
   void stop_control_loop_() {
     stop_requested_.store(true);
