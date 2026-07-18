@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.6.0] - 2026-07-17
+
+### Added
+- Control modes: `InternalImpedance(k_theta)` (built-in joint impedance controller, Ruckig-shaped references — previous behavior) and `SoftwareImpedance(kq, kqd, kx, kxd)` (polymetis hybrid impedance law `tau = (J^T Kx J + Kq)(q_d - q) - (J^T Kxd J + Kqd) dq + coriolis` over the torque interface, `limit_rate` on, 100 Hz cutoff — DROID execution semantics). `Robot` applies the initial mode in its constructor; `set_control_mode()` applies a mode with the least interruption the change allows — an equal mode is a no-op, a gains-only `SoftwareImpedance` change reaches the running torque loop without interrupting motion, and any other change stops the control loop so the next motion command starts the matching one. The mode structs compare by value (Python `==` included). Under `SoftwareImpedance`, async `set_target_joints` steps the reference instantly; sync calls shape it with Ruckig, tracked by the same law, and block until the measured joints settle near the reference (1 s cap). Defaults are the factory stiffness and DROID's polymetis gains.
+- Expose `q_d` (commanded reference; under `SoftwareImpedance` the loop's stepped/shaped reference), `tau_J` (measured joint torques), `tau_J_d` (commanded torque after rate limiting/filtering, gravity-free), and `time` (controller clock) on `State` — all fields reported from the same control tick.
+- `zero_jacobian(q)` and `coriolis(q, dq)` — the exact model terms the torque loop uses, for offline validation of a logged trace against the law.
+- Mode gains are validated at construction and read-only afterwards: `k_theta` strictly positive; `SoftwareImpedance` takes either no gains (DROID's deployed values) or all four together, each half (joint `kq`/`kqd`, Cartesian `kx`/`kxd`) entirely zero — disabled — or strictly positive, with at least one half active. `set_target_joints` rejects non-finite targets.
+
+### Removed
+- `set_joint_impedance` — joint stiffness is owned by the `InternalImpedance` control mode; pass it to the `Robot` constructor or `set_control_mode()`.
+- `set_cartesian_impedance` — it parameterizes the robot's internal *Cartesian* impedance controller, which this driver never activates (motion-generator sessions run in the default joint-impedance controller mode, and the torque loop bypasses internal impedance entirely), so the setting was dead configuration. If internal Cartesian control is ever wanted, it becomes a new `ControlMode` alternative owning that stiffness.
+
+### Fixed
+- A control thread that dies (reflex, exception) mid-goal now wakes a blocked synchronous `set_target_joints` caller, which raises instead of deadlocking or returning as if the target was reached.
+- A failed Ruckig replan no longer leaves a stale/default trajectory in place — evaluating one fed NaN positions into libfranka ("lowpass-filter: … NaN") and killed the control thread. The previous plan keeps playing instead.
+- An asynchronous target that supersedes a synchronous goal — still queued or already in flight — cancels it and releases the blocked caller instead of leaving it waiting for an unrelated goal.
+- A target stranded by a dead control loop is cleared before the replacement loop starts, so its first ticks cannot move toward a stale goal.
+- A synchronous target whose trajectory plan is rejected raises instead of reporting the goal reached at the old reference.
+
 ## [0.5.0] - 2026-07-10
 
 ### Added

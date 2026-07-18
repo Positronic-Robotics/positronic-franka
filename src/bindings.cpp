@@ -2,18 +2,45 @@
 #include <pybind11/stl.h>
 #include <pybind11/numpy.h>
 #include <pybind11/eigen.h>
+#include <pybind11/operators.h>
 
 #include "robot.hpp"
 
 namespace py = pybind11;
 
 PYBIND11_MODULE(_franka, m) {
-  m.doc() = "Franka driver stub";
+  m.doc() = "Franka robot driver";
 
   py::enum_<franka::RealtimeConfig>(m, "RealtimeConfig")
       .value("Enforce", franka::RealtimeConfig::kEnforce)
       .value("Ignore", franka::RealtimeConfig::kIgnore)
       .export_values();
+
+  py::class_<positronic_franka::InternalImpedance>(m, "InternalImpedance",
+      "Robot's built-in joint impedance controller fed by Ruckig-shaped joint position references. "
+      "k_theta is the joint stiffness (7,), strictly positive, default factory-stiff; damping is "
+      "managed internally.")
+      .def(py::init<const std::array<double, 7>&>(),
+           py::arg("k_theta") = positronic_franka::InternalImpedance{}.k_theta)
+      .def_readonly("k_theta", &positronic_franka::InternalImpedance::k_theta)
+      .def(py::self == py::self);
+
+  py::class_<positronic_franka::SoftwareImpedance>(m, "SoftwareImpedance",
+      "Software impedance law on the torque interface (polymetis HybridJointImpedanceControl): "
+      "tau = (J^T Kx J + Kq)(q_d - q) - (J^T Kxd J + Kqd) dq + coriolis. Async targets step the "
+      "reference instantly; sync targets are Ruckig-shaped. Constructed with no arguments it carries "
+      "the gains DROID's polymetis deployment uses; otherwise all four must be passed together, and "
+      "each half (joint kq/kqd, Cartesian kx/kxd) is either all zero — disabled — or strictly positive, "
+      "with at least one half active.")
+      .def(py::init<>())
+      .def(py::init<const std::array<double, 7>&, const std::array<double, 7>&,
+                    const std::array<double, 6>&, const std::array<double, 6>&>(),
+           py::arg("kq"), py::arg("kqd"), py::arg("kx"), py::arg("kxd"))
+      .def_readonly("kq", &positronic_franka::SoftwareImpedance::kq)
+      .def_readonly("kqd", &positronic_franka::SoftwareImpedance::kqd)
+      .def_readonly("kx", &positronic_franka::SoftwareImpedance::kx)
+      .def_readonly("kxd", &positronic_franka::SoftwareImpedance::kxd)
+      .def(py::self == py::self);
 
   py::class_<positronic_franka::State>(m, "State")
       .def_property_readonly(
@@ -25,9 +52,25 @@ PYBIND11_MODULE(_franka, m) {
           [](const positronic_franka::State& s) { return s.dq; },
           "Measured joint velocities (7,) as numpy array")
       .def_property_readonly(
+          "q_d",
+          [](const positronic_franka::State& s) { return s.q_d; },
+          "Last commanded joint positions (7,) — the reference the internal controller tracks")
+      .def_property_readonly(
+          "tau_J",
+          [](const positronic_franka::State& s) { return s.tau_J; },
+          "Measured link-side joint torques (7,) as numpy array")
+      .def_property_readonly(
+          "tau_J_d",
+          [](const positronic_franka::State& s) { return s.tau_J_d; },
+          "Last commanded joint torques (7,) after rate limiting/filtering, without gravity")
+      .def_property_readonly(
           "end_effector_pose",
           [](const positronic_franka::State& s) { return s.end_effector_pose; },
           "End-effector pose in robot frame as (tx,ty,tz,qw,qx,qy,qz)")
+      .def_property_readonly(
+          "time",
+          [](const positronic_franka::State& s) { return s.time; },
+          "Robot controller time since start, seconds")
       .def_property_readonly(
           "error",
           [](const positronic_franka::State& s) { return s.error; },
@@ -42,12 +85,22 @@ PYBIND11_MODULE(_franka, m) {
           "External wrench on stiffness frame (Fx,Fy,Fz,Mx,My,Mz)");
 
   py::class_<positronic_franka::Robot>(m, "Robot")
-      .def(py::init<const std::string&, franka::RealtimeConfig, double>(),
+      .def(py::init<const std::string&, franka::RealtimeConfig, double, positronic_franka::ControlMode>(),
            py::arg("ip"),
            py::arg("realtime_config") = franka::RealtimeConfig::kIgnore,
-           py::arg("relative_dynamics_factor") = 1.0)
+           py::arg("relative_dynamics_factor") = 1.0,
+           py::arg("control_mode") = positronic_franka::ControlMode(positronic_franka::InternalImpedance{}))
+      .def("set_control_mode", &positronic_franka::Robot::set_control_mode,
+           py::arg("mode"),
+           "Apply a control mode (InternalImpedance | SoftwareImpedance): an equal mode is a no-op; a "
+           "gains-only SoftwareImpedance change reaches the running torque loop without interrupting "
+           "motion; any other change stops the control loop and the next motion command starts the "
+           "matching one")
+      .def_property_readonly("control_mode", &positronic_franka::Robot::control_mode,
+                             "Active control mode (InternalImpedance | SoftwareImpedance)")
       .def("state", &positronic_franka::Robot::state,
-           "Returns a State with q and dq")
+           "State snapshot from one control tick: measured q/dq/tau_J, tracked reference q_d, commanded "
+           "tau_J_d, EE pose, time, errors, wrench")
       .def(
           "forward_kinematics",
           [](positronic_franka::Robot& r, const positronic_franka::Vector7d& q) {
@@ -55,6 +108,18 @@ PYBIND11_MODULE(_franka, m) {
           },
           py::arg("q"),
           "FK from joint vector (7,) to EE pose (tx,ty,tz,qw,qx,qy,qz) in base frame")
+      .def(
+          "zero_jacobian",
+          [](positronic_franka::Robot& r, const positronic_franka::Vector7d& q) { return r.zero_jacobian(q); },
+          py::arg("q"),
+          "End-effector zero Jacobian (6x7) at joint values q, with the robot's current frames — the "
+          "J the SoftwareImpedance law uses")
+      .def(
+          "coriolis",
+          [](positronic_franka::Robot& r, const positronic_franka::Vector7d& q,
+             const positronic_franka::Vector7d& dq) { return r.coriolis(q, dq); },
+          py::arg("q"), py::arg("dq"),
+          "Coriolis torques (7,) at explicit q, dq with the robot's current load configuration")
       .def(
           "inverse_kinematics",
           [](positronic_franka::Robot& r, const positronic_franka::Vector7d& target_pose_wxyz) {
@@ -91,12 +156,6 @@ PYBIND11_MODULE(_franka, m) {
       .def_property_readonly("relative_dynamics_factor",
                              &positronic_franka::Robot::relative_dynamics_factor,
                              "Fixed factor scaling max vel/acc/jerk for Ruckig (0.05..1.0)")
-      .def("set_joint_impedance", &positronic_franka::Robot::set_joint_impedance,
-           py::arg("joint_stiffness"),
-           "Set joint stiffness (7,) in N·m/rad")
-      .def("set_cartesian_impedance", &positronic_franka::Robot::set_cartesian_impedance,
-           py::arg("cartesian_stiffness"),
-           "Set Cartesian stiffness (6,) [Fx,Fy,Fz,Mx,My,Mz]")
       .def(
           "set_collision_behavior",
           py::overload_cast<

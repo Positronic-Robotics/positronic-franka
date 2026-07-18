@@ -17,12 +17,14 @@
 #include <mutex>
 #include <condition_variable>
 #include <cstring>
+#include <optional>
+#include <stdexcept>
+#include <variant>
 #include <Eigen/Core>
 #include <Eigen/Geometry>
 #include <ruckig/ruckig.hpp>
 #include <ruckig/input_parameter.hpp>
 #include <osqp.h>
-#include <stdexcept>
 
 namespace positronic_franka {
 
@@ -35,16 +37,103 @@ constexpr std::array<double, 7> PANDA_JOINT_LOWER_LIMITS = {
 constexpr std::array<double, 7> PANDA_JOINT_UPPER_LIMITS = {
     2.8973, 1.7628, 2.8973, 3.0718, 2.8973, 3.7525, 2.8973};
 
+// Rest detection for the software-impedance loop: position/velocity tolerances and the tick cap (1 kHz
+// ticks, so 1 s) bounding how long a waiter can be held.
+constexpr double SETTLE_POSITION_TOLERANCE = 0.05;  // rad
+constexpr double SETTLE_VELOCITY_TOLERANCE = 0.05;  // rad/s
+constexpr int SETTLE_TICKS_CAP = 1000;
+
 // Common Eigen aliases
 using Vector7d = Eigen::Matrix<double, 7, 1>;
 using Vector6d = Eigen::Matrix<double, 6, 1>;
+using Matrix7d = Eigen::Matrix<double, 7, 7>;
 using SpatialJacobian = Eigen::Matrix<double, 6, 7>;
+
+// Control modes. InternalImpedance drives the robot's built-in joint impedance controller through the
+// joint position motion generator with Ruckig-shaped references. SoftwareImpedance owns the impedance law
+// itself: it runs the polymetis hybrid joint/Cartesian impedance over the torque interface, with async
+// targets applied as instantly-stepped references (DROID execution semantics) and sync targets shaped by
+// Ruckig. Defaults are the factory joint stiffness and DROID's polymetis gains respectively.
+template <size_t N>
+bool all_zero(const std::array<double, N>& v) {
+  for (double x : v) {
+    if (x != 0.0) return false;
+  }
+  return true;
+}
+
+template <size_t N>
+bool all_positive(const std::array<double, N>& v) {
+  for (double x : v) {
+    if (!(x > 0.0) || !std::isfinite(x)) return false;  // NaN fails the comparison, inf fails isfinite
+  }
+  return true;
+}
+
+// A gain space is either disabled (stiffness and damping all zero) or a damped spring (both strictly
+// positive); anything in between is a configuration error.
+template <size_t N>
+void validate_half(const std::array<double, N>& k, const std::array<double, N>& kd, const char* name) {
+  if (all_zero(k) && all_zero(kd)) return;
+  if (all_positive(k) && all_positive(kd)) return;
+  throw std::invalid_argument(std::string(name) +
+                              " stiffness and damping must be either all zero (half disabled) or strictly positive");
+}
+
+struct InternalImpedance {
+  std::array<double, 7> k_theta{3000.0, 3000.0, 3000.0, 2500.0, 2500.0, 2000.0, 2000.0};
+
+  InternalImpedance() = default;
+  explicit InternalImpedance(const std::array<double, 7>& k_theta_in) : k_theta(k_theta_in) {
+    if (!all_positive(k_theta)) throw std::invalid_argument("k_theta must be finite and strictly positive");
+  }
+};
+
+// Gain defaults are the metadata defaults of DROID's polymetis deployment — fairo
+// polymetis/conf/robot_client/franka_hardware.yaml, loaded by DROID's `launch_robot.py
+// robot_client=franka_hardware` — i.e. the exact configuration HybridJointImpedanceControl runs with
+// in the DROID data-collection stack.
+struct SoftwareImpedance {
+  std::array<double, 7> kq{40.0, 30.0, 50.0, 25.0, 35.0, 25.0, 10.0};
+  std::array<double, 7> kqd{4.0, 6.0, 5.0, 5.0, 3.0, 2.0, 1.0};
+  std::array<double, 6> kx{750.0, 750.0, 750.0, 15.0, 15.0, 15.0};
+  std::array<double, 6> kxd{37.0, 37.0, 37.0, 2.0, 2.0, 2.0};
+
+  SoftwareImpedance() = default;
+  SoftwareImpedance(const std::array<double, 7>& kq_in, const std::array<double, 7>& kqd_in,
+                    const std::array<double, 6>& kx_in, const std::array<double, 6>& kxd_in)
+      : kq(kq_in), kqd(kqd_in), kx(kx_in), kxd(kxd_in) {
+    validate_half(kq, kqd, "joint (kq/kqd)");
+    validate_half(kx, kxd, "Cartesian (kx/kxd)");
+    if (all_zero(kq) && all_zero(kx)) {
+      throw std::invalid_argument("at least one of the joint or Cartesian halves must be active");
+    }
+  }
+};
+
+inline bool operator==(const InternalImpedance& a, const InternalImpedance& b) {
+  return a.k_theta == b.k_theta;
+}
+
+inline bool operator==(const SoftwareImpedance& a, const SoftwareImpedance& b) {
+  return a.kq == b.kq && a.kqd == b.kqd && a.kx == b.kx && a.kxd == b.kxd;
+}
+
+using ControlMode = std::variant<InternalImpedance, SoftwareImpedance>;
 
 struct State {
   Vector7d q;
   Vector7d dq;
+  // Last commanded joint positions (the reference the internal controller tracks).
+  Vector7d q_d;
+  // Measured link-side joint torques.
+  Vector7d tau_J;
+  // Last commanded joint torques (after rate limiting/filtering), without gravity.
+  Vector7d tau_J_d;
   // End-effector pose in base (robot) frame: [tx, ty, tz, qw, qx, qy, qz]
   Vector7d end_effector_pose;
+  // Robot controller time since start, seconds.
+  double time = 0.0;
   int error = 0;
   std::string error_message;
   // External wrench (force, torque) on end-effector frame expressed in K frame.
@@ -80,9 +169,22 @@ class TrajectoryGenerator {
     replan_();
   }
 
-  void set_target(const Vector7d& target) {
-    for (size_t i = 0; i < 7; ++i) input_.target_position[i] = target[i];
+  // Restart the generator from a reference position at rest (torque mode shapes segments from the
+  // stepped reference, not from measured robot state).
+  void reset(const Vector7d& pos) {
+    for (size_t i = 0; i < 7; ++i) {
+      input_.current_position[i] = pos[i];
+      input_.current_velocity[i] = 0.0;
+      input_.current_acceleration[i] = 0.0;
+      input_.target_position[i] = pos[i];
+    }
     replan_();
+  }
+
+  // Returns whether the plan to the new target was accepted; on failure the previous plan keeps playing.
+  bool set_target(const Vector7d& target) {
+    for (size_t i = 0; i < 7; ++i) input_.target_position[i] = target[i];
+    return replan_();
   }
 
   void stop_at_current() {
@@ -92,6 +194,8 @@ class TrajectoryGenerator {
 
   // Advance trajectory by actual elapsed time and return the position.
   std::array<double, 7> step(franka::Duration period) {
+    if (!planned_) return input_.current_position;
+
     double dt = period.toSec();
     if (dt <= 0.0) dt = NOMINAL_DT;
     cumulative_time_ += dt;
@@ -111,15 +215,22 @@ class TrajectoryGenerator {
   bool active() const { return active_; }
 
  private:
-  void replan_() {
-    auto result = otg_.calculate(input_, trajectory_);
+  bool replan_() {
+    // Calculate into a scratch trajectory and swap only on success: a failed calculate must not leave a
+    // default-constructed/stale trajectory in place — evaluating one feeds garbage (NaN) into libfranka
+    // and kills the control thread. On failure the previous plan keeps playing.
+    ruckig::Trajectory<7> next;
+    auto result = otg_.calculate(input_, next);
     if (result < 0) {
       std::cerr << "Ruckig trajectory planning failed (error " << static_cast<int>(result) << ")" << std::endl;
-      return;
+      return false;
     }
+    trajectory_ = next;
+    planned_ = true;
     cumulative_time_ = 0.0;
     duration_ = trajectory_.get_duration();
     active_ = true;
+    return true;
   }
 
   ruckig::Ruckig<7> otg_{NOMINAL_DT};
@@ -128,17 +239,21 @@ class TrajectoryGenerator {
   double cumulative_time_ = 0.0;
   double duration_ = 0.0;
   bool active_ = false;
+  bool planned_ = false;
 };
 
 class Robot {
  public:
   explicit Robot(const std::string& ip,
                  franka::RealtimeConfig realtime_config = franka::RealtimeConfig::kIgnore,
-                 double relative_dynamics_factor = 1.0)
-      : ip_(ip),
-        robot_(std::make_unique<franka::Robot>(ip, realtime_config)),
+                 double relative_dynamics_factor = 1.0,
+                 ControlMode control_mode = InternalImpedance{})
+      : robot_(std::make_unique<franka::Robot>(ip, realtime_config)),
         relative_dynamics_factor_(std::clamp(relative_dynamics_factor, 0.0001, 1.0)) {
     model_ = std::make_unique<franka::Model>(robot_->loadModel());
+    // Force-apply: the equality guard in set_control_mode must not skip pushing k_theta when the
+    // requested mode happens to equal the default — the robot may persist stiffness from past sessions.
+    apply_control_mode_(control_mode);
   }
 
   ~Robot() {
@@ -146,7 +261,7 @@ class Robot {
   }
 
   State state() {
-    franka::RobotState rs = read_robot_state_();
+    auto [rs, software_ref] = read_state_snapshot_();
     // Map the column-major 4x4 transform into Eigen
     Eigen::Map<const Eigen::Matrix4d> T(rs.O_T_EE.data());
     const Eigen::Vector3d t = T.block<3, 1>(0, 3);
@@ -156,7 +271,13 @@ class Robot {
     State st{};
     st.q = Eigen::Map<const Vector7d>(rs.q.data());
     st.dq = Eigen::Map<const Vector7d>(rs.dq.data());
+    // Under torque control the reference lives in the software loop, not in the robot's q_d; report
+    // whichever reference the active controller tracks.
+    st.q_d = software_ref ? *software_ref : Eigen::Map<const Vector7d>(rs.q_d.data());
+    st.tau_J = Eigen::Map<const Vector7d>(rs.tau_J.data());
+    st.tau_J_d = Eigen::Map<const Vector7d>(rs.tau_J_d.data());
     st.end_effector_pose << t.x(), t.y(), t.z(), q.w(), q.x(), q.y(), q.z();
+    st.time = rs.time.toSec();
     st.error = rs.current_errors ? 1 : 0;
     if (st.error) {
       st.error_message = static_cast<std::string>(rs.current_errors);
@@ -166,30 +287,72 @@ class Robot {
     return st;
   }
 
+  // Apply a control mode with the least interruption the change allows: an equal mode is a no-op; a
+  // gains-only SoftwareImpedance change is handed to the running torque loop without interrupting motion;
+  // any other change stops the control loop (clearing the pending target) and the next motion command
+  // starts the matching loop. k_theta is pushed to the robot (the internal controller reads robot-side
+  // config); software gains live purely in the torque loop.
+  void set_control_mode(const ControlMode& mode) {
+    if (mode == control_mode_) return;
+    apply_control_mode_(mode);
+  }
+
+  ControlMode control_mode() const { return control_mode_; }
+
   void set_target_joints(const Eigen::Ref<const Vector7d>& q_target,
                          bool asynchronous = true) {
+    // Reject garbage before it reaches a control loop: an async torque-mode target becomes the reference
+    // verbatim, so a NaN here would become NaN torques.
+    if (!q_target.allFinite()) {
+      throw std::invalid_argument("q_target must be finite");
+    }
     if (!control_running_.load()) {
       if (control_thread_.joinable()) {
         control_thread_.join();
       }
       stop_requested_.store(false);
+      // A target or sync request stranded by a dead loop must not feed the replacement loop's first
+      // ticks — those can run before this command publishes its own target below. Anything queued here
+      // is stale: no loop consumed it, and the caller's publish comes after (callers are serialized).
+      has_target_.store(false);
+      sync_request_next_.store(false);
       control_running_.store(true);
-      control_thread_ = std::thread([this] { this->run_joint_position_control_(); });
+      // Snapshot the mode here: the caller is GIL-serialized with set_control_mode, while the thread
+      // body would race a concurrent gains handoff writing control_mode_.
+      const ControlMode mode = control_mode_;
+      control_thread_ = std::thread([this, mode] {
+        if (const auto* software = std::get_if<SoftwareImpedance>(&mode)) {
+          this->run_joint_torque_control_(*software);
+        } else {
+          this->run_joint_position_control_();
+        }
+      });
     }
     if (!asynchronous) {
       // Prepare synchronous wait before publishing the target to avoid races.
       std::lock_guard<std::mutex> glk(goal_mutex_);
       goal_completed_ = false;
+      goal_failed_ = false;
       sync_request_next_.store(true);
     }
     {
       std::lock_guard<std::mutex> lk(target_mutex_);
+      // An async target cancels any queued sync request it overwrites (including one stranded by a dead
+      // loop) and releases its waiter — the goal that request belonged to can no longer complete.
+      if (asynchronous && sync_request_next_.exchange(false)) complete_goal_();
       target_q_ = q_target;
       has_target_.store(true);
     }
     if (!asynchronous) {
+      // Also wake when the control thread dies (reflex, exception): a dead thread can never complete
+      // the goal, and finish_control_thread_ notifies after clearing control_running_.
       std::unique_lock<std::mutex> lk(goal_mutex_);
-      goal_cv_.wait(lk, [&]{ return goal_completed_; });
+      goal_cv_.wait(lk, [&]{ return goal_completed_ || !control_running_.load(); });
+      // Waking without a completed goal means the loop died between our publish and its bookkeeping.
+      if (goal_failed_ || !goal_completed_) {
+        throw std::runtime_error(goal_failed_ ? goal_error_
+                                              : "control loop stopped before the joint target was reached");
+      }
     }
   }
 
@@ -208,6 +371,23 @@ class Robot {
     Vector7d pose;
     pose << t.x(), t.y(), t.z(), quat.w(), quat.x(), quat.y(), quat.z();
     return pose;
+  }
+
+  // Model terms at explicit joint values, using the connected robot's current frames and load
+  // configuration. These mirror the exact terms the SoftwareImpedance loop uses, so logged traces can
+  // be validated offline against the implemented law.
+  SpatialJacobian zero_jacobian(const Eigen::Ref<const Vector7d>& q) {
+    franka::RobotState st = read_robot_state_();
+    st.q = to_std_array7_(q);
+    return ee_jacobian_(st);
+  }
+
+  Vector7d coriolis(const Eigen::Ref<const Vector7d>& q, const Eigen::Ref<const Vector7d>& dq) {
+    franka::RobotState st = read_robot_state_();
+    st.q = to_std_array7_(q);
+    st.dq = to_std_array7_(dq);
+    const auto cor = model_->coriolis(st);
+    return Eigen::Map<const Vector7d>(cor.data());
   }
 
   // Inverse Kinematics to EndEffector pose in base frame (tx, ty, tz, qw, qx, qy, qz)
@@ -274,12 +454,6 @@ class Robot {
       }
       if (best_err >= err_norm - 1e-9) break;  // No meaningful improvement, terminate
     }
-    // Print final Cartesian error (translation in mm, rotation in degrees) to stderr
-    st.q = to_std_array7_(q);
-    const Eigen::Matrix4d T_final = ee_pose_matrix_(st);
-    const Eigen::Matrix<double, 6, 1> e_final = cartesian_error_(T_final, t_tgt, R_tgt);
-    const double trans_err_mm = 1000.0 * e_final.head<3>().norm();
-    const double rot_err_deg = (180.0 / M_PI) * e_final.tail<3>().norm();
     return q;
   }
 
@@ -514,14 +688,6 @@ class Robot {
         break;
       q = q_next;
     }
-
-    st.q = to_std_array7_(q);
-    const Eigen::Matrix4d T_final = ee_pose_matrix_(st);
-    const Eigen::Matrix<double, 6, 1> e_final = cartesian_error_(T_final, t_tgt, R_tgt);
-    const double trans_err_mm = 1000.0 * e_final.head<3>().norm();
-    const double rot_err_deg = (180.0 / M_PI) * e_final.tail<3>().norm();
-    static_cast<void>(trans_err_mm);
-    static_cast<void>(rot_err_deg);
     return q;
   }
 
@@ -594,20 +760,22 @@ private:
 
           if (!stopping && has_target_.load()) {
             std::lock_guard<std::mutex> lk(target_mutex_);
-            traj.set_target(target_q_);
+            const bool planned = traj.set_target(target_q_);
             has_target_.store(false);
-            sync_in_flight = sync_request_next_.exchange(false);
+            const bool sync = sync_request_next_.exchange(false);
+            // An async target supersedes a sync goal still in flight; release its waiter rather than
+            // leave it blocked until some unrelated goal completes.
+            if (sync_in_flight && !sync) complete_goal_();
+            sync_in_flight = sync && planned;
+            // A rejected plan must not let the old trajectory finish this goal as if reached.
+            if (sync && !planned) fail_goal_("joint target rejected by the trajectory planner");
           }
 
           auto pos = traj.step(period);
 
           if (!traj.active()) {
             if (sync_in_flight) {
-              {
-                std::lock_guard<std::mutex> lk(goal_mutex_);
-                goal_completed_ = true;
-              }
-              goal_cv_.notify_all();
+              complete_goal_();
               sync_in_flight = false;
             }
             if (stopping) {
@@ -622,18 +790,178 @@ private:
     } catch (const std::exception& e) {
       std::cerr << "Joint control thread error: " << e.what() << std::endl;
     }
+    finish_control_thread_();
+  }
+
+  // Torque-interface control loop running the polymetis hybrid impedance law:
+  //   tau = (J^T Kx J + Kq)(q_d - q) - (J^T Kxd J + Kqd) dq + coriolis
+  // Gravity is compensated by libfranka underneath the torque command. Shares the target/stop/sync
+  // machinery with the position loop; only the reference semantics differ: async targets step the
+  // reference q_d instantly (DROID execution semantics), sync targets are Ruckig-shaped and tracked
+  // by the same law.
+  void run_joint_torque_control_(SoftwareImpedance imp) {
+    Vector7d Kq = Eigen::Map<const Vector7d>(imp.kq.data());
+    Vector7d Kqd = Eigen::Map<const Vector7d>(imp.kqd.data());
+    Vector6d Kx = Eigen::Map<const Vector6d>(imp.kx.data());
+    Vector6d Kxd = Eigen::Map<const Vector6d>(imp.kxd.data());
+    try {
+      TrajectoryGenerator traj(relative_dynamics_factor_);
+
+      robot_->control(
+        [&, this,
+         first = true,
+         shaped = false,
+         settling = false,
+         settle_ticks = 0,
+         stopping = false,
+         stop_ticks = 0,
+         ref = Vector7d(Vector7d::Zero())](const franka::RobotState& st,
+                                           franka::Duration period) mutable -> franka::Torques {
+          const Vector7d q = Eigen::Map<const Vector7d>(st.q.data());
+          const Vector7d dq = Eigen::Map<const Vector7d>(st.dq.data());
+
+          if (first) {
+            ref = q;
+            first = false;
+          } else if (!stopping && stop_requested_.load()) {
+            stopping = true;
+            has_target_.store(false);
+            shaped = false;
+            settling = false;
+            ref = q;
+          }
+
+          if (!stopping && has_target_.load()) {
+            std::lock_guard<std::mutex> lk(target_mutex_);
+            const bool sync_in_flight = shaped || settling;
+            settling = false;
+            if (sync_request_next_.exchange(false)) {
+              traj.reset(ref);
+              if (traj.set_target(target_q_)) {
+                shaped = true;
+              } else {
+                // A rejected plan must not let settling at the old reference report the goal reached.
+                fail_goal_("joint target rejected by the trajectory planner");
+              }
+            } else {
+              ref = target_q_;
+              shaped = false;
+              // A step target supersedes a sync goal still in flight; release its waiter rather than
+              // leave it blocked until some unrelated goal completes.
+              if (sync_in_flight) complete_goal_();
+            }
+            has_target_.store(false);
+          }
+
+          if (has_new_gains_.load()) {
+            std::lock_guard<std::mutex> lk(target_mutex_);
+            Kq = Eigen::Map<const Vector7d>(new_gains_.kq.data());
+            Kqd = Eigen::Map<const Vector7d>(new_gains_.kqd.data());
+            Kx = Eigen::Map<const Vector6d>(new_gains_.kx.data());
+            Kxd = Eigen::Map<const Vector6d>(new_gains_.kxd.data());
+            has_new_gains_.store(false);
+          }
+
+          if (shaped) {
+            const auto pos = traj.step(period);
+            ref = Eigen::Map<const Vector7d>(pos.data());
+            if (!traj.active()) {
+              shaped = false;
+              settling = true;
+              settle_ticks = 0;
+            }
+          }
+
+          // An exhausted reference is not arrival: the loop is a compliant spring, and under load the
+          // measured joints settle well after ref reaches the target. Complete the sync goal once q/dq
+          // are close (capped so contact can never hang the caller).
+          if (settling) {
+            ++settle_ticks;
+            const bool close = (ref - q).cwiseAbs().maxCoeff() < SETTLE_POSITION_TOLERANCE &&
+                               dq.cwiseAbs().maxCoeff() < SETTLE_VELOCITY_TOLERANCE;
+            if (close || settle_ticks >= SETTLE_TICKS_CAP) {
+              settling = false;
+              complete_goal_();
+            }
+          }
+
+          // Publish the state and this tick's final reference in one critical section, so a state()
+          // snapshot can never pair them from different ticks.
+          {
+            std::lock_guard<std::mutex> lk(last_state_mutex_);
+            last_state_ = std::make_unique<franka::RobotState>(st);
+            last_software_ref_ = ref;
+          }
+
+          const auto J_arr = model_->zeroJacobian(franka::Frame::kEndEffector, st);
+          const SpatialJacobian J = Eigen::Map<const SpatialJacobian>(J_arr.data());
+          const auto cor = model_->coriolis(st);
+
+          const Matrix7d Kp = J.transpose() * Kx.asDiagonal() * J + Matrix7d(Kq.asDiagonal());
+          const Matrix7d Kd = J.transpose() * Kxd.asDiagonal() * J + Matrix7d(Kqd.asDiagonal());
+          const Vector7d tau = Kp * (ref - q) - Kd * dq + Eigen::Map<const Vector7d>(cor.data());
+
+          std::array<double, 7> tau_arr;
+          Eigen::Map<Vector7d>(tau_arr.data()) = tau;
+          franka::Torques cmd(tau_arr);
+
+          if (stopping) {
+            // The spring at ref = q plus damping brings the arm to rest; finish once quiet (capped).
+            ++stop_ticks;
+            if (dq.cwiseAbs().maxCoeff() < SETTLE_VELOCITY_TOLERANCE || stop_ticks >= SETTLE_TICKS_CAP) {
+              cmd.motion_finished = true;
+            }
+          }
+          return cmd;
+        },
+        true /* limit_rate */, 100.0 /* cutoff_frequency */);
+    } catch (const std::exception& e) {
+      std::cerr << "Torque control thread error: " << e.what() << std::endl;
+    }
+    finish_control_thread_();
+  }
+
+  // Wake any synchronous set_target_joints waiter.
+  void complete_goal_() {
+    {
+      std::lock_guard<std::mutex> lk(goal_mutex_);
+      goal_completed_ = true;
+    }
+    goal_cv_.notify_all();
+  }
+
+  // Wake the synchronous waiter with a failure: its set_target_joints raises instead of returning.
+  void fail_goal_(const char* reason) {
+    {
+      std::lock_guard<std::mutex> lk(goal_mutex_);
+      goal_completed_ = true;
+      goal_failed_ = true;
+      goal_error_ = reason;
+    }
+    goal_cv_.notify_all();
+  }
+
+  // Every control-thread exit path must clear control_running_ and then wake any synchronous waiter:
+  // a thread that died mid-goal (reflex, NaN, connection loss) otherwise leaves the waiter blocked
+  // forever — and a goal still pending at exit was aborted, not reached, so that waiter raises.
+  void finish_control_thread_() {
     control_running_.store(false);
+    {
+      std::lock_guard<std::mutex> lk(last_state_mutex_);
+      last_software_ref_.reset();
+    }
+    {
+      std::lock_guard<std::mutex> lk(goal_mutex_);
+      if (!goal_completed_) {
+        goal_failed_ = true;
+        goal_error_ = "control loop stopped before the joint target was reached";
+      }
+      goal_completed_ = true;
+    }
+    goal_cv_.notify_all();
   }
 
  public:
-  void set_joint_impedance(const std::array<double, 7>& joint_stiffness) {
-    robot_->setJointImpedance(joint_stiffness);
-  }
-
-  void set_cartesian_impedance(const std::array<double, 6>& cartesian_stiffness) {
-    robot_->setCartesianImpedance(cartesian_stiffness);
-  }
-
   void set_collision_behavior(
       const std::array<double, 7>& lower_torque_thresholds_acceleration,
       const std::array<double, 7>& upper_torque_thresholds_acceleration,
@@ -727,16 +1055,18 @@ private:
   }
 
  private:
-  franka::RobotState read_robot_state_() {
+  franka::RobotState read_robot_state_() { return read_state_snapshot_().first; }
+
+  // The cached robot state and the software reference copied under one lock, so a state() built from
+  // them pairs q/dq/tau with the q_d of the same control tick.
+  std::pair<franka::RobotState, std::optional<Vector7d>> read_state_snapshot_() {
     if (control_running_.load()) {
       std::lock_guard<std::mutex> lk(last_state_mutex_);
-      if (last_state_ != nullptr)
-        return *last_state_;
+      if (last_state_ != nullptr) return {*last_state_, last_software_ref_};
     }
-    return robot_->readOnce();
+    return {robot_->readOnce(), std::nullopt};
   }
 
-  std::string ip_;
   std::unique_ptr<franka::Robot> robot_;
   std::unique_ptr<franka::Model> model_;
   std::thread control_thread_;
@@ -744,18 +1074,48 @@ private:
   std::atomic<bool> stop_requested_{false};
   std::atomic<bool> has_target_{false};
 
-  // Synchronization for synchronous set_target_joints
+  // Synchronization for synchronous set_target_joints. The goal machinery assumes callers are
+  // serialized — the Python bindings hold the GIL, and a synchronous caller keeps it through its whole
+  // publish-and-wait — so concurrent C++ callers are not supported.
   std::mutex goal_mutex_;
   std::condition_variable goal_cv_;
   bool goal_completed_ = false;
+  bool goal_failed_ = false;
+  std::string goal_error_;
   std::atomic<bool> sync_request_next_{false};
 
   std::mutex last_state_mutex_;
   std::unique_ptr<franka::RobotState> last_state_;
+  // The software-impedance loop's reference, published so state() can report the tracked q_d; empty
+  // whenever the torque loop is not running.
+  std::optional<Vector7d> last_software_ref_;
 
   const double relative_dynamics_factor_{1.0};
+  // Read when a motion command starts the loop; the running loop never reads it — a software gains
+  // change reaches the loop via new_gains_. Callers are serialized by the Python GIL.
+  ControlMode control_mode_;
   std::mutex target_mutex_;
   Vector7d target_q_ = Vector7d::Zero();
+  // A gains-only SoftwareImpedance change, picked up by the running torque loop mid-session.
+  SoftwareImpedance new_gains_;
+  std::atomic<bool> has_new_gains_{false};
+
+  // The unconditional half of set_control_mode; the constructor uses it to force-apply the initial mode.
+  void apply_control_mode_(const ControlMode& mode) {
+    // A software→software change is absorbed by the running torque loop (the rate limiter and lowpass
+    // smooth the gain step, as with reference steps); every other change needs the backend torn down.
+    const bool gains_handoff = std::holds_alternative<SoftwareImpedance>(mode) &&
+                               std::holds_alternative<SoftwareImpedance>(control_mode_);
+    if (!gains_handoff) stop_control_loop_();
+    control_mode_ = mode;
+    if (const auto* internal = std::get_if<InternalImpedance>(&control_mode_)) {
+      robot_->setJointImpedance(internal->k_theta);
+    } else {
+      std::lock_guard<std::mutex> lk(target_mutex_);
+      new_gains_ = std::get<SoftwareImpedance>(control_mode_);
+      has_new_gains_.store(true);
+    }
+  }
 
   void stop_control_loop_() {
     stop_requested_.store(true);
@@ -764,11 +1124,7 @@ private:
     }
     control_running_.store(false);
     has_target_.store(false);
-    {
-      std::lock_guard<std::mutex> lk(goal_mutex_);
-      goal_completed_ = true;
-    }
-    goal_cv_.notify_all();
+    complete_goal_();
     stop_requested_.store(false);
   }
 };
