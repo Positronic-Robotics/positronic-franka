@@ -212,7 +212,7 @@ class Robot {
   }
 
   State state() {
-    franka::RobotState rs = read_robot_state_();
+    auto [rs, software_ref] = read_state_snapshot_();
     // Map the column-major 4x4 transform into Eigen
     Eigen::Map<const Eigen::Matrix4d> T(rs.O_T_EE.data());
     const Eigen::Vector3d t = T.block<3, 1>(0, 3);
@@ -224,11 +224,7 @@ class Robot {
     st.dq = Eigen::Map<const Vector7d>(rs.dq.data());
     // Under torque control the reference lives in the software loop, not in the robot's q_d; report
     // whichever reference the active controller tracks.
-    st.q_d = Eigen::Map<const Vector7d>(rs.q_d.data());
-    {
-      std::lock_guard<std::mutex> lk(last_state_mutex_);
-      if (last_software_ref_) st.q_d = *last_software_ref_;
-    }
+    st.q_d = software_ref ? *software_ref : Eigen::Map<const Vector7d>(rs.q_d.data());
     st.tau_J = Eigen::Map<const Vector7d>(rs.tau_J.data());
     st.tau_J_d = Eigen::Map<const Vector7d>(rs.tau_J_d.data());
     st.end_effector_pose << t.x(), t.y(), t.z(), q.w(), q.x(), q.y(), q.z();
@@ -991,13 +987,16 @@ private:
   }
 
  private:
-  franka::RobotState read_robot_state_() {
+  franka::RobotState read_robot_state_() { return read_state_snapshot_().first; }
+
+  // The cached robot state and the software reference copied under one lock, so a state() built from
+  // them pairs q/dq/tau with the q_d of the same control tick.
+  std::pair<franka::RobotState, std::optional<Vector7d>> read_state_snapshot_() {
     if (control_running_.load()) {
       std::lock_guard<std::mutex> lk(last_state_mutex_);
-      if (last_state_ != nullptr)
-        return *last_state_;
+      if (last_state_ != nullptr) return {*last_state_, last_software_ref_};
     }
-    return robot_->readOnce();
+    return {robot_->readOnce(), std::nullopt};
   }
 
   std::string ip_;
