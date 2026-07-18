@@ -133,9 +133,10 @@ class TrajectoryGenerator {
     replan_();
   }
 
-  void set_target(const Vector7d& target) {
+  // Returns whether the plan to the new target was accepted; on failure the previous plan keeps playing.
+  bool set_target(const Vector7d& target) {
     for (size_t i = 0; i < 7; ++i) input_.target_position[i] = target[i];
-    replan_();
+    return replan_();
   }
 
   void stop_at_current() {
@@ -166,7 +167,7 @@ class TrajectoryGenerator {
   bool active() const { return active_; }
 
  private:
-  void replan_() {
+  bool replan_() {
     // Calculate into a scratch trajectory and swap only on success: a failed calculate must not leave a
     // default-constructed/stale trajectory in place — evaluating one feeds garbage (NaN) into libfranka
     // and kills the control thread. On failure the previous plan keeps playing.
@@ -174,13 +175,14 @@ class TrajectoryGenerator {
     auto result = otg_.calculate(input_, next);
     if (result < 0) {
       std::cerr << "Ruckig trajectory planning failed (error " << static_cast<int>(result) << ")" << std::endl;
-      return;
+      return false;
     }
     trajectory_ = next;
     planned_ = true;
     cumulative_time_ = 0.0;
     duration_ = trajectory_.get_duration();
     active_ = true;
+    return true;
   }
 
   ruckig::Ruckig<7> otg_{NOMINAL_DT};
@@ -252,6 +254,11 @@ class Robot {
 
   void set_target_joints(const Eigen::Ref<const Vector7d>& q_target,
                          bool asynchronous = true) {
+    // Reject garbage before it reaches a control loop: an async torque-mode target becomes the reference
+    // verbatim, so a NaN here would become NaN torques.
+    if (!q_target.allFinite()) {
+      throw std::invalid_argument("q_target must be finite");
+    }
     if (!control_running_.load()) {
       if (control_thread_.joinable()) {
         control_thread_.join();
@@ -278,6 +285,7 @@ class Robot {
       // Prepare synchronous wait before publishing the target to avoid races.
       std::lock_guard<std::mutex> glk(goal_mutex_);
       goal_completed_ = false;
+      goal_failed_ = false;
       sync_request_next_.store(true);
     }
     {
@@ -293,6 +301,10 @@ class Robot {
       // the goal, and finish_control_thread_ notifies after clearing control_running_.
       std::unique_lock<std::mutex> lk(goal_mutex_);
       goal_cv_.wait(lk, [&]{ return goal_completed_ || !control_running_.load(); });
+      if (goal_failed_) {
+        goal_failed_ = false;
+        throw std::runtime_error("joint target rejected by the trajectory planner");
+      }
     }
   }
 
@@ -714,13 +726,15 @@ private:
 
           if (!stopping && has_target_.load()) {
             std::lock_guard<std::mutex> lk(target_mutex_);
-            traj.set_target(target_q_);
+            const bool planned = traj.set_target(target_q_);
             has_target_.store(false);
             const bool sync = sync_request_next_.exchange(false);
             // An async target supersedes a sync goal still in flight; release its waiter rather than
             // leave it blocked until some unrelated goal completes.
             if (sync_in_flight && !sync) complete_goal_();
-            sync_in_flight = sync;
+            sync_in_flight = sync && planned;
+            // A rejected plan must not let the old trajectory finish this goal as if reached.
+            if (sync && !planned) fail_goal_();
           }
 
           auto pos = traj.step(period);
@@ -790,9 +804,13 @@ private:
             const bool sync = sync_request_next_.exchange(false);
             if (sync) {
               traj.reset(ref);
-              traj.set_target(target_q_);
-              shaped = true;
-              sync_in_flight = true;
+              if (traj.set_target(target_q_)) {
+                shaped = true;
+                sync_in_flight = true;
+              } else {
+                // A rejected plan must not let settling at the old reference report the goal reached.
+                fail_goal_();
+              }
             } else {
               ref = target_q_;
               shaped = false;
@@ -881,6 +899,16 @@ private:
     {
       std::lock_guard<std::mutex> lk(goal_mutex_);
       goal_completed_ = true;
+    }
+    goal_cv_.notify_all();
+  }
+
+  // Wake the synchronous waiter with a failure: its set_target_joints raises instead of returning.
+  void fail_goal_() {
+    {
+      std::lock_guard<std::mutex> lk(goal_mutex_);
+      goal_completed_ = true;
+      goal_failed_ = true;
     }
     goal_cv_.notify_all();
   }
@@ -1016,6 +1044,7 @@ private:
   std::mutex goal_mutex_;
   std::condition_variable goal_cv_;
   bool goal_completed_ = false;
+  bool goal_failed_ = false;
   std::atomic<bool> sync_request_next_{false};
 
   std::mutex last_state_mutex_;
