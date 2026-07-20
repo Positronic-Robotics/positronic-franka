@@ -47,6 +47,11 @@ def _acknowledgeable_errors(status: dict) -> list[str]:
     return [error_id for flag, error_id in _ACKNOWLEDGEABLE_ERRORS.items() if status['recoverableErrors'][flag]]
 
 
+def _safety_error_reasons(status: dict) -> list[str]:
+    reasons = status['safetyControllerStatusReason']
+    return [reason for reason, active in reasons.items() if (any(active) if isinstance(active, list) else active)]
+
+
 def encode_password(login: str, password: str) -> str:
     """Encode a Desk password the way the Desk web client does: base64 of the comma-joined sha256 digest bytes."""
     digest = hashlib.sha256(f'{password}#{login}@franka'.encode()).digest()
@@ -62,6 +67,7 @@ class Desk:
         self._session = requests.Session()
         self._session.verify = False
         self._control_token: str | None = None
+        self._rebooted = False
         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
     def _request(self, method: str, path: str, **kwargs) -> requests.Response:
@@ -154,6 +160,16 @@ class Desk:
     def deactivate_fci(self) -> None:
         self._request('DELETE', '/admin/api/control-token/fci', json={'token': self._control_token})
 
+    def reboot(self) -> None:
+        """Reboot the control box. Authenticates on its own and needs no robot control, so it is usable outside the
+        context manager — the recovery path when a stranded control token makes `__enter__` refuse. The reboot resets
+        FCI, brakes, and the control token, so context teardown becomes a no-op. The box is unreachable for ~40s
+        afterwards."""
+        self._authenticate()
+        self._request('POST', '/admin/api/reboot')
+        self._control_token = None
+        self._rebooted = True
+
     def run_self_test(self) -> None:
         """Acknowledge any recoverable safety error, then run the TD2 self-test. Mirrors Desk's "Acknowledge &
         Execute": once the tests are overdue the error must be acknowledged before Desk allows anything else."""
@@ -171,6 +187,11 @@ class Desk:
     def prepare(self) -> None:
         """Run the TD2 self-test if one is due or overdue, open the brakes, and activate FCI. Requires held control."""
         status = self.safety_status()
+        if status['safetyControllerStatus'] == 'SafetyError':
+            raise RuntimeError(
+                f'Safety controller is in SafetyError ({", ".join(_safety_error_reasons(status))}); Desk refuses '
+                f'every recovery action in this state. Reboot the control box (`Desk.reboot()` or the Desk web UI).'
+            )
         if status['timeToTd2'] <= SELF_TEST_LEAD_SEC or _acknowledgeable_errors(status):
             logger.info('TD2 self-test due within %ds, running it now', SELF_TEST_LEAD_SEC)
             self.run_self_test()
@@ -178,11 +199,16 @@ class Desk:
         self.activate_fci()
 
     def __enter__(self) -> 'Desk':
+        self._rebooted = False
         self._authenticate()
         self._take_control()
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
+        # A reboot already reset FCI, brakes, and the control token and left the box unreachable, so teardown is
+        # moot and its status calls would only raise connection errors.
+        if self._rebooted:
+            return
         # Each teardown step is attempted even if the previous one fails: leaving the brakes open or the control
         # token held is worse than any single failed request.
         try:

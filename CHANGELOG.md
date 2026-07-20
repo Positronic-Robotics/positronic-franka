@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.6.1] - 2026-07-20
+
+### Added
+- `Desk.reboot()` — reboot the control box over the Desk web API. Authenticates on its own and needs no robot control, so it is usable outside the context manager (a crashed session's stranded control token makes `__enter__` refuse). The box is unreachable for ~40s afterwards.
+
+### Fixed
+- `Desk.prepare()` detects the unrecoverable `SafetyError` controller state (e.g. `nonRecoverableSafetyError`, a per-joint safety fault) up front and raises naming the active reasons and the required control-box reboot, instead of failing later with an opaque 500 from the recoverable-error acknowledge endpoint, which Desk refuses in that state.
+
 ## [0.6.0] - 2026-07-17
 
 ### Added
