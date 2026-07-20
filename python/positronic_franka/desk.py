@@ -67,6 +67,7 @@ class Desk:
         self._session = requests.Session()
         self._session.verify = False
         self._control_token: str | None = None
+        self._rebooted = False
         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
     def _request(self, method: str, path: str, **kwargs) -> requests.Response:
@@ -160,12 +161,14 @@ class Desk:
         self._request('DELETE', '/admin/api/control-token/fci', json={'token': self._control_token})
 
     def reboot(self) -> None:
-        """Reboot the control box. Needs authentication but not robot control, works outside the context manager
-        (entry is impossible while a crashed session's token is stranded), and invalidates any held control token.
-        The box is unreachable for ~40s afterwards."""
+        """Reboot the control box. Authenticates on its own and needs no robot control, so it is usable outside the
+        context manager — the recovery path when a stranded control token makes `__enter__` refuse. The reboot resets
+        FCI, brakes, and the control token, so context teardown becomes a no-op. The box is unreachable for ~40s
+        afterwards."""
         self._authenticate()
         self._request('POST', '/admin/api/reboot')
         self._control_token = None
+        self._rebooted = True
 
     def run_self_test(self) -> None:
         """Acknowledge any recoverable safety error, then run the TD2 self-test. Mirrors Desk's "Acknowledge &
@@ -201,6 +204,10 @@ class Desk:
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
+        # A reboot already reset FCI, brakes, and the control token and left the box unreachable, so teardown is
+        # moot and its status calls would only raise connection errors.
+        if self._rebooted:
+            return
         # Each teardown step is attempted even if the previous one fails: leaving the brakes open or the control
         # token held is worse than any single failed request.
         try:
