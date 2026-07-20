@@ -199,6 +199,7 @@ class Desk:
         self.activate_fci()
 
     def __enter__(self) -> 'Desk':
+        self._rebooted = False
         self._authenticate()
         self._take_control()
         return self
