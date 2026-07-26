@@ -200,18 +200,17 @@ class Desk:
         except requests.exceptions.RequestException:
             return False
 
-    def _controller_ready(self) -> bool:
-        # The web API answers before the safety controller finishes arming after a reboot; a brake-unlock in that
-        # window is refused (424). Treat the box as ready once the controller settles into a state `prepare()` can
-        # act on: `Work`, or a `Recovery` whose recoverable errors `prepare()` acknowledges and clears (a reboot
-        # does not run the TD2 test, so an overdue box returns in `Recovery` with `td2Timeout`) — never `SafetyError`.
+    def _controller_settled(self) -> bool:
+        # The web API answers before the controller finishes arming; a brake-unlock while it is still arming is
+        # refused (424). Return only once it has settled into a state `prepare()` acts on to completion: `Work`,
+        # an acknowledgeable `Recovery` (a reboot skips the overdue TD2 test, so the box can return in `Recovery`
+        # with `td2Timeout`), or a `SafetyError` a reboot did not clear — which `prepare()` re-raises promptly
+        # rather than leaving the wait to time out on an already-terminal fault.
         try:
             status = self.safety_status()
         except requests.exceptions.RequestException:
             return False
-        if status['safetyControllerStatus'] == 'SafetyError':
-            return False
-        return status['safetyControllerStatus'] == 'Work' or bool(_acknowledgeable_errors(status))
+        return status['safetyControllerStatus'] in ('Work', 'SafetyError') or bool(_acknowledgeable_errors(status))
 
     def _wait_for_reboot(self) -> None:
         # The reboot POST returns before the box goes offline. Require observing it drop off the network — a reboot
@@ -228,7 +227,7 @@ class Desk:
         up_deadline = time.monotonic() + _REBOOT_UP_TIMEOUT_SEC
         stable = 0
         while time.monotonic() < up_deadline:
-            stable = stable + 1 if self._controller_ready() else 0
+            stable = stable + 1 if self._controller_settled() else 0
             if stable >= _REBOOT_READY_STABLE_READS:
                 return
             time.sleep(_REBOOT_POLL_INTERVAL_SEC)
