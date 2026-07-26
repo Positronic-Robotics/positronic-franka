@@ -202,20 +202,29 @@ class Desk:
 
     def _controller_ready(self) -> bool:
         # The web API answers before the safety controller finishes arming after a reboot; a brake-unlock in that
-        # window is refused (424). Treat the box as ready only once the controller reports a settled `Work` state.
+        # window is refused (424). Treat the box as ready once the controller settles into a state `prepare()` can
+        # act on: `Work`, or a `Recovery` whose recoverable errors `prepare()` acknowledges and clears (a reboot
+        # does not run the TD2 test, so an overdue box returns in `Recovery` with `td2Timeout`) — never `SafetyError`.
         try:
             status = self.safety_status()
         except requests.exceptions.RequestException:
             return False
-        return status['safetyControllerStatus'] == 'Work' and not any(status['recoverableErrors'].values())
+        if status['safetyControllerStatus'] == 'SafetyError':
+            return False
+        return status['safetyControllerStatus'] == 'Work' or bool(_acknowledgeable_errors(status))
 
     def _wait_for_reboot(self) -> None:
-        # Wait for the box to drop off the network before waiting for it to return, so the still-answering
-        # pre-reboot box is not mistaken for the rebooted one.
+        # The reboot POST returns before the box goes offline. Require observing it drop off the network — a reboot
+        # that silently did not happen would otherwise look like an instant recovery and hand back the stranded box.
         down_deadline = time.monotonic() + _REBOOT_DOWN_TIMEOUT_SEC
-        while self._reachable() and time.monotonic() < down_deadline:
+        while self._reachable():
+            if time.monotonic() >= down_deadline:
+                raise TimeoutError(
+                    f'Control box stayed reachable {_REBOOT_DOWN_TIMEOUT_SEC:.0f}s after the reboot; it did not go down'
+                )
             time.sleep(_REBOOT_POLL_INTERVAL_SEC)
-        # Then wait for the controller to settle into `Work`, confirmed across a few reads, before returning.
+        # The web API answers before the controller finishes arming; wait until it settles into a state prepare()
+        # can act on, confirmed across a few reads, before returning.
         up_deadline = time.monotonic() + _REBOOT_UP_TIMEOUT_SEC
         stable = 0
         while time.monotonic() < up_deadline:
@@ -223,7 +232,7 @@ class Desk:
             if stable >= _REBOOT_READY_STABLE_READS:
                 return
             time.sleep(_REBOOT_POLL_INTERVAL_SEC)
-        raise TimeoutError(f'Control box did not settle into Work within {_REBOOT_UP_TIMEOUT_SEC:.0f}s of the reboot')
+        raise TimeoutError(f'Control box did not settle within {_REBOOT_UP_TIMEOUT_SEC:.0f}s of the reboot')
 
     def run_self_test(self) -> None:
         """Acknowledge any recoverable safety error, then run the TD2 self-test. Mirrors Desk's "Acknowledge &
