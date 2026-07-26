@@ -37,6 +37,8 @@ _POLL_INTERVAL_SEC = 0.5
 _REBOOT_DOWN_TIMEOUT_SEC = 30.0
 _REBOOT_UP_TIMEOUT_SEC = 180.0
 _REBOOT_POLL_INTERVAL_SEC = 2.0
+# Consecutive settled reads required before the rebooted controller is treated as ready.
+_REBOOT_READY_STABLE_READS = 3
 
 _CONTROL_HELD_MSG = (
     'Another session holds robot control. Open Franka Desk at https://{host}, release control there, then start again.'
@@ -182,8 +184,8 @@ class Desk:
         """Reboot the control box. Authenticates on its own and needs no robot control, so it is usable outside the
         context manager — the recovery path when a stranded control token makes `__enter__` refuse. The reboot resets
         FCI, brakes, and the control token, so context teardown becomes a no-op. The box is unreachable for ~40s
-        afterwards; with `wait`, block until it has gone down and come back reachable so the caller can open a fresh
-        session, raising `TimeoutError` if it does not return in time."""
+        afterwards; with `wait`, block until it has gone down and its safety controller has settled back into
+        `Work` so the caller can open a fresh session, raising `TimeoutError` if it does not return in time."""
         self._authenticate()
         self._request('POST', '/admin/api/reboot')
         self._control_token = None
@@ -198,18 +200,30 @@ class Desk:
         except requests.exceptions.RequestException:
             return False
 
+    def _controller_ready(self) -> bool:
+        # The web API answers before the safety controller finishes arming after a reboot; a brake-unlock in that
+        # window is refused (424). Treat the box as ready only once the controller reports a settled `Work` state.
+        try:
+            status = self.safety_status()
+        except requests.exceptions.RequestException:
+            return False
+        return status['safetyControllerStatus'] == 'Work' and not any(status['recoverableErrors'].values())
+
     def _wait_for_reboot(self) -> None:
         # Wait for the box to drop off the network before waiting for it to return, so the still-answering
         # pre-reboot box is not mistaken for the rebooted one.
         down_deadline = time.monotonic() + _REBOOT_DOWN_TIMEOUT_SEC
         while self._reachable() and time.monotonic() < down_deadline:
             time.sleep(_REBOOT_POLL_INTERVAL_SEC)
+        # Then wait for the controller to settle into `Work`, confirmed across a few reads, before returning.
         up_deadline = time.monotonic() + _REBOOT_UP_TIMEOUT_SEC
+        stable = 0
         while time.monotonic() < up_deadline:
-            if self._reachable():
+            stable = stable + 1 if self._controller_ready() else 0
+            if stable >= _REBOOT_READY_STABLE_READS:
                 return
             time.sleep(_REBOOT_POLL_INTERVAL_SEC)
-        raise TimeoutError(f'Control box did not come back within {_REBOOT_UP_TIMEOUT_SEC:.0f}s of the reboot')
+        raise TimeoutError(f'Control box did not settle into Work within {_REBOOT_UP_TIMEOUT_SEC:.0f}s of the reboot')
 
     def run_self_test(self) -> None:
         """Acknowledge any recoverable safety error, then run the TD2 self-test. Mirrors Desk's "Acknowledge &
