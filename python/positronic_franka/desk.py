@@ -33,6 +33,11 @@ _FCI_TIMEOUT_SEC = 15.0
 _SELF_TEST_TIMEOUT_SEC = 180.0
 _POLL_INTERVAL_SEC = 0.5
 
+# After the reboot POST the box answers briefly, then drops off the network for ~40s before it returns.
+_REBOOT_DOWN_TIMEOUT_SEC = 30.0
+_REBOOT_UP_TIMEOUT_SEC = 180.0
+_REBOOT_POLL_INTERVAL_SEC = 2.0
+
 _CONTROL_HELD_MSG = (
     'Another session holds robot control. Open Franka Desk at https://{host}, release control there, then start again.'
 )
@@ -56,6 +61,19 @@ def encode_password(login: str, password: str) -> str:
     """Encode a Desk password the way the Desk web client does: base64 of the comma-joined sha256 digest bytes."""
     digest = hashlib.sha256(f'{password}#{login}@franka'.encode()).digest()
     return base64.b64encode(','.join(str(b) for b in digest).encode()).decode()
+
+
+class SafetyControllerError(RuntimeError):
+    """The safety controller is in an unrecoverable ``SafetyError`` state; Desk refuses every recovery action until
+    the control box is rebooted (``Desk.reboot()`` or the Desk web UI)."""
+
+    def __init__(self, reasons: list[str]):
+        self.reasons = tuple(reasons)
+        detail = ', '.join(reasons) if reasons else 'no reason reported'
+        super().__init__(
+            f'Safety controller is in SafetyError ({detail}); Desk refuses every recovery action in this state. '
+            f'Reboot the control box (`Desk.reboot()` or the Desk web UI).'
+        )
 
 
 class Desk:
@@ -160,15 +178,38 @@ class Desk:
     def deactivate_fci(self) -> None:
         self._request('DELETE', '/admin/api/control-token/fci', json={'token': self._control_token})
 
-    def reboot(self) -> None:
+    def reboot(self, wait: bool = False) -> None:
         """Reboot the control box. Authenticates on its own and needs no robot control, so it is usable outside the
         context manager — the recovery path when a stranded control token makes `__enter__` refuse. The reboot resets
         FCI, brakes, and the control token, so context teardown becomes a no-op. The box is unreachable for ~40s
-        afterwards."""
+        afterwards; with `wait`, block until it has gone down and come back reachable so the caller can open a fresh
+        session, raising `TimeoutError` if it does not return in time."""
         self._authenticate()
         self._request('POST', '/admin/api/reboot')
         self._control_token = None
         self._rebooted = True
+        if wait:
+            self._wait_for_reboot()
+
+    def _reachable(self) -> bool:
+        try:
+            self.safety_status()
+            return True
+        except requests.exceptions.RequestException:
+            return False
+
+    def _wait_for_reboot(self) -> None:
+        # Wait for the box to drop off the network before waiting for it to return, so the still-answering
+        # pre-reboot box is not mistaken for the rebooted one.
+        down_deadline = time.monotonic() + _REBOOT_DOWN_TIMEOUT_SEC
+        while self._reachable() and time.monotonic() < down_deadline:
+            time.sleep(_REBOOT_POLL_INTERVAL_SEC)
+        up_deadline = time.monotonic() + _REBOOT_UP_TIMEOUT_SEC
+        while time.monotonic() < up_deadline:
+            if self._reachable():
+                return
+            time.sleep(_REBOOT_POLL_INTERVAL_SEC)
+        raise TimeoutError(f'Control box did not come back within {_REBOOT_UP_TIMEOUT_SEC:.0f}s of the reboot')
 
     def run_self_test(self) -> None:
         """Acknowledge any recoverable safety error, then run the TD2 self-test. Mirrors Desk's "Acknowledge &
@@ -188,10 +229,7 @@ class Desk:
         """Run the TD2 self-test if one is due or overdue, open the brakes, and activate FCI. Requires held control."""
         status = self.safety_status()
         if status['safetyControllerStatus'] == 'SafetyError':
-            raise RuntimeError(
-                f'Safety controller is in SafetyError ({", ".join(_safety_error_reasons(status))}); Desk refuses '
-                f'every recovery action in this state. Reboot the control box (`Desk.reboot()` or the Desk web UI).'
-            )
+            raise SafetyControllerError(_safety_error_reasons(status))
         if status['timeToTd2'] <= SELF_TEST_LEAD_SEC or _acknowledgeable_errors(status):
             logger.info('TD2 self-test due within %ds, running it now', SELF_TEST_LEAD_SEC)
             self.run_self_test()

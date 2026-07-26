@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.6.2] - 2026-07-26
+
+### Added
+- `Desk.reboot(wait=...)` — with `wait`, block until the control box has dropped off the network and come back reachable (~40s), so a caller can immediately open a fresh session; raises `TimeoutError` if it does not return in time.
+- `SafetyControllerError` — raised by `Desk.prepare()` for the unrecoverable `SafetyError` controller state, carrying the active `reasons`, so callers can catch it precisely and drive the required control-box reboot. Subclasses `RuntimeError`, so existing handlers keep working.
+
 ## [0.6.1] - 2026-07-20
 
 ### Added
