@@ -183,22 +183,40 @@ class Desk:
     def reboot(self, wait: bool = False) -> None:
         """Reboot the control box. Authenticates on its own and needs no robot control, so it is usable outside the
         context manager — the recovery path when a stranded control token makes `__enter__` refuse. The reboot resets
-        FCI, brakes, and the control token, so context teardown becomes a no-op. The box is unreachable for ~40s
-        afterwards; with `wait`, block until it has gone down and its safety controller has settled back into
-        `Work` so the caller can open a fresh session, raising `TimeoutError` if it does not return in time."""
+        FCI, brakes, and the control token, so context teardown becomes a no-op — but only once the reboot is
+        confirmed to have taken effect (with `wait`, once the box is observed to go offline), so a POST that never
+        rebooted still tears the session down cleanly. The box is unreachable for ~40s afterwards; with `wait`, block
+        until it has gone down and its safety controller has settled, raising `TimeoutError` if it never goes down or
+        never settles."""
         self._authenticate()
         self._request('POST', '/admin/api/reboot')
+        if wait:
+            self._await_downtime()
         self._control_token = None
         self._rebooted = True
         if wait:
-            self._wait_for_reboot()
+            self._await_settle()
 
     def _reachable(self) -> bool:
+        # Any HTTP response means the box is up; only a connection or timeout failure is real downtime. An HTTP
+        # error status must not count as down, or a transient 5xx from a box that never rebooted would be mistaken
+        # for the reboot taking effect.
         try:
-            self.safety_status()
+            self._session.get(f'https://{self.host}/admin/api/safety/status', timeout=self._timeout)
             return True
-        except requests.exceptions.RequestException:
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
             return False
+
+    def _await_downtime(self) -> None:
+        # The reboot POST returns before the box goes offline. Require observing it drop off the network — a reboot
+        # that silently did not happen would otherwise look like an instant recovery and strand the live session.
+        deadline = time.monotonic() + _REBOOT_DOWN_TIMEOUT_SEC
+        while self._reachable():
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    f'Control box stayed reachable {_REBOOT_DOWN_TIMEOUT_SEC:.0f}s after the reboot; it did not go down'
+                )
+            time.sleep(_REBOOT_POLL_INTERVAL_SEC)
 
     def _controller_settled(self) -> bool:
         # The web API answers before the controller finishes arming; a brake-unlock while it is still arming is
@@ -212,21 +230,12 @@ class Desk:
             return False
         return status['safetyControllerStatus'] in ('Work', 'SafetyError') or bool(_acknowledgeable_errors(status))
 
-    def _wait_for_reboot(self) -> None:
-        # The reboot POST returns before the box goes offline. Require observing it drop off the network — a reboot
-        # that silently did not happen would otherwise look like an instant recovery and hand back the stranded box.
-        down_deadline = time.monotonic() + _REBOOT_DOWN_TIMEOUT_SEC
-        while self._reachable():
-            if time.monotonic() >= down_deadline:
-                raise TimeoutError(
-                    f'Control box stayed reachable {_REBOOT_DOWN_TIMEOUT_SEC:.0f}s after the reboot; it did not go down'
-                )
-            time.sleep(_REBOOT_POLL_INTERVAL_SEC)
+    def _await_settle(self) -> None:
         # The web API answers before the controller finishes arming; wait until it settles into a state prepare()
         # can act on, confirmed across a few reads, before returning.
-        up_deadline = time.monotonic() + _REBOOT_UP_TIMEOUT_SEC
+        deadline = time.monotonic() + _REBOOT_UP_TIMEOUT_SEC
         stable = 0
-        while time.monotonic() < up_deadline:
+        while time.monotonic() < deadline:
             stable = stable + 1 if self._controller_settled() else 0
             if stable >= _REBOOT_READY_STABLE_READS:
                 return
