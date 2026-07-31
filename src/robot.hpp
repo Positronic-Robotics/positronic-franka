@@ -1033,15 +1033,15 @@ private:
     // Seconds accumulated from the callback's own period, not a tick count: a callback is only
     // nominally 1 ms, so counting invocations under-measures real time under bad scheduling.
     elapsed_s += dt;
-    if (elapsed_s >= deadline_s) return Arrival::Stalled;
-    // While the reference is still being shaped the arm is meant to be behind it — nothing to test
-    // yet, only the deadline runs.
-    if (travelling) return Arrival::InFlight;
-
-    return (ref - q).cwiseAbs().maxCoeff() < SETTLE_POSITION_TOLERANCE &&
-                   dq.cwiseAbs().maxCoeff() < SETTLE_VELOCITY_TOLERANCE
-               ? Arrival::Reached
-               : Arrival::InFlight;
+    // Arrival is tested first, so an arm that is at the target on the tick its deadline expires
+    // reports REACHED. The deadline exists to end a move that is not arriving; one that has
+    // arrived is not that move. While the reference is still being shaped there is nothing to
+    // test, and only the deadline runs.
+    if (!travelling && (ref - q).cwiseAbs().maxCoeff() < SETTLE_POSITION_TOLERANCE &&
+        dq.cwiseAbs().maxCoeff() < SETTLE_VELOCITY_TOLERANCE) {
+      return Arrival::Reached;
+    }
+    return elapsed_s >= deadline_s ? Arrival::Stalled : Arrival::InFlight;
   }
 
   // Apply that outcome to the goal `id` names. Returns true once the move is over, so the caller
