@@ -19,6 +19,7 @@
 - A control loop that dies now reports *why*: the goal carries libfranka's own text (`Move command aborted: motion aborted by reflex! ["cartesian_reflex"]`) instead of the generic "control loop stopped before the joint target was reached". Previously the exception was printed in the dying thread and discarded, leaving the caller to infer the cause from `state()` — which may already have recovered. The stderr line stays as a second record.
 - A motion command issued while the robot holds an error no longer starts a control thread that libfranka rejects on its first tick (`command not possible in the current mode ("Reflex")`). The move settles ABORTED naming the robot's error. Clearing it stays the caller's decision — a reflex means the arm hit something.
 - A rejected joint target now stops the arm. `TrajectoryGenerator` keeps the previous plan when a replan fails, so the goal reported ABORTED while the arm kept driving toward the superseded target.
+- `stop()`, `recover_from_errors()` and a control-mode change no longer settle an in-flight move as `REACHED`. A teardown ends the move wherever the arm got to, so it settles ABORTED.
 - An older trajectory can no longer settle the goal that replaced it. Each move carries an id, handed to the control loop with its target, and a settle that does not name the move in flight is ignored. Previously a move replaced just as its trajectory ended completed the newly armed goal as `REACHED`.
 
 ## [0.6.2] - 2026-07-26

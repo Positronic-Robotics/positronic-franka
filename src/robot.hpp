@@ -137,7 +137,9 @@ enum class GoalStatus {
   IN_FLIGHT,
   // The arm settled at the commanded target.
   REACHED,
-  // The move stopped short — a reflex, a rejected plan, a lost connection. `Goal::reason` says which.
+  // The move stopped short — a reflex, a rejected plan, a lost connection, an expired deadline.
+  // `Goal::reason` says which. The arm may still be braking when this appears; read `state()` if
+  // that matters.
   ABORTED,
 };
 
@@ -1241,7 +1243,10 @@ private:
     }
     control_running_.store(false);
     has_target_.store(false);
-    settle_current_goal_(GoalStatus::REACHED);
+    // A teardown ends the move wherever the arm got to, so ABORTED. Normally the loop's own
+    // `finish_control_thread_` has already settled it with a better reason and this is ignored;
+    // it stands for the paths where nothing else settles the goal.
+    settle_current_goal_(GoalStatus::ABORTED, "the control loop was stopped before the joint target was reached");
     stop_requested_.store(false);
   }
 };

@@ -49,7 +49,8 @@ PYBIND11_MODULE(_franka, m) {
       .value("REACHED", positronic_franka::GoalStatus::REACHED,
              "The arm settled at the target — within tolerance and no longer moving")
       .value("ABORTED", positronic_franka::GoalStatus::ABORTED,
-             "Stopped short — reflex, rejected plan, lost connection; see Goal.reason");
+             "Stopped short — reflex, rejected plan, lost connection, expired deadline; see "
+             "Goal.reason. The arm may still be braking when this appears");
 
   py::class_<positronic_franka::Goal>(m, "Goal")
       // Constructible so tests can stand one in; only the driver produces a real one.
