@@ -17,6 +17,7 @@
 #include <mutex>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <optional>
 #include <stdexcept>
 #include <utility>
@@ -42,11 +43,16 @@ constexpr std::array<double, 7> PANDA_JOINT_UPPER_LIMITS = {
 // the commanded reference and no longer moving.
 constexpr double SETTLE_POSITION_TOLERANCE = 0.05;  // rad
 constexpr double SETTLE_VELOCITY_TOLERANCE = 0.05;  // rad/s
-// How long the arm may sit AT REST short of the target before the move is given up as stalled (1 kHz
-// ticks, so 1 s). It bounds time spent going nowhere, NOT the move: a long move keeps resetting the
-// count while it is still travelling, so only an arm actually held short — contact, a joint limit —
-// trips it. A stalled move ABORTS; it never reports arrival, because it did not arrive.
+// How long the arm may make NO PROGRESS toward the target before the move is given up as stalled
+// (1 kHz ticks, so 1 s). It bounds time spent going nowhere, NOT the move: progress resets the count,
+// so an arm still closing on the target is never given up on however slowly it converges — only one
+// actually held short (contact, a joint limit) trips it. A stalled move ABORTS; it never reports
+// arrival, because it did not arrive.
 constexpr int STALL_TICKS_CAP = 1000;
+// The joint error must shrink by at least this much to count as progress. Far below any real
+// convergence — a move creeping at a tenth of the rest threshold still closes 500x this in a second —
+// and far above the noise on a joint encoder, so it separates "converging slowly" from "not moving".
+constexpr double STALL_PROGRESS_EPSILON = 1e-4;  // rad
 
 // Common Eigen aliases
 using Vector7d = Eigen::Matrix<double, 7, 1>;
@@ -344,7 +350,95 @@ class Robot {
   // Ruckig trajectory, `SoftwareImpedance` steps the reference and lets the impedance law pull the
   // arm in (DROID execution semantics) — but both report the same way, and neither waits.
   void set_target_joints(const Eigen::Ref<const Vector7d>& q_target) {
-    publish_target_(q_target);
+  // Start the control loop if it is not running, then publish `q_target` to it. Every target arms
+  // the goal, so the move reports IN_FLIGHT until the loop settles it — one path, because a target's
+  // treatment must not depend on whether anyone happens to be watching it.
+    // Reject garbage before it reaches a control loop: a torque-mode target becomes the reference
+    // verbatim, so a NaN here would become NaN torques.
+    if (!q_target.allFinite()) {
+      throw std::invalid_argument("q_target must be finite");
+    }
+    std::uint64_t goal_id = 0;
+    if (!control_running_.load()) {
+      if (control_thread_.joinable()) {
+        control_thread_.join();
+      }
+      // Arm here, after the join and before the launch below, and the goal has exactly one loop that
+      // can settle it. Arming any later would leave a window where the loop dies before the goal
+      // exists: the abort finds nothing in flight and is dropped, and the goal armed afterwards then
+      // belongs to a dead thread, so a poller waits on a move nothing will ever settle. Arming any
+      // earlier would expose it to the loop being replaced — the join is what guarantees that one has
+      // finished settling, so it cannot abort the move its successor is about to run.
+      goal_id = arm_goal_();
+      // Starting a loop issues a Move command, and the robot refuses one while it holds an error
+      // ("command not possible in the current mode"), so the fresh thread would die on its first tick.
+      // Report the robot's own error instead of spawning it. Clearing is the caller's call, not this
+      // library's: a reflex means the arm hit something, and only the caller knows whether resuming is
+      // safe — the goal aborts with the robot's own text so the caller sees why.
+      // Best effort: if the state read itself fails, fall through and let the loop report whatever is
+      // wrong, rather than turning a guard into a new failure mode.
+      std::string robot_errors;
+      try {
+        if (const auto errors = read_robot_state_().current_errors; static_cast<bool>(errors)) {
+          robot_errors = static_cast<std::string>(errors);
+        }
+      } catch (const std::exception&) {  // NOLINT(bugprone-empty-catch)
+      }
+      if (!robot_errors.empty()) {
+        fail_goal_(goal_id, "robot reports an error, recover before commanding a move: " + robot_errors);
+        return;
+      }
+      stop_requested_.store(false);
+      // A target or sync request stranded by a dead loop must not feed the replacement loop's first
+      // ticks — those can run before this command publishes its own target below. Anything queued here
+      // is stale: no loop consumed it, and the caller's publish comes after (callers are serialized).
+      has_target_.store(false);
+      {
+        std::lock_guard<std::mutex> lk(target_mutex_);
+        target_goal_id_ = 0;
+      }
+      control_running_.store(true);
+      // Snapshot the mode here: the caller is GIL-serialized with set_control_mode, while the thread
+      // body would race a concurrent gains handoff writing control_mode_.
+      const ControlMode mode = control_mode_;
+      try {
+        control_thread_ = std::thread([this, mode] {
+          if (const auto* software = std::get_if<SoftwareImpedance>(&mode)) {
+            this->run_joint_torque_control_(*software);
+          } else {
+            this->run_joint_position_control_();
+          }
+        });
+      } catch (...) {
+        // No thread means nothing will ever clear control_running_ or settle the goal armed above.
+        control_running_.store(false);
+        fail_goal_(goal_id, "could not start the control loop");
+        throw;
+      }
+    } else {
+      // The loop is ALREADY running, which is every move after the first. There is no join to order
+      // against here: the loop that will consume this target is the one already running, so arming
+      // immediately before publishing is the whole requirement. If that loop dies in the window,
+      // `finish_control_thread_` settles the goal armed here as ABORTED with the loop's own reason.
+      goal_id = arm_goal_();
+    }
+    {
+      std::lock_guard<std::mutex> lk(target_mutex_);
+      target_q_ = q_target;
+      target_goal_id_ = goal_id;
+      has_target_.store(true);
+    }
+    // The loop can exit between the `control_running_` read above and this publish: its
+    // `finish_control_thread_` then settles whatever goal was in flight BEFORE this one was armed,
+    // and the target just published belongs to a thread that is gone — leaving `goal()` IN_FLIGHT
+    // with nothing left that could ever settle it. Re-read after publishing and abort the goal
+    // ourselves. `control_running_` only goes false when a loop ends and only back to true when a
+    // caller starts one (callers are serialized), so a false read here is final, not a race.
+    // `settle_goal_` ignores a goal already settled, so a `finish_control_thread_` landing in
+    // between wins with its own, better reason.
+    if (!control_running_.load()) {
+      fail_goal_(goal_id, "the control loop stopped before it took up the target");
+    }
   }
 
   // Forward Kinematics: compute EE pose (tx, ty, tz, qw, qx, qy, qz) from joints q (7,)
@@ -736,6 +830,7 @@ private:
          first = true,
          goal_in_flight = std::uint64_t{0},
          stall_ticks = 0,
+         best_err = std::numeric_limits<double>::infinity(),
          stopping = false](const franka::RobotState& st, franka::Duration period) mutable -> franka::JointPositions {
           {
             std::lock_guard<std::mutex> lk(last_state_mutex_);
@@ -757,6 +852,7 @@ private:
             has_target_.store(false);
             goal_in_flight = std::exchange(target_goal_id_, 0);
             stall_ticks = 0;
+            best_err = std::numeric_limits<double>::infinity();
             // A rejected plan must not let the old trajectory finish this goal as if reached.
             if (!planned) {
               fail_goal_(goal_in_flight, "joint target rejected by the trajectory planner");
@@ -779,7 +875,7 @@ private:
               settle_on_arrival_(goal_in_flight,
                                  arrival_(Eigen::Map<const Vector7d>(pos.data()),
                                           Eigen::Map<const Vector7d>(st.q.data()),
-                                          Eigen::Map<const Vector7d>(st.dq.data()), stall_ticks))) {
+                                          Eigen::Map<const Vector7d>(st.dq.data()), best_err, stall_ticks))) {
             goal_in_flight = 0;
           }
 
@@ -818,6 +914,7 @@ private:
          first = true,
          goal_in_flight = std::uint64_t{0},
          stall_ticks = 0,
+         best_err = std::numeric_limits<double>::infinity(),
          stopping = false,
          stop_ticks = 0,
          ref = Vector7d(Vector7d::Zero())](const franka::RobotState& st,
@@ -843,6 +940,7 @@ private:
             ref = target_q_;
             goal_in_flight = std::exchange(target_goal_id_, 0);
             stall_ticks = 0;
+            best_err = std::numeric_limits<double>::infinity();
             has_target_.store(false);
           }
 
@@ -858,7 +956,7 @@ private:
           // The same arrival rule the position loop uses. No gate on a trajectory is needed: the
           // reference stepped away from the arm when the target arrived, so the check cannot pass
           // until the spring has actually pulled the joints in.
-          if (goal_in_flight != 0 && settle_on_arrival_(goal_in_flight, arrival_(ref, q, dq, stall_ticks))) {
+          if (goal_in_flight != 0 && settle_on_arrival_(goal_in_flight, arrival_(ref, q, dq, best_err, stall_ticks))) {
             goal_in_flight = 0;
           }
 
@@ -901,98 +999,6 @@ private:
     finish_control_thread_(std::move(thread_error));
   }
 
-  // Start the control loop if it is not running, then publish `q_target` to it. Every target arms
-  // the goal, so the move reports IN_FLIGHT until the loop settles it — one path, because a target's
-  // treatment must not depend on whether anyone happens to be watching it.
-  void publish_target_(const Eigen::Ref<const Vector7d>& q_target) {
-    // Reject garbage before it reaches a control loop: a torque-mode target becomes the reference
-    // verbatim, so a NaN here would become NaN torques.
-    if (!q_target.allFinite()) {
-      throw std::invalid_argument("q_target must be finite");
-    }
-    std::uint64_t goal_id = 0;
-    if (!control_running_.load()) {
-      if (control_thread_.joinable()) {
-        control_thread_.join();
-      }
-      // Arm here, after the join and before the launch below, and the goal has exactly one loop that
-      // can settle it. Arming any later would leave a window where the loop dies before the goal
-      // exists: the abort finds nothing in flight and is dropped, and the goal armed afterwards then
-      // belongs to a dead thread, so a poller waits on a move nothing will ever settle. Arming any
-      // earlier would expose it to the loop being replaced — the join is what guarantees that one has
-      // finished settling, so it cannot abort the move its successor is about to run.
-      goal_id = arm_goal_();
-      // Starting a loop issues a Move command, and the robot refuses one while it holds an error
-      // ("command not possible in the current mode"), so the fresh thread would die on its first tick.
-      // Report the robot's own error instead of spawning it. Clearing is the caller's call, not this
-      // library's: a reflex means the arm hit something, and only the caller knows whether resuming is
-      // safe — the goal aborts with the robot's own text so the caller sees why.
-      // Best effort: if the state read itself fails, fall through and let the loop report whatever is
-      // wrong, rather than turning a guard into a new failure mode.
-      std::string robot_errors;
-      try {
-        if (const auto errors = read_robot_state_().current_errors; static_cast<bool>(errors)) {
-          robot_errors = static_cast<std::string>(errors);
-        }
-      } catch (const std::exception&) {  // NOLINT(bugprone-empty-catch)
-      }
-      if (!robot_errors.empty()) {
-        fail_goal_(goal_id, "robot reports an error, recover before commanding a move: " + robot_errors);
-        return;
-      }
-      stop_requested_.store(false);
-      // A target or sync request stranded by a dead loop must not feed the replacement loop's first
-      // ticks — those can run before this command publishes its own target below. Anything queued here
-      // is stale: no loop consumed it, and the caller's publish comes after (callers are serialized).
-      has_target_.store(false);
-      {
-        std::lock_guard<std::mutex> lk(target_mutex_);
-        target_goal_id_ = 0;
-      }
-      control_running_.store(true);
-      // Snapshot the mode here: the caller is GIL-serialized with set_control_mode, while the thread
-      // body would race a concurrent gains handoff writing control_mode_.
-      const ControlMode mode = control_mode_;
-      try {
-        control_thread_ = std::thread([this, mode] {
-          if (const auto* software = std::get_if<SoftwareImpedance>(&mode)) {
-            this->run_joint_torque_control_(*software);
-          } else {
-            this->run_joint_position_control_();
-          }
-        });
-      } catch (...) {
-        // No thread means nothing will ever clear control_running_ or settle the goal armed above.
-        control_running_.store(false);
-        fail_goal_(goal_id, "could not start the control loop");
-        throw;
-      }
-    } else {
-      // The loop is ALREADY running, which is every move after the first. There is no join to order
-      // against here: the loop that will consume this target is the one already running, so arming
-      // immediately before publishing is the whole requirement. If that loop dies in the window,
-      // `finish_control_thread_` settles the goal armed here as ABORTED with the loop's own reason.
-      goal_id = arm_goal_();
-    }
-    {
-      std::lock_guard<std::mutex> lk(target_mutex_);
-      target_q_ = q_target;
-      target_goal_id_ = goal_id;
-      has_target_.store(true);
-    }
-    // The loop can exit between the `control_running_` read above and this publish: its
-    // `finish_control_thread_` then settles whatever goal was in flight BEFORE this one was armed,
-    // and the target just published belongs to a thread that is gone — leaving `goal()` IN_FLIGHT
-    // with nothing left that could ever settle it. Re-read after publishing and abort the goal
-    // ourselves. `control_running_` only goes false when a loop ends and only back to true when a
-    // caller starts one (callers are serialized), so a false read here is final, not a race.
-    // `settle_goal_` ignores a goal already settled, so a `finish_control_thread_` landing in
-    // between wins with its own, better reason.
-    if (!control_running_.load()) {
-      fail_goal_(goal_id, "the control loop stopped before it took up the target");
-    }
-  }
-
   // Arm a move and return the id that names it. Every move gets its own id, so an outcome reported by
   // whatever was running before can be told apart from the move now in flight.
   std::uint64_t arm_goal_() {
@@ -1033,14 +1039,27 @@ private:
   // REACHED requires actual arrival — at the commanded reference and no longer moving. A move that
   // runs out of patience is STALLED, never REACHED: an arm held short by contact has not arrived,
   // and telling a poller it has lets an experiment advance on a robot that is nowhere near its
-  // target. `stall_ticks` counts only ticks spent AT REST short of the reference, so a long move
-  // resets it while it is still travelling and is never mistaken for a stalled one.
+  // target.
+  //
+  // Stalling is measured as lost PROGRESS, not low velocity. Under soft gains, or on the last
+  // approach to a target, every joint can sit below the rest threshold for a second while the arm is
+  // still genuinely closing — judging by velocity alone would reject that legitimate slow move. So
+  // the count advances only while the smallest error yet seen for this move stops improving, which
+  // an arm held against something does and a converging one does not.
   enum class Arrival { InFlight, Reached, Stalled };
 
-  static Arrival arrival_(const Vector7d& ref, const Vector7d& q, const Vector7d& dq, int& stall_ticks) {
-    const bool still = dq.cwiseAbs().maxCoeff() < SETTLE_VELOCITY_TOLERANCE;
-    if (still && (ref - q).cwiseAbs().maxCoeff() < SETTLE_POSITION_TOLERANCE) return Arrival::Reached;
-    stall_ticks = still ? stall_ticks + 1 : 0;
+  static Arrival arrival_(const Vector7d& ref, const Vector7d& q, const Vector7d& dq, double& best_err,
+                          int& stall_ticks) {
+    const double err = (ref - q).cwiseAbs().maxCoeff();
+    if (err < SETTLE_POSITION_TOLERANCE && dq.cwiseAbs().maxCoeff() < SETTLE_VELOCITY_TOLERANCE) {
+      return Arrival::Reached;
+    }
+    if (err < best_err - STALL_PROGRESS_EPSILON) {
+      best_err = err;
+      stall_ticks = 0;
+    } else {
+      ++stall_ticks;
+    }
     return stall_ticks >= STALL_TICKS_CAP ? Arrival::Stalled : Arrival::InFlight;
   }
 
