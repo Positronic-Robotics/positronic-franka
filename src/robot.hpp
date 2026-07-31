@@ -43,15 +43,15 @@ constexpr std::array<double, 7> PANDA_JOINT_UPPER_LIMITS = {
 // the commanded reference and no longer moving.
 constexpr double SETTLE_POSITION_TOLERANCE = 0.05;  // rad
 constexpr double SETTLE_VELOCITY_TOLERANCE = 0.05;  // rad/s
-// The window over which progress is judged (1 kHz ticks, so 1 s). At the end of each window the arm
-// must be closer than it was when the window opened, or the move is given up as stalled. It bounds
-// time spent going nowhere, NOT the move: a window that shows progress opens a new one, so an arm
-// still closing is never given up on however slowly it converges — only one actually held short
-// (contact, a joint limit) trips it. A stalled move ABORTS; it never reports arrival.
+// The window over which motion is judged (1 kHz ticks, so 1 s). If the error does not vary across a
+// whole window the arm is going nowhere and the move is given up as stalled. It bounds time spent
+// frozen, NOT the move: an arm still moving — converging, oscillating, creeping — opens a new window
+// every second, so only one actually held fast (contact, a joint limit) trips it. A stalled move
+// ABORTS; it never reports arrival.
 constexpr int STALL_TICKS_CAP = 1000;
-// How much closer the arm must be at the end of a window than at its start. Far below any real
-// convergence — a move creeping at a tenth of the rest threshold still closes 500x this in a second —
-// and far above the noise on a joint encoder, so it separates "converging slowly" from "not moving".
+// How much the error must vary across a window to count as motion. Far below any real convergence —
+// a move creeping at a tenth of the rest threshold still covers 500x this in a second — and far
+// above the noise on a joint encoder, so it separates "still moving" from "stopped".
 constexpr double STALL_PROGRESS_EPSILON = 1e-4;  // rad
 // How long a move may run BEYOND the trajectory it was planned (the shaped case) or from the moment
 // it was commanded (the stepped one). The progress rule alone bounds a move only at
@@ -845,9 +845,8 @@ private:
          window_ticks = 0,
          move_ticks = 0,
          deadline_ticks = MOVE_TICKS_CAP,
-         prev_peak = std::numeric_limits<double>::infinity(),
-         window_peak = 0.0,
-         turned = false,
+         window_min = std::numeric_limits<double>::infinity(),
+         window_max = 0.0,
          stopping = false](const franka::RobotState& st, franka::Duration period) mutable -> franka::JointPositions {
           {
             std::lock_guard<std::mutex> lk(last_state_mutex_);
@@ -870,9 +869,8 @@ private:
             goal_in_flight = std::exchange(target_goal_id_, 0);
             window_ticks = 0;
             move_ticks = 0;
-            prev_peak = std::numeric_limits<double>::infinity();
-            window_peak = 0.0;
-            turned = false;
+            window_min = std::numeric_limits<double>::infinity();
+            window_max = 0.0;
             // The deadline is the plan's own duration plus the settle budget, so a deliberately slow
             // `relative_dynamics_factor` gets the time it asked for rather than being cut off by a
             // flat constant — while a move that overruns its own plan by a minute still ends.
@@ -900,7 +898,7 @@ private:
                                  arrival_(Eigen::Map<const Vector7d>(pos.data()),
                                           Eigen::Map<const Vector7d>(st.q.data()),
                                           Eigen::Map<const Vector7d>(st.dq.data()), traj.active(),
-                                          deadline_ticks, prev_peak, window_peak, turned, window_ticks,
+                                          deadline_ticks, window_min, window_max, window_ticks,
                                           move_ticks))) {
             goal_in_flight = 0;
           }
@@ -941,9 +939,8 @@ private:
          goal_in_flight = std::uint64_t{0},
          window_ticks = 0,
          move_ticks = 0,
-         prev_peak = std::numeric_limits<double>::infinity(),
-         window_peak = 0.0,
-         turned = false,
+         window_min = std::numeric_limits<double>::infinity(),
+         window_max = 0.0,
          stopping = false,
          stop_ticks = 0,
          ref = Vector7d(Vector7d::Zero())](const franka::RobotState& st,
@@ -970,9 +967,8 @@ private:
             goal_in_flight = std::exchange(target_goal_id_, 0);
             window_ticks = 0;
             move_ticks = 0;
-            prev_peak = std::numeric_limits<double>::infinity();
-            window_peak = 0.0;
-            turned = false;
+            window_min = std::numeric_limits<double>::infinity();
+            window_max = 0.0;
             has_target_.store(false);
           }
 
@@ -990,7 +986,7 @@ private:
           // spring has actually pulled the joints in, and the deadline is the flat one.
           if (goal_in_flight != 0 &&
               settle_on_arrival_(goal_in_flight, arrival_(ref, q, dq, /*travelling=*/false, MOVE_TICKS_CAP,
-                                                          prev_peak, window_peak, turned, window_ticks, move_ticks))) {
+                                                          window_min, window_max, window_ticks, move_ticks))) {
             goal_in_flight = 0;
           }
 
@@ -1075,25 +1071,23 @@ private:
   // and telling a poller it has lets an experiment advance on a robot that is nowhere near its
   // target.
   //
-  // Stalling is measured as lost PROGRESS, not low velocity. Under soft gains, or on the last
-  // approach to a target, every joint can sit below the rest threshold for a second while the arm is
-  // still genuinely closing — judging by velocity alone would reject that legitimate slow move.
+  // Two guards, and each answers a question the other cannot. The WINDOW asks whether anything is
+  // happening at all — an arm pinned against contact is the case it exists for, and it catches that
+  // in a second. The DEADLINE asks whether the move is ever going to end, which no local reading
+  // can: a marginally stable arm oscillates forever while looking busy every window.
   //
-  // Progress is judged over a MOVING WINDOW — is the arm closer now than one window ago — and not
-  // against the closest it has ever been. Underdamped gains make the difference: the arm overshoots,
-  // crossing the target at speed (so REACHED does not fire, and an all-time best would be pinned
-  // near zero), then converges through decaying swings that could never improve on that crossing.
-  // Judged against the window it opened, each swing is plainly smaller than the last.
-  //
-  // Two guards, because the window one bounds a move only at `distance / STALL_PROGRESS_EPSILON`
-  // seconds: an arm creeping by a hair per window opens new ones indefinitely. `move_ticks` is the
-  // flat deadline on the move as a whole, and the pair covers both shapes — held fast (1 s) and
-  // never quite finishing (60 s).
+  // Stalling is deliberately not judged from velocity, nor by comparing one window against another.
+  // Velocity rejects a legitimate slow move — under soft gains every joint can sit below the rest
+  // threshold while the arm is still genuinely closing. Comparing windows breaks on oscillation:
+  // where a boundary falls decides what is compared, so one turning peak can be read as two windows'
+  // worth of no progress, and a move whose error is still rising toward its first turn looks like a
+  // move going backwards. The range within a window has neither problem, because motion is motion
+  // whatever its phase.
   enum class Arrival { InFlight, Reached, Stalled };
 
   static Arrival arrival_(const Vector7d& ref, const Vector7d& q, const Vector7d& dq, bool travelling,
-                          int deadline_ticks, double& prev_peak, double& window_peak, bool& turned,
-                          int& window_ticks, int& move_ticks) {
+                          int deadline_ticks, double& window_min, double& window_max, int& window_ticks,
+                          int& move_ticks) {
     // The deadline covers the WHOLE move, the shaped phase included — it is the guarantee that a
     // goal cannot stay IN_FLIGHT indefinitely, and a phase excluded from it is a hole in that.
     if (++move_ticks >= deadline_ticks) return Arrival::Stalled;
@@ -1105,30 +1099,18 @@ private:
     if (err < SETTLE_POSITION_TOLERANCE && dq.cwiseAbs().maxCoeff() < SETTLE_VELOCITY_TOLERANCE) {
       return Arrival::Reached;
     }
-    // Compare each window's PEAK error, not the error at its boundary. An underdamped move can be at
-    // a zero crossing when one window closes and near a peak when the next does, so two boundary
-    // samples can rise while the oscillation's envelope is shrinking normally — the peaks fall
-    // whatever the phase. `prev_peak` starts at infinity, so the first window is free.
-    window_peak = std::max(window_peak, err);
-
-    // Nothing is judged until the error has turned over once. A target that replaces a move while
-    // the arm still carries velocity sends the error UP first, and under soft gains the quarter
-    // period before it turns can outlast a window — so comparing peaks across that opening stretch
-    // measures a move that has not begun converging yet and calls a healthy one stalled. The turn is
-    // the first meaningful drop below the running peak; the deadline runs throughout regardless, so
-    // an arm that never turns is still bounded.
-    if (!turned) {
-      if (window_peak - err <= STALL_PROGRESS_EPSILON) return Arrival::InFlight;
-      turned = true;
-      window_peak = err;
-      window_ticks = 0;
-      return Arrival::InFlight;
-    }
-
+    // Is anything happening? Over each window, the error's full RANGE decides: an arm that is
+    // converging moves — however it moves, oscillating or creeping — and one that is stuck against
+    // contact or a joint limit does not. Range is blind to the phase and to where a window boundary
+    // happens to fall, which comparisons between windows are not: they read a turning peak twice, or
+    // measure the opening stretch of a move whose error is still rising, and abort a healthy move.
+    //
+    // A move that keeps moving but never arrives is not this check's job — the deadline ends it.
+    window_min = std::min(window_min, err);
+    window_max = std::max(window_max, err);
     if (++window_ticks < STALL_TICKS_CAP) return Arrival::InFlight;
-    if (window_peak >= prev_peak - STALL_PROGRESS_EPSILON) return Arrival::Stalled;
-    prev_peak = window_peak;
-    window_peak = 0.0;
+    if (window_max - window_min <= STALL_PROGRESS_EPSILON) return Arrival::Stalled;
+    window_min = window_max = err;
     window_ticks = 0;
     return Arrival::InFlight;
   }
