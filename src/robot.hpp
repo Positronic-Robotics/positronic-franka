@@ -845,8 +845,8 @@ private:
          window_ticks = 0,
          move_ticks = 0,
          deadline_ticks = MOVE_TICKS_CAP,
-         window_min = std::numeric_limits<double>::infinity(),
-         window_max = 0.0,
+         window_min = Vector7d(Vector7d::Constant(std::numeric_limits<double>::infinity())),
+         window_max = Vector7d(Vector7d::Zero()),
          stopping = false](const franka::RobotState& st, franka::Duration period) mutable -> franka::JointPositions {
           {
             std::lock_guard<std::mutex> lk(last_state_mutex_);
@@ -869,8 +869,8 @@ private:
             goal_in_flight = std::exchange(target_goal_id_, 0);
             window_ticks = 0;
             move_ticks = 0;
-            window_min = std::numeric_limits<double>::infinity();
-            window_max = 0.0;
+            window_min.setConstant(std::numeric_limits<double>::infinity());
+            window_max.setZero();
             // The deadline is the plan's own duration plus the settle budget, so a deliberately slow
             // `relative_dynamics_factor` gets the time it asked for rather than being cut off by a
             // flat constant — while a move that overruns its own plan by a minute still ends.
@@ -938,8 +938,8 @@ private:
          goal_in_flight = std::uint64_t{0},
          window_ticks = 0,
          move_ticks = 0,
-         window_min = std::numeric_limits<double>::infinity(),
-         window_max = 0.0,
+         window_min = Vector7d(Vector7d::Constant(std::numeric_limits<double>::infinity())),
+         window_max = Vector7d(Vector7d::Zero()),
          stopping = false,
          stop_ticks = 0,
          ref = Vector7d(Vector7d::Zero())](const franka::RobotState& st,
@@ -966,8 +966,8 @@ private:
             goal_in_flight = std::exchange(target_goal_id_, 0);
             window_ticks = 0;
             move_ticks = 0;
-            window_min = std::numeric_limits<double>::infinity();
-            window_max = 0.0;
+            window_min.setConstant(std::numeric_limits<double>::infinity());
+            window_max.setZero();
             has_target_.store(false);
           }
 
@@ -1086,7 +1086,7 @@ private:
   enum class Arrival { InFlight, Reached, Stalled };
 
   static Arrival arrival_(const Vector7d& ref, const Vector7d& q, bool travelling,
-                          int deadline_ticks, double& window_min, double& window_max, int& window_ticks,
+                          int deadline_ticks, Vector7d& window_min, Vector7d& window_max, int& window_ticks,
                           int& move_ticks) {
     // The deadline covers the WHOLE move, the shaped phase included — it is the guarantee that a
     // goal cannot stay IN_FLIGHT indefinitely, and a phase excluded from it is a hole in that.
@@ -1112,14 +1112,18 @@ private:
     // The floor on that is physical, not a gap here: as the configured frequency falls, "creeping"
     // and "stopped" stop being distinguishable within any finite observation. That case is what the
     // whole-move deadline is for.
-    const double err = (ref - q).cwiseAbs().maxCoeff();
-    window_min = std::min(window_min, err);
-    window_max = std::max(window_max, err);
+    // PER JOINT, and only then reduced. Taking the largest error first and watching that scalar
+    // hides every other joint behind it: one joint resting on a residual just inside tolerance holds
+    // the maximum constant while another swings freely underneath, and the arm reports arrival while
+    // it is still moving. The arm is settled when NO joint is moving.
+    const Vector7d e = (ref - q).cwiseAbs();
+    window_min = window_min.cwiseMin(e);
+    window_max = window_max.cwiseMax(e);
     if (++window_ticks < STALL_TICKS_CAP) return Arrival::InFlight;
-    if (window_max - window_min <= STALL_PROGRESS_EPSILON) {
-      return err < SETTLE_POSITION_TOLERANCE ? Arrival::Reached : Arrival::Stalled;
+    if ((window_max - window_min).maxCoeff() <= STALL_PROGRESS_EPSILON) {
+      return e.maxCoeff() < SETTLE_POSITION_TOLERANCE ? Arrival::Reached : Arrival::Stalled;
     }
-    window_min = window_max = err;
+    window_min = window_max = e;
     window_ticks = 0;
     return Arrival::InFlight;
   }
