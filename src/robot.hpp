@@ -213,9 +213,11 @@ class TrajectoryGenerator {
     return replan_();
   }
 
-  void stop_at_current() {
+  // Plan a stop from wherever the reference now is. Returns false if the planner refused, in which
+  // case the previous plan is still playing and the caller must ask again.
+  bool stop_at_current() {
     input_.target_position = input_.current_position;
-    replan_();
+    return replan_();
   }
 
   // Advance trajectory by actual elapsed time and return the position.
@@ -815,6 +817,7 @@ private:
          goal_in_flight = std::uint64_t{0},
          elapsed_s = 0.0,
          deadline_s = 0.0,
+         braking = false,
          stopping = false](const franka::RobotState& st, franka::Duration period) mutable -> franka::JointPositions {
           {
             std::lock_guard<std::mutex> lk(last_state_mutex_);
@@ -827,8 +830,12 @@ private:
           } else if (!stopping && stop_requested_.load()) {
             stopping = true;
             has_target_.store(false);
-            traj.stop_at_current();
+            braking = !traj.stop_at_current();
           }
+
+          // A refused stop leaves the arm travelling to the target the goal has already been told it
+          // will not reach, so keep asking until the planner accepts one.
+          if (braking) braking = !traj.stop_at_current();
 
           if (!stopping && has_target_.load()) {
             std::lock_guard<std::mutex> lk(target_mutex_);
@@ -845,7 +852,9 @@ private:
             if (!planned) {
               fail_goal_(goal_in_flight, "joint target rejected by the trajectory planner");
               goal_in_flight = 0;
-              traj.stop_at_current();
+              braking = !traj.stop_at_current();
+            } else {
+              braking = false;
             }
           }
 
@@ -865,7 +874,7 @@ private:
               goal_in_flight = 0;
               // ABORTED says the move stopped short, so the arm has to actually stop rather than
               // keep being driven at the expired target.
-              if (outcome == Arrival::Stalled) traj.stop_at_current();
+              if (outcome == Arrival::Stalled) braking = !traj.stop_at_current();
             }
           }
 
