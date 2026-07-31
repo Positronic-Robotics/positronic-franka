@@ -53,11 +53,13 @@ constexpr int STALL_TICKS_CAP = 1000;
 // convergence — a move creeping at a tenth of the rest threshold still closes 500x this in a second —
 // and far above the noise on a joint encoder, so it separates "converging slowly" from "not moving".
 constexpr double STALL_PROGRESS_EPSILON = 1e-4;  // rad
-// The whole move's deadline, whatever it is doing. The progress rule alone bounds a move only at
-// `distance / STALL_PROGRESS_EPSILON` seconds — 1 rad of travel buys ~9500 resets, so an arm making
-// microscopic progress could hold a caller for hours. This is the backstop: generous next to any real
-// move (the impedance spring settles in seconds, a full-range Ruckig move at 0.2 dynamics in ~10),
-// so it never cuts a legitimate one short, and it turns the worst case from hours into a minute.
+// How long a move may run BEYOND the trajectory it was planned (the shaped case) or from the moment
+// it was commanded (the stepped one). The progress rule alone bounds a move only at
+// `distance / STALL_PROGRESS_EPSILON` seconds — 1 rad of travel buys ~9500 windows, so an arm making
+// microscopic progress could hold a caller for hours. This is the backstop, and it is generous next
+// to any real settle (the impedance spring settles in seconds), so it only ever fires on a move that
+// has already gone wrong. Adding it to the plan's own duration rather than replacing it is what lets
+// a deliberately slow `relative_dynamics_factor` still finish.
 constexpr int MOVE_TICKS_CAP = 60000;  // 1 kHz ticks — 60 s
 
 // Common Eigen aliases
@@ -257,6 +259,11 @@ class TrajectoryGenerator {
   }
 
   bool active() const { return active_; }
+
+  // How long the planned trajectory runs, in seconds. The move deadline adds it to the settle
+  // budget: a slow `relative_dynamics_factor` (down to 0.0001) can make a full-range move take
+  // hours, and a flat deadline would abort it long before the plan it was given had finished.
+  double duration() const { return duration_; }
 
  private:
   bool replan_() {
@@ -837,7 +844,9 @@ private:
          goal_in_flight = std::uint64_t{0},
          window_ticks = 0,
          move_ticks = 0,
-         window_err = std::numeric_limits<double>::infinity(),
+         deadline_ticks = MOVE_TICKS_CAP,
+         prev_peak = std::numeric_limits<double>::infinity(),
+         window_peak = 0.0,
          stopping = false](const franka::RobotState& st, franka::Duration period) mutable -> franka::JointPositions {
           {
             std::lock_guard<std::mutex> lk(last_state_mutex_);
@@ -860,7 +869,12 @@ private:
             goal_in_flight = std::exchange(target_goal_id_, 0);
             window_ticks = 0;
             move_ticks = 0;
-            window_err = std::numeric_limits<double>::infinity();
+            prev_peak = std::numeric_limits<double>::infinity();
+            window_peak = 0.0;
+            // The deadline is the plan's own duration plus the settle budget, so a deliberately slow
+            // `relative_dynamics_factor` gets the time it asked for rather than being cut off by a
+            // flat constant — while a move that overruns its own plan by a minute still ends.
+            deadline_ticks = MOVE_TICKS_CAP + static_cast<int>(traj.duration() * 1000.0);
             // A rejected plan must not let the old trajectory finish this goal as if reached.
             if (!planned) {
               fail_goal_(goal_in_flight, "joint target rejected by the trajectory planner");
@@ -875,15 +889,16 @@ private:
           // the internal controller tracks closely but not exactly, and the torque loop has no
           // trajectory to exhaust at all.
           //
-          // Here it is gated on the trajectory being done, which the torque loop needs no equivalent
-          // of: a Ruckig move STARTS with the reference at the current pose and the arm at rest, so
-          // an ungated check would report REACHED on the first tick of every move. A stepped
-          // reference starts far from the arm, so the same check is safe unguarded there.
-          if (goal_in_flight != 0 && !traj.active() &&
+          // `traj.active()` is passed rather than gating the call: while the reference is still being
+          // shaped there is no arrival to test — a Ruckig move STARTS with the reference at the arm
+          // and the arm at rest, so an ungated check would report REACHED on the first tick — but the
+          // deadline must keep running through that phase or it does not bound the move.
+          if (goal_in_flight != 0 &&
               settle_on_arrival_(goal_in_flight,
                                  arrival_(Eigen::Map<const Vector7d>(pos.data()),
                                           Eigen::Map<const Vector7d>(st.q.data()),
-                                          Eigen::Map<const Vector7d>(st.dq.data()), window_err, window_ticks,
+                                          Eigen::Map<const Vector7d>(st.dq.data()), traj.active(),
+                                          deadline_ticks, prev_peak, window_peak, window_ticks,
                                           move_ticks))) {
             goal_in_flight = 0;
           }
@@ -924,7 +939,8 @@ private:
          goal_in_flight = std::uint64_t{0},
          window_ticks = 0,
          move_ticks = 0,
-         window_err = std::numeric_limits<double>::infinity(),
+         prev_peak = std::numeric_limits<double>::infinity(),
+         window_peak = 0.0,
          stopping = false,
          stop_ticks = 0,
          ref = Vector7d(Vector7d::Zero())](const franka::RobotState& st,
@@ -951,7 +967,8 @@ private:
             goal_in_flight = std::exchange(target_goal_id_, 0);
             window_ticks = 0;
             move_ticks = 0;
-            window_err = std::numeric_limits<double>::infinity();
+            prev_peak = std::numeric_limits<double>::infinity();
+            window_peak = 0.0;
             has_target_.store(false);
           }
 
@@ -964,11 +981,12 @@ private:
             has_new_gains_.store(false);
           }
 
-          // The same arrival rule the position loop uses. No gate on a trajectory is needed: the
-          // reference stepped away from the arm when the target arrived, so the check cannot pass
-          // until the spring has actually pulled the joints in.
+          // The same arrival rule the position loop uses, with nothing shaping the reference — it
+          // stepped away from the arm when the target arrived, so the check cannot pass until the
+          // spring has actually pulled the joints in, and the deadline is the flat one.
           if (goal_in_flight != 0 &&
-              settle_on_arrival_(goal_in_flight, arrival_(ref, q, dq, window_err, window_ticks, move_ticks))) {
+              settle_on_arrival_(goal_in_flight, arrival_(ref, q, dq, /*travelling=*/false, MOVE_TICKS_CAP,
+                                                          prev_peak, window_peak, window_ticks, move_ticks))) {
             goal_in_flight = 0;
           }
 
@@ -1069,18 +1087,29 @@ private:
   // never quite finishing (60 s).
   enum class Arrival { InFlight, Reached, Stalled };
 
-  static Arrival arrival_(const Vector7d& ref, const Vector7d& q, const Vector7d& dq, double& window_err,
-                          int& window_ticks, int& move_ticks) {
+  static Arrival arrival_(const Vector7d& ref, const Vector7d& q, const Vector7d& dq, bool travelling,
+                          int deadline_ticks, double& prev_peak, double& window_peak, int& window_ticks,
+                          int& move_ticks) {
+    // The deadline covers the WHOLE move, the shaped phase included — it is the guarantee that a
+    // goal cannot stay IN_FLIGHT indefinitely, and a phase excluded from it is a hole in that.
+    if (++move_ticks >= deadline_ticks) return Arrival::Stalled;
+    // While the reference is still being shaped the arm is meant to be behind it, so there is no
+    // arrival to test and no stall to detect; only the deadline runs.
+    if (travelling) return Arrival::InFlight;
+
     const double err = (ref - q).cwiseAbs().maxCoeff();
     if (err < SETTLE_POSITION_TOLERANCE && dq.cwiseAbs().maxCoeff() < SETTLE_VELOCITY_TOLERANCE) {
       return Arrival::Reached;
     }
-    if (++move_ticks >= MOVE_TICKS_CAP) return Arrival::Stalled;
+    // Compare each window's PEAK error, not the error at its boundary. An underdamped move can be at
+    // a zero crossing when one window closes and near a peak when the next does, so two boundary
+    // samples can rise while the oscillation's envelope is shrinking normally — the peaks fall
+    // whatever the phase. `prev_peak` starts at infinity, so the first window is free.
+    window_peak = std::max(window_peak, err);
     if (++window_ticks < STALL_TICKS_CAP) return Arrival::InFlight;
-    // The window is up: closer than when it opened, or the arm is going nowhere. `window_err` starts
-    // at infinity, so the first window is free — the arm has not been anywhere to be compared with.
-    if (err >= window_err - STALL_PROGRESS_EPSILON) return Arrival::Stalled;
-    window_err = err;
+    if (window_peak >= prev_peak - STALL_PROGRESS_EPSILON) return Arrival::Stalled;
+    prev_peak = window_peak;
+    window_peak = 0.0;
     window_ticks = 0;
     return Arrival::InFlight;
   }
