@@ -43,13 +43,13 @@ constexpr std::array<double, 7> PANDA_JOINT_UPPER_LIMITS = {
 // the commanded reference and no longer moving.
 constexpr double SETTLE_POSITION_TOLERANCE = 0.05;  // rad
 constexpr double SETTLE_VELOCITY_TOLERANCE = 0.05;  // rad/s
-// How long the arm may make NO PROGRESS toward the target before the move is given up as stalled
-// (1 kHz ticks, so 1 s). It bounds time spent going nowhere, NOT the move: progress resets the count,
-// so an arm still closing on the target is never given up on however slowly it converges — only one
-// actually held short (contact, a joint limit) trips it. A stalled move ABORTS; it never reports
-// arrival, because it did not arrive.
+// The window over which progress is judged (1 kHz ticks, so 1 s). At the end of each window the arm
+// must be closer than it was when the window opened, or the move is given up as stalled. It bounds
+// time spent going nowhere, NOT the move: a window that shows progress opens a new one, so an arm
+// still closing is never given up on however slowly it converges — only one actually held short
+// (contact, a joint limit) trips it. A stalled move ABORTS; it never reports arrival.
 constexpr int STALL_TICKS_CAP = 1000;
-// The joint error must shrink by at least this much to count as progress. Far below any real
+// How much closer the arm must be at the end of a window than at its start. Far below any real
 // convergence — a move creeping at a tenth of the rest threshold still closes 500x this in a second —
 // and far above the noise on a joint encoder, so it separates "converging slowly" from "not moving".
 constexpr double STALL_PROGRESS_EPSILON = 1e-4;  // rad
@@ -835,9 +835,9 @@ private:
         [&, this,
          first = true,
          goal_in_flight = std::uint64_t{0},
-         stall_ticks = 0,
+         window_ticks = 0,
          move_ticks = 0,
-         best_err = std::numeric_limits<double>::infinity(),
+         window_err = std::numeric_limits<double>::infinity(),
          stopping = false](const franka::RobotState& st, franka::Duration period) mutable -> franka::JointPositions {
           {
             std::lock_guard<std::mutex> lk(last_state_mutex_);
@@ -858,9 +858,9 @@ private:
             const bool planned = traj.set_target(target_q_);
             has_target_.store(false);
             goal_in_flight = std::exchange(target_goal_id_, 0);
-            stall_ticks = 0;
+            window_ticks = 0;
             move_ticks = 0;
-            best_err = std::numeric_limits<double>::infinity();
+            window_err = std::numeric_limits<double>::infinity();
             // A rejected plan must not let the old trajectory finish this goal as if reached.
             if (!planned) {
               fail_goal_(goal_in_flight, "joint target rejected by the trajectory planner");
@@ -883,7 +883,7 @@ private:
               settle_on_arrival_(goal_in_flight,
                                  arrival_(Eigen::Map<const Vector7d>(pos.data()),
                                           Eigen::Map<const Vector7d>(st.q.data()),
-                                          Eigen::Map<const Vector7d>(st.dq.data()), best_err, stall_ticks,
+                                          Eigen::Map<const Vector7d>(st.dq.data()), window_err, window_ticks,
                                           move_ticks))) {
             goal_in_flight = 0;
           }
@@ -922,9 +922,9 @@ private:
         [&, this,
          first = true,
          goal_in_flight = std::uint64_t{0},
-         stall_ticks = 0,
+         window_ticks = 0,
          move_ticks = 0,
-         best_err = std::numeric_limits<double>::infinity(),
+         window_err = std::numeric_limits<double>::infinity(),
          stopping = false,
          stop_ticks = 0,
          ref = Vector7d(Vector7d::Zero())](const franka::RobotState& st,
@@ -949,9 +949,9 @@ private:
             std::lock_guard<std::mutex> lk(target_mutex_);
             ref = target_q_;
             goal_in_flight = std::exchange(target_goal_id_, 0);
-            stall_ticks = 0;
+            window_ticks = 0;
             move_ticks = 0;
-            best_err = std::numeric_limits<double>::infinity();
+            window_err = std::numeric_limits<double>::infinity();
             has_target_.store(false);
           }
 
@@ -968,7 +968,7 @@ private:
           // reference stepped away from the arm when the target arrived, so the check cannot pass
           // until the spring has actually pulled the joints in.
           if (goal_in_flight != 0 &&
-              settle_on_arrival_(goal_in_flight, arrival_(ref, q, dq, best_err, stall_ticks, move_ticks))) {
+              settle_on_arrival_(goal_in_flight, arrival_(ref, q, dq, window_err, window_ticks, move_ticks))) {
             goal_in_flight = 0;
           }
 
@@ -1055,30 +1055,34 @@ private:
   //
   // Stalling is measured as lost PROGRESS, not low velocity. Under soft gains, or on the last
   // approach to a target, every joint can sit below the rest threshold for a second while the arm is
-  // still genuinely closing — judging by velocity alone would reject that legitimate slow move. So
-  // the count advances only while the smallest error yet seen for this move stops improving, which
-  // an arm held against something does and a converging one does not.
+  // still genuinely closing — judging by velocity alone would reject that legitimate slow move.
   //
-  // Two guards, because that one bounds a move only at `distance / STALL_PROGRESS_EPSILON` seconds:
-  // an arm creeping by a hair every second resets the count indefinitely. `move_ticks` is the flat
-  // deadline on the move as a whole, and the pair covers both shapes — held fast (1 s) and never
-  // quite finishing (60 s).
+  // Progress is judged over a MOVING WINDOW — is the arm closer now than one window ago — and not
+  // against the closest it has ever been. Underdamped gains make the difference: the arm overshoots,
+  // crossing the target at speed (so REACHED does not fire, and an all-time best would be pinned
+  // near zero), then converges through decaying swings that could never improve on that crossing.
+  // Judged against the window it opened, each swing is plainly smaller than the last.
+  //
+  // Two guards, because the window one bounds a move only at `distance / STALL_PROGRESS_EPSILON`
+  // seconds: an arm creeping by a hair per window opens new ones indefinitely. `move_ticks` is the
+  // flat deadline on the move as a whole, and the pair covers both shapes — held fast (1 s) and
+  // never quite finishing (60 s).
   enum class Arrival { InFlight, Reached, Stalled };
 
-  static Arrival arrival_(const Vector7d& ref, const Vector7d& q, const Vector7d& dq, double& best_err,
-                          int& stall_ticks, int& move_ticks) {
+  static Arrival arrival_(const Vector7d& ref, const Vector7d& q, const Vector7d& dq, double& window_err,
+                          int& window_ticks, int& move_ticks) {
     const double err = (ref - q).cwiseAbs().maxCoeff();
     if (err < SETTLE_POSITION_TOLERANCE && dq.cwiseAbs().maxCoeff() < SETTLE_VELOCITY_TOLERANCE) {
       return Arrival::Reached;
     }
-    if (err < best_err - STALL_PROGRESS_EPSILON) {
-      best_err = err;
-      stall_ticks = 0;
-    } else {
-      ++stall_ticks;
-    }
-    return (stall_ticks >= STALL_TICKS_CAP || ++move_ticks >= MOVE_TICKS_CAP) ? Arrival::Stalled
-                                                                             : Arrival::InFlight;
+    if (++move_ticks >= MOVE_TICKS_CAP) return Arrival::Stalled;
+    if (++window_ticks < STALL_TICKS_CAP) return Arrival::InFlight;
+    // The window is up: closer than when it opened, or the arm is going nowhere. `window_err` starts
+    // at infinity, so the first window is free — the arm has not been anywhere to be compared with.
+    if (err >= window_err - STALL_PROGRESS_EPSILON) return Arrival::Stalled;
+    window_err = err;
+    window_ticks = 0;
+    return Arrival::InFlight;
   }
 
   // Apply that outcome to the goal `id` names. Returns true once the move is over, so the caller
