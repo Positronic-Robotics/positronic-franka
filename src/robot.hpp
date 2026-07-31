@@ -847,6 +847,7 @@ private:
          deadline_ticks = MOVE_TICKS_CAP,
          prev_peak = std::numeric_limits<double>::infinity(),
          window_peak = 0.0,
+         turned = false,
          stopping = false](const franka::RobotState& st, franka::Duration period) mutable -> franka::JointPositions {
           {
             std::lock_guard<std::mutex> lk(last_state_mutex_);
@@ -871,6 +872,7 @@ private:
             move_ticks = 0;
             prev_peak = std::numeric_limits<double>::infinity();
             window_peak = 0.0;
+            turned = false;
             // The deadline is the plan's own duration plus the settle budget, so a deliberately slow
             // `relative_dynamics_factor` gets the time it asked for rather than being cut off by a
             // flat constant — while a move that overruns its own plan by a minute still ends.
@@ -898,7 +900,7 @@ private:
                                  arrival_(Eigen::Map<const Vector7d>(pos.data()),
                                           Eigen::Map<const Vector7d>(st.q.data()),
                                           Eigen::Map<const Vector7d>(st.dq.data()), traj.active(),
-                                          deadline_ticks, prev_peak, window_peak, window_ticks,
+                                          deadline_ticks, prev_peak, window_peak, turned, window_ticks,
                                           move_ticks))) {
             goal_in_flight = 0;
           }
@@ -941,6 +943,7 @@ private:
          move_ticks = 0,
          prev_peak = std::numeric_limits<double>::infinity(),
          window_peak = 0.0,
+         turned = false,
          stopping = false,
          stop_ticks = 0,
          ref = Vector7d(Vector7d::Zero())](const franka::RobotState& st,
@@ -969,6 +972,7 @@ private:
             move_ticks = 0;
             prev_peak = std::numeric_limits<double>::infinity();
             window_peak = 0.0;
+            turned = false;
             has_target_.store(false);
           }
 
@@ -986,7 +990,7 @@ private:
           // spring has actually pulled the joints in, and the deadline is the flat one.
           if (goal_in_flight != 0 &&
               settle_on_arrival_(goal_in_flight, arrival_(ref, q, dq, /*travelling=*/false, MOVE_TICKS_CAP,
-                                                          prev_peak, window_peak, window_ticks, move_ticks))) {
+                                                          prev_peak, window_peak, turned, window_ticks, move_ticks))) {
             goal_in_flight = 0;
           }
 
@@ -1088,8 +1092,8 @@ private:
   enum class Arrival { InFlight, Reached, Stalled };
 
   static Arrival arrival_(const Vector7d& ref, const Vector7d& q, const Vector7d& dq, bool travelling,
-                          int deadline_ticks, double& prev_peak, double& window_peak, int& window_ticks,
-                          int& move_ticks) {
+                          int deadline_ticks, double& prev_peak, double& window_peak, bool& turned,
+                          int& window_ticks, int& move_ticks) {
     // The deadline covers the WHOLE move, the shaped phase included — it is the guarantee that a
     // goal cannot stay IN_FLIGHT indefinitely, and a phase excluded from it is a hole in that.
     if (++move_ticks >= deadline_ticks) return Arrival::Stalled;
@@ -1106,6 +1110,21 @@ private:
     // samples can rise while the oscillation's envelope is shrinking normally — the peaks fall
     // whatever the phase. `prev_peak` starts at infinity, so the first window is free.
     window_peak = std::max(window_peak, err);
+
+    // Nothing is judged until the error has turned over once. A target that replaces a move while
+    // the arm still carries velocity sends the error UP first, and under soft gains the quarter
+    // period before it turns can outlast a window — so comparing peaks across that opening stretch
+    // measures a move that has not begun converging yet and calls a healthy one stalled. The turn is
+    // the first meaningful drop below the running peak; the deadline runs throughout regardless, so
+    // an arm that never turns is still bounded.
+    if (!turned) {
+      if (window_peak - err <= STALL_PROGRESS_EPSILON) return Arrival::InFlight;
+      turned = true;
+      window_peak = err;
+      window_ticks = 0;
+      return Arrival::InFlight;
+    }
+
     if (++window_ticks < STALL_TICKS_CAP) return Arrival::InFlight;
     if (window_peak >= prev_peak - STALL_PROGRESS_EPSILON) return Arrival::Stalled;
     prev_peak = window_peak;
