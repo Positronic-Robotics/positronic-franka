@@ -16,9 +16,11 @@
 #include <atomic>
 #include <mutex>
 #include <condition_variable>
+#include <cstdint>
 #include <cstring>
 #include <optional>
 #include <stdexcept>
+#include <utility>
 #include <variant>
 #include <Eigen/Core>
 #include <Eigen/Geometry>
@@ -746,7 +748,7 @@ private:
       robot_->control(
         [&, this,
          first = true,
-         sync_in_flight = false,
+         sync_in_flight = std::uint64_t{0},
          stopping = false](const franka::RobotState& st, franka::Duration period) mutable -> franka::JointPositions {
           {
             std::lock_guard<std::mutex> lk(last_state_mutex_);
@@ -766,21 +768,21 @@ private:
             std::lock_guard<std::mutex> lk(target_mutex_);
             const bool planned = traj.set_target(target_q_);
             has_target_.store(false);
-            const bool sync = sync_request_next_.exchange(false);
+            const std::uint64_t goal_id = std::exchange(target_goal_id_, 0);
             // An async target supersedes a tracked move still in flight; release its waiter rather
             // than leave it blocked until some unrelated goal completes.
-            if (sync_in_flight && !sync) supersede_goal_();
-            sync_in_flight = sync && planned;
+            if (sync_in_flight != 0 && goal_id == 0) supersede_goal_(sync_in_flight);
+            sync_in_flight = planned ? goal_id : 0;
             // A rejected plan must not let the old trajectory finish this goal as if reached.
-            if (sync && !planned) fail_goal_("joint target rejected by the trajectory planner");
+            if (goal_id != 0 && !planned) fail_goal_(goal_id, "joint target rejected by the trajectory planner");
           }
 
           auto pos = traj.step(period);
 
           if (!traj.active()) {
-            if (sync_in_flight) {
-              complete_goal_();
-              sync_in_flight = false;
+            if (sync_in_flight != 0) {
+              complete_goal_(sync_in_flight);
+              sync_in_flight = 0;
             }
             if (stopping) {
               auto cmd = franka::JointPositions(pos);
@@ -820,6 +822,7 @@ private:
          first = true,
          shaped = false,
          settling = false,
+         sync_in_flight = std::uint64_t{0},
          settle_ticks = 0,
          stopping = false,
          stop_ticks = 0,
@@ -841,22 +844,25 @@ private:
 
           if (!stopping && has_target_.load()) {
             std::lock_guard<std::mutex> lk(target_mutex_);
-            const bool sync_in_flight = shaped || settling;
+            const std::uint64_t previous = (shaped || settling) ? sync_in_flight : 0;
             settling = false;
-            if (sync_request_next_.exchange(false)) {
+            const std::uint64_t goal_id = std::exchange(target_goal_id_, 0);
+            if (goal_id != 0) {
               traj.reset(ref);
               if (traj.set_target(target_q_)) {
                 shaped = true;
+                sync_in_flight = goal_id;
               } else {
                 // A rejected plan must not let settling at the old reference report the goal reached.
-                fail_goal_("joint target rejected by the trajectory planner");
+                sync_in_flight = 0;
+                fail_goal_(goal_id, "joint target rejected by the trajectory planner");
               }
             } else {
               ref = target_q_;
               shaped = false;
               // A step target supersedes a tracked move still in flight; release its waiter rather
               // than leave it blocked until some unrelated goal completes.
-              if (sync_in_flight) supersede_goal_();
+              if (previous != 0) supersede_goal_(previous);
             }
             has_target_.store(false);
           }
@@ -889,7 +895,7 @@ private:
                                dq.cwiseAbs().maxCoeff() < SETTLE_VELOCITY_TOLERANCE;
             if (close || settle_ticks >= SETTLE_TICKS_CAP) {
               settling = false;
-              complete_goal_();
+              complete_goal_(sync_in_flight);
             }
           }
 
@@ -941,10 +947,18 @@ private:
     if (!q_target.allFinite()) {
       throw std::invalid_argument("q_target must be finite");
     }
+    std::uint64_t goal_id = 0;
     if (!control_running_.load()) {
       if (control_thread_.joinable()) {
         control_thread_.join();
       }
+      // Arm here, after the join and before the launch below, and the goal has exactly one loop that
+      // can settle it. Arming any later would leave a window where the loop dies before the goal
+      // exists: the abort finds nothing in flight and is dropped, and the goal armed afterwards then
+      // belongs to a dead thread, so a poller waits on a move nothing will ever settle. Arming any
+      // earlier would expose it to the loop being replaced — the join is what guarantees that one has
+      // finished settling, so it cannot abort the move its successor is about to run.
+      if (tracked) goal_id = arm_goal_();
       // Starting a loop issues a Move command, and the robot refuses one while it holds an error
       // ("command not possible in the current mode"), so the fresh thread would die on its first tick.
       // Report the robot's own error instead of spawning it. Clearing is the caller's call, not this
@@ -961,11 +975,7 @@ private:
       } catch (const std::exception&) {  // NOLINT(bugprone-empty-catch)
       }
       if (!robot_errors.empty()) {
-        if (tracked) {
-          std::lock_guard<std::mutex> lk(goal_mutex_);
-          goal_status_ = GoalStatus::ABORTED;
-          goal_error_ = "robot reports an error, recover before commanding a move: " + robot_errors;
-        }
+        fail_goal_(goal_id, "robot reports an error, recover before commanding a move: " + robot_errors);
         return;
       }
       stop_requested_.store(false);
@@ -973,58 +983,86 @@ private:
       // ticks — those can run before this command publishes its own target below. Anything queued here
       // is stale: no loop consumed it, and the caller's publish comes after (callers are serialized).
       has_target_.store(false);
-      sync_request_next_.store(false);
+      {
+        std::lock_guard<std::mutex> lk(target_mutex_);
+        target_goal_id_ = 0;
+      }
       control_running_.store(true);
       // Snapshot the mode here: the caller is GIL-serialized with set_control_mode, while the thread
       // body would race a concurrent gains handoff writing control_mode_.
       const ControlMode mode = control_mode_;
-      control_thread_ = std::thread([this, mode] {
-        if (const auto* software = std::get_if<SoftwareImpedance>(&mode)) {
-          this->run_joint_torque_control_(*software);
-        } else {
-          this->run_joint_position_control_();
-        }
-      });
-    }
-    if (tracked) {
-      // Arm before publishing the target, so the loop cannot settle a goal that is not yet in flight.
-      std::lock_guard<std::mutex> glk(goal_mutex_);
-      goal_status_ = GoalStatus::IN_FLIGHT;
-      goal_error_.clear();
-      sync_request_next_.store(true);
+      try {
+        control_thread_ = std::thread([this, mode] {
+          if (const auto* software = std::get_if<SoftwareImpedance>(&mode)) {
+            this->run_joint_torque_control_(*software);
+          } else {
+            this->run_joint_position_control_();
+          }
+        });
+      } catch (...) {
+        // No thread means nothing will ever clear control_running_ or settle the goal armed above.
+        control_running_.store(false);
+        fail_goal_(goal_id, "could not start the control loop");
+        throw;
+      }
     }
     {
       std::lock_guard<std::mutex> lk(target_mutex_);
       // A streamed target cancels any queued tracked request it overwrites (including one stranded by a
       // dead loop) and releases its waiter — the goal that request belonged to can no longer complete.
-      if (!tracked && sync_request_next_.exchange(false)) supersede_goal_();
+      if (!tracked && target_goal_id_ != 0) supersede_goal_(target_goal_id_);
       target_q_ = q_target;
+      target_goal_id_ = goal_id;
       has_target_.store(true);
     }
   }
 
-  // Settle the tracked move and wake any waiter. Only a move still in flight can settle: a status
-  // written over a finished one would report the wrong outcome to a poller, and there is no waiter
-  // left to wake.
-  void settle_goal_(GoalStatus status, std::string reason = {}) {
+  // Arm a tracked move and return the id that names it. Every move gets its own id, so an outcome
+  // reported by whatever was running before can be told apart from the move now in flight.
+  std::uint64_t arm_goal_() {
+    std::lock_guard<std::mutex> lk(goal_mutex_);
+    goal_status_ = GoalStatus::IN_FLIGHT;
+    goal_error_.clear();
+    return ++goal_id_;
+  }
+
+  // Settle the move `id` names and wake any waiter. Two moves are refused: one already settled (a
+  // status written over a finished one would report the wrong outcome to a poller, and there is no
+  // waiter left to wake), and one that is no longer the move in flight — an older trajectory
+  // finishing must not report the arrival of the move that replaced it. Ids start at 1, so 0 names
+  // no move and settles nothing, which is what a streamed target passes.
+  void settle_goal_(std::uint64_t id, GoalStatus status, std::string reason = {}) {
     {
       std::lock_guard<std::mutex> lk(goal_mutex_);
-      if (goal_status_ != GoalStatus::IN_FLIGHT) return;
+      if (goal_status_ != GoalStatus::IN_FLIGHT || goal_id_ != id) return;
       goal_status_ = status;
       goal_error_ = std::move(reason);
     }
     goal_cv_.notify_all();
   }
 
+  // Settle whichever move is in flight, for the paths that end every move there is: a dying control
+  // loop and a torn-down one. They cannot name an id — the move they end was armed by someone else.
+  void settle_current_goal_(GoalStatus status, std::string reason = {}) {
+    std::uint64_t id = 0;
+    {
+      std::lock_guard<std::mutex> lk(goal_mutex_);
+      id = goal_id_;
+    }
+    settle_goal_(id, status, std::move(reason));
+  }
+
   // The trajectory ran to the target.
-  void complete_goal_() { settle_goal_(GoalStatus::REACHED); }
+  void complete_goal_(std::uint64_t id) { settle_goal_(id, GoalStatus::REACHED); }
 
   // A newer target replaced the tracked move. Its waiter returns normally — the caller got the
   // motion it asked for last — but a poller must not read this as an arrival.
-  void supersede_goal_() { settle_goal_(GoalStatus::SUPERSEDED); }
+  void supersede_goal_(std::uint64_t id) { settle_goal_(id, GoalStatus::SUPERSEDED); }
 
   // The move stopped short. Its waiter raises instead of returning.
-  void fail_goal_(std::string reason) { settle_goal_(GoalStatus::ABORTED, std::move(reason)); }
+  void fail_goal_(std::uint64_t id, std::string reason) {
+    settle_goal_(id, GoalStatus::ABORTED, std::move(reason));
+  }
 
   // Every control-thread exit path must clear control_running_ and then settle any tracked move: a
   // thread that died mid-goal (reflex, NaN, connection loss) otherwise leaves a waiter blocked
@@ -1040,7 +1078,7 @@ private:
       last_software_ref_.reset();
     }
     if (reason.empty()) reason = "control loop stopped before the joint target was reached";
-    fail_goal_(std::move(reason));
+    settle_current_goal_(GoalStatus::ABORTED, std::move(reason));
   }
 
  public:
@@ -1163,7 +1201,8 @@ private:
   std::condition_variable goal_cv_;
   GoalStatus goal_status_ = GoalStatus::NONE;
   std::string goal_error_;
-  std::atomic<bool> sync_request_next_{false};
+  // Names the move `goal_status_` describes. Ids start at 1; 0 names no move.
+  std::uint64_t goal_id_ = 0;
 
   std::mutex last_state_mutex_;
   std::unique_ptr<franka::RobotState> last_state_;
@@ -1177,6 +1216,9 @@ private:
   ControlMode control_mode_;
   std::mutex target_mutex_;
   Vector7d target_q_ = Vector7d::Zero();
+  // The move `target_q_` belongs to, carried with it so the loop learns which goal it is executing
+  // from the same critical section that hands it the target; 0 for a streamed target, which has none.
+  std::uint64_t target_goal_id_ = 0;
   // A gains-only SoftwareImpedance change, picked up by the running torque loop mid-session.
   SoftwareImpedance new_gains_;
   std::atomic<bool> has_new_gains_{false};
@@ -1205,7 +1247,7 @@ private:
     }
     control_running_.store(false);
     has_target_.store(false);
-    complete_goal_();
+    settle_current_goal_(GoalStatus::REACHED);
     stop_requested_.store(false);
   }
 };
