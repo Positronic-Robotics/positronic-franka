@@ -49,6 +49,11 @@ constexpr double SETTLE_VELOCITY_TOLERANCE = 0.05;  // rad/s
 // every second, so only one actually held fast (contact, a joint limit) trips it. A stalled move
 // ABORTS; it never reports arrival.
 constexpr int STALL_TICKS_CAP = 1000;
+// How long the arrival condition must hold CONTINUOUSLY before the move is reported REACHED (1 kHz
+// ticks, so 0.2 s). One instant is not enough: at the turning point of an oscillation the velocity
+// passes through zero, so an arm still swinging inside the position band satisfies both tests for a
+// moment on every swing. An arm that is genuinely settled satisfies them indefinitely.
+constexpr int SETTLE_HOLD_TICKS = 200;
 // How much the error must vary across a window to count as motion. Far below any real convergence —
 // a move creeping at a tenth of the rest threshold still covers 500x this in a second — and far
 // above the noise on a joint encoder, so it separates "still moving" from "stopped".
@@ -847,6 +852,7 @@ private:
          deadline_ticks = MOVE_TICKS_CAP,
          window_min = std::numeric_limits<double>::infinity(),
          window_max = 0.0,
+         settled_ticks = 0,
          stopping = false](const franka::RobotState& st, franka::Duration period) mutable -> franka::JointPositions {
           {
             std::lock_guard<std::mutex> lk(last_state_mutex_);
@@ -871,6 +877,7 @@ private:
             move_ticks = 0;
             window_min = std::numeric_limits<double>::infinity();
             window_max = 0.0;
+            settled_ticks = 0;
             // The deadline is the plan's own duration plus the settle budget, so a deliberately slow
             // `relative_dynamics_factor` gets the time it asked for rather than being cut off by a
             // flat constant — while a move that overruns its own plan by a minute still ends.
@@ -898,7 +905,7 @@ private:
                                  arrival_(Eigen::Map<const Vector7d>(pos.data()),
                                           Eigen::Map<const Vector7d>(st.q.data()),
                                           Eigen::Map<const Vector7d>(st.dq.data()), traj.active(),
-                                          deadline_ticks, window_min, window_max, window_ticks,
+                                          deadline_ticks, window_min, window_max, window_ticks, settled_ticks,
                                           move_ticks))) {
             goal_in_flight = 0;
           }
@@ -941,6 +948,7 @@ private:
          move_ticks = 0,
          window_min = std::numeric_limits<double>::infinity(),
          window_max = 0.0,
+         settled_ticks = 0,
          stopping = false,
          stop_ticks = 0,
          ref = Vector7d(Vector7d::Zero())](const franka::RobotState& st,
@@ -969,6 +977,7 @@ private:
             move_ticks = 0;
             window_min = std::numeric_limits<double>::infinity();
             window_max = 0.0;
+            settled_ticks = 0;
             has_target_.store(false);
           }
 
@@ -986,7 +995,8 @@ private:
           // spring has actually pulled the joints in, and the deadline is the flat one.
           if (goal_in_flight != 0 &&
               settle_on_arrival_(goal_in_flight, arrival_(ref, q, dq, /*travelling=*/false, MOVE_TICKS_CAP,
-                                                          window_min, window_max, window_ticks, move_ticks))) {
+                                                          window_min, window_max, window_ticks,
+                                                          settled_ticks, move_ticks))) {
             goal_in_flight = 0;
           }
 
@@ -1087,7 +1097,7 @@ private:
 
   static Arrival arrival_(const Vector7d& ref, const Vector7d& q, const Vector7d& dq, bool travelling,
                           int deadline_ticks, double& window_min, double& window_max, int& window_ticks,
-                          int& move_ticks) {
+                          int& settled_ticks, int& move_ticks) {
     // The deadline covers the WHOLE move, the shaped phase included — it is the guarantee that a
     // goal cannot stay IN_FLIGHT indefinitely, and a phase excluded from it is a hole in that.
     if (++move_ticks >= deadline_ticks) return Arrival::Stalled;
@@ -1097,8 +1107,12 @@ private:
 
     const double err = (ref - q).cwiseAbs().maxCoeff();
     if (err < SETTLE_POSITION_TOLERANCE && dq.cwiseAbs().maxCoeff() < SETTLE_VELOCITY_TOLERANCE) {
-      return Arrival::Reached;
+      // Sustained, not instantaneous. Velocity passes through zero at every turning point, so a
+      // single tick inside the band is satisfied on each swing of an arm that is still oscillating.
+      if (++settled_ticks >= SETTLE_HOLD_TICKS) return Arrival::Reached;
+      return Arrival::InFlight;
     }
+    settled_ticks = 0;
     // Is anything happening? Over each window, the error's full RANGE decides: an arm that is
     // converging moves — however it moves, oscillating or creeping — and one that is stuck against
     // contact or a joint limit does not. Range is blind to the phase and to where a window boundary
