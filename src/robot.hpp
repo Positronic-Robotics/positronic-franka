@@ -438,7 +438,7 @@ class Robot {
       target_goal_id_ = goal_id;
       // Carried with the target rather than read by the loop, so the deadline that applies is the
       // one this call named — a later call with a different deadline cannot retroactively change it.
-      target_deadline_ticks_ = ticks_from_seconds_(deadline_s);
+      target_deadline_s_ = deadline_s;
       has_target_.store(true);
     }
     // The loop can exit between the `control_running_` read above and this publish: its
@@ -843,8 +843,8 @@ private:
          first = true,
          goal_in_flight = std::uint64_t{0},
          settled_ticks = 0,
-         move_ticks = std::int64_t{0},
-         deadline_ticks = std::int64_t{0},
+         elapsed_s = 0.0,
+         deadline_s = 0.0,
          stopping = false](const franka::RobotState& st, franka::Duration period) mutable -> franka::JointPositions {
           {
             std::lock_guard<std::mutex> lk(last_state_mutex_);
@@ -866,11 +866,11 @@ private:
             has_target_.store(false);
             goal_in_flight = std::exchange(target_goal_id_, 0);
             settled_ticks = 0;
-            move_ticks = 0;
+            elapsed_s = 0.0;
             // The deadline is the plan's own duration plus the settle budget, so a deliberately slow
             // `relative_dynamics_factor` gets the time it asked for rather than being cut off by a
             // flat constant — while a move that overruns its own plan by a minute still ends.
-            deadline_ticks = std::exchange(target_deadline_ticks_, 0);
+            deadline_s = std::exchange(target_deadline_s_, 0.0);
             // A rejected plan must not let the old trajectory finish this goal as if reached.
             if (!planned) {
               fail_goal_(goal_in_flight, "joint target rejected by the trajectory planner");
@@ -894,7 +894,7 @@ private:
                                  arrival_(Eigen::Map<const Vector7d>(pos.data()),
                                           Eigen::Map<const Vector7d>(st.q.data()), traj.active(),
                                           Eigen::Map<const Vector7d>(st.dq.data()), traj.active(),
-                                          deadline_ticks, settled_ticks, move_ticks))) {
+                                          period.toSec(), deadline_s, settled_ticks, elapsed_s))) {
             goal_in_flight = 0;
           }
 
@@ -932,13 +932,13 @@ private:
         [&, this,
          first = true,
          goal_in_flight = std::uint64_t{0},
-         move_ticks = std::int64_t{0},
          settled_ticks = 0,
-         deadline_ticks = std::int64_t{0},
+         elapsed_s = 0.0,
+         deadline_s = 0.0,
          stopping = false,
          stop_ticks = 0,
          ref = Vector7d(Vector7d::Zero())](const franka::RobotState& st,
-                                           franka::Duration /*period*/) mutable -> franka::Torques {
+                                           franka::Duration period) mutable -> franka::Torques {
           const Vector7d q = Eigen::Map<const Vector7d>(st.q.data());
           const Vector7d dq = Eigen::Map<const Vector7d>(st.dq.data());
 
@@ -960,8 +960,8 @@ private:
             ref = target_q_;
             goal_in_flight = std::exchange(target_goal_id_, 0);
             settled_ticks = 0;
-            move_ticks = 0;
-            deadline_ticks = std::exchange(target_deadline_ticks_, 0);
+            elapsed_s = 0.0;
+            deadline_s = std::exchange(target_deadline_s_, 0.0);
             has_target_.store(false);
           }
 
@@ -982,8 +982,8 @@ private:
           // stepped away from the arm when the target arrived, so the check cannot pass until the
           // spring has actually pulled the joints in, and the deadline is the flat one.
           if (goal_in_flight != 0 &&
-              settle_on_arrival_(goal_in_flight, arrival_(ref, q, dq, /*travelling=*/false,
-                                                          deadline_ticks, settled_ticks, move_ticks))) {
+              settle_on_arrival_(goal_in_flight, arrival_(ref, q, dq, /*travelling=*/false, period.toSec(),
+                                                          deadline_s, settled_ticks, elapsed_s))) {
             goal_in_flight = 0;
           }
 
@@ -1086,16 +1086,6 @@ private:
   // loaded arm oscillates slowly, and a window shorter than its period sees a stationary-looking
   // slice of ordinary motion. Joints with no stiffness of their own (a Cartesian-only gain set) are
   // skipped; if that leaves none, there is no joint-space period and the fallback stands in.
-  // Seconds to ticks, saturating. A period derived from a near-zero stiffness can exceed what the
-  // counter holds, and converting a double past the integer range is undefined — so it is clamped
-  // before the cast rather than after, where the damage would already be done.
-  static std::int64_t ticks_from_seconds_(double seconds) {
-    constexpr double kMaxTicks = 4.0e18;  // comfortably inside int64
-    const double ticks = seconds * 1000.0;
-    if (!(ticks > 0.0)) return 0;
-    return ticks >= kMaxTicks ? static_cast<std::int64_t>(kMaxTicks) : static_cast<std::int64_t>(ticks);
-  }
-
   enum class Arrival { InFlight, Reached, Stalled };
 
   // Two outcomes and one question each. ARRIVED is measured: every joint inside the tolerance band
@@ -1104,8 +1094,14 @@ private:
   // move that was asked for, and the caller is the only party that knows what duration is reasonable
   // for it. Nothing here tries to infer that from the arm.
   static Arrival arrival_(const Vector7d& ref, const Vector7d& q, const Vector7d& dq, bool travelling,
-                          std::int64_t deadline_ticks, int& settled_ticks, std::int64_t& move_ticks) {
-    if (++move_ticks >= deadline_ticks) return Arrival::Stalled;
+                          double dt, double deadline_s, int& settled_ticks, double& elapsed_s) {
+    // Elapsed SECONDS, accumulated from the callback's own period, not a count of callbacks. The
+    // deadline is advertised in seconds, and a control callback is only nominally 1 ms — a delayed
+    // one or a skipped packet arrives with a longer period, so counting invocations under-measures
+    // real time and would hold a move past the deadline the caller set, by more the worse the
+    // scheduling gets.
+    elapsed_s += dt;
+    if (elapsed_s >= deadline_s) return Arrival::Stalled;
     // While the reference is still being shaped the arm is meant to be behind it; there is nothing to
     // test yet, and only the deadline runs.
     if (travelling) return Arrival::InFlight;
@@ -1294,8 +1290,8 @@ private:
   // The move `target_q_` belongs to, carried with it so the loop learns which goal it is executing
   // from the same critical section that hands it the target; 0 for a streamed target, which has none.
   std::uint64_t target_goal_id_ = 0;
-  // The deadline the pending target was commanded with, in 1 kHz ticks; taken by the loop with it.
-  std::int64_t target_deadline_ticks_ = 0;
+  // The deadline the pending target was commanded with, in seconds; taken by the loop with it.
+  double target_deadline_s_ = 0.0;
   // A gains-only SoftwareImpedance change, picked up by the running torque loop mid-session.
   SoftwareImpedance new_gains_;
   std::atomic<bool> has_new_gains_{false};
