@@ -54,10 +54,15 @@ constexpr double SETTLE_VELOCITY_TOLERANCE = 0.05;  // rad/s
 // watched before "not moving" means anything, and stiffness is a constructor argument validated only
 // as positive — so any constant here would be right for one configuration and wrong for the rest,
 // which is how a soft enough arm crosses the band looking stationary for whatever interval was
-// assumed. These bounds only stop a pathological gain set producing a window too short to measure
-// anything or so long it stops being a check.
-constexpr int SETTLE_WINDOW_MIN_TICKS = 250;    // 0.25 s
-constexpr int SETTLE_WINDOW_MAX_TICKS = 10000;  // 10 s
+// assumed.
+//
+// The one bound is a FLOOR, and it is about sampling rather than the plant: a handful of ticks is too
+// few readings to call anything. There is deliberately no ceiling — capping the derived period would
+// put back exactly the fixed window this replaced, and a configuration soft enough to swing for a
+// minute genuinely takes a minute to judge. The library reports the truth for as long as that takes
+// (neither arrived nor stalled); deciding it has waited long enough is the caller's, which is where
+// a reasonable duration is actually known.
+constexpr int SETTLE_WINDOW_MIN_TICKS = 250;  // 0.25 s
 // Used only when no joint has a usable stiffness — a Cartesian-only `SoftwareImpedance`, which
 // `validate_half` permits — leaving no joint-space period to derive one from.
 constexpr int SETTLE_WINDOW_FALLBACK_TICKS = 1000;
@@ -996,6 +1001,14 @@ private:
             Kx = Eigen::Map<const Vector6d>(new_gains_.kx.data());
             Kxd = Eigen::Map<const Vector6d>(new_gains_.kxd.data());
             has_new_gains_.store(false);
+            // New gains are a new plant, so the timescale the move is being judged on no longer
+            // applies and the samples taken under the old one describe a different system. Re-derive
+            // and restart the observation; softer gains would otherwise have a valid slow
+            // continuation judged against the stiffer controller's window and called stalled.
+            window_cap = settle_window_ticks_(st, Kq);
+            window_min.setConstant(std::numeric_limits<double>::infinity());
+            window_max.setZero();
+            window_ticks = 0;
           }
 
           // The same arrival rule the position loop uses, with nothing shaping the reference — it
@@ -1116,8 +1129,7 @@ private:
       slowest_period = std::max(slowest_period, TWO_PI * std::sqrt(inertia / stiffness));
     }
     if (!(slowest_period > 0.0)) return SETTLE_WINDOW_FALLBACK_TICKS;
-    return std::clamp(static_cast<int>(slowest_period * 1000.0), SETTLE_WINDOW_MIN_TICKS,
-                      SETTLE_WINDOW_MAX_TICKS);
+    return std::max(static_cast<int>(slowest_period * 1000.0), SETTLE_WINDOW_MIN_TICKS);
   }
 
   enum class Arrival { InFlight, Reached, Stalled };
