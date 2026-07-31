@@ -27,8 +27,9 @@ PYBIND11_MODULE(_franka, m) {
 
   py::class_<positronic_franka::SoftwareImpedance>(m, "SoftwareImpedance",
       "Software impedance law on the torque interface (polymetis HybridJointImpedanceControl): "
-      "tau = (J^T Kx J + Kq)(q_d - q) - (J^T Kxd J + Kqd) dq + coriolis. Async targets step the "
-      "reference instantly; sync targets are Ruckig-shaped. Constructed with no arguments it carries "
+      "tau = (J^T Kx J + Kq)(q_d - q) - (J^T Kxd J + Kqd) dq + coriolis. Every target steps the "
+      "reference instantly and the law pulls the arm in, which is DROID's execution semantics. "
+      "Constructed with no arguments it carries "
       "the gains DROID's polymetis deployment uses; otherwise all four must be passed together, and "
       "each half (joint kq/kqd, Cartesian kx/kxd) is either all zero — disabled — or strictly positive, "
       "with at least one half active.")

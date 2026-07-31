@@ -43,24 +43,38 @@ constexpr std::array<double, 7> PANDA_JOINT_UPPER_LIMITS = {
 // the commanded reference and no longer moving.
 constexpr double SETTLE_POSITION_TOLERANCE = 0.05;  // rad
 constexpr double SETTLE_VELOCITY_TOLERANCE = 0.05;  // rad/s
-// The window over which motion is judged (1 kHz ticks, so 1 s). If the error does not vary across a
-// whole window the arm is going nowhere and the move is given up as stalled. It bounds time spent
-// frozen, NOT the move: an arm still moving — converging, oscillating, creeping — opens a new window
-// every second, so only one actually held fast (contact, a joint limit) trips it. A stalled move
-// ABORTS; it never reports arrival.
-constexpr int STALL_TICKS_CAP = 1000;
+// The window over which motion is judged. If the error does not vary across a whole window the arm is
+// going nowhere and the move is given up as stalled — it bounds time spent frozen, NOT the move: an
+// arm still moving (converging, oscillating, creeping) opens a new window each time, so only one
+// actually held fast (contact, a joint limit) trips it. A stalled move ABORTS; it never reports
+// arrival.
+//
+// Its LENGTH is derived per move from the configured stiffness and the arm's own inertia
+// (`settle_window_ticks_`), never fixed. The natural period is what decides how long the arm must be
+// watched before "not moving" means anything, and stiffness is a constructor argument validated only
+// as positive — so any constant here would be right for one configuration and wrong for the rest,
+// which is how a soft enough arm crosses the band looking stationary for whatever interval was
+// assumed. These bounds only stop a pathological gain set producing a window too short to measure
+// anything or so long it stops being a check.
+constexpr int SETTLE_WINDOW_MIN_TICKS = 250;    // 0.25 s
+constexpr int SETTLE_WINDOW_MAX_TICKS = 10000;  // 10 s
+// Used only when no joint has a usable stiffness — a Cartesian-only `SoftwareImpedance`, which
+// `validate_half` permits — leaving no joint-space period to derive one from.
+constexpr int SETTLE_WINDOW_FALLBACK_TICKS = 1000;
+constexpr double TWO_PI = 6.283185307179586;
 // How much the error must vary across a window to count as motion. Far below any real convergence —
 // a move creeping at a tenth of the rest threshold still covers 500x this in a second — and far
 // above the noise on a joint encoder, so it separates "still moving" from "stopped".
 constexpr double STALL_PROGRESS_EPSILON = 1e-4;  // rad
 // How long a move may run BEYOND the trajectory it was planned (the shaped case) or from the moment
-// it was commanded (the stepped one). The progress rule alone bounds a move only at
-// `distance / STALL_PROGRESS_EPSILON` seconds — 1 rad of travel buys ~9500 windows, so an arm making
-// microscopic progress could hold a caller for hours. This is the backstop, and it is generous next
-// to any real settle (the impedance spring settles in seconds), so it only ever fires on a move that
-// has already gone wrong. Adding it to the plan's own duration rather than replacing it is what lets
-// a deliberately slow `relative_dynamics_factor` still finish.
-constexpr int MOVE_TICKS_CAP = 60000;  // 1 kHz ticks — 60 s
+// it was commanded (the stepped one), counted in SETTLE WINDOWS so it scales with the plant exactly
+// as the window does — a configuration slow enough to need a long window needs a proportionally long
+// deadline, and a fixed one would cut it off. The window rule alone bounds a move only at
+// `distance / STALL_PROGRESS_EPSILON` windows, so an arm making microscopic progress could hold a
+// caller for hours; this is the backstop, generous next to any real settle, and it fires only on a
+// move that has already gone wrong. Adding it to the plan's own duration rather than replacing it is
+// what lets a deliberately slow `relative_dynamics_factor` still finish.
+constexpr int DEADLINE_WINDOWS = 60;
 
 // Common Eigen aliases
 using Vector7d = Eigen::Matrix<double, 7, 1>;
@@ -419,7 +433,7 @@ class Robot {
           if (const auto* software = std::get_if<SoftwareImpedance>(&mode)) {
             this->run_joint_torque_control_(*software);
           } else {
-            this->run_joint_position_control_();
+            this->run_joint_position_control_(std::get<InternalImpedance>(mode));
           }
         });
       } catch (...) {
@@ -833,7 +847,7 @@ private:
   double relative_dynamics_factor() const { return relative_dynamics_factor_; }
 
  private:
-  void run_joint_position_control_() {
+  void run_joint_position_control_(InternalImpedance imp) {
     std::string thread_error;
     try {
       TrajectoryGenerator traj(relative_dynamics_factor_);
@@ -844,7 +858,8 @@ private:
          goal_in_flight = std::uint64_t{0},
          window_ticks = 0,
          move_ticks = 0,
-         deadline_ticks = MOVE_TICKS_CAP,
+         window_cap = SETTLE_WINDOW_FALLBACK_TICKS,
+         deadline_ticks = DEADLINE_WINDOWS * SETTLE_WINDOW_FALLBACK_TICKS,
          window_min = Vector7d(Vector7d::Constant(std::numeric_limits<double>::infinity())),
          window_max = Vector7d(Vector7d::Zero()),
          stopping = false](const franka::RobotState& st, franka::Duration period) mutable -> franka::JointPositions {
@@ -874,7 +889,8 @@ private:
             // The deadline is the plan's own duration plus the settle budget, so a deliberately slow
             // `relative_dynamics_factor` gets the time it asked for rather than being cut off by a
             // flat constant — while a move that overruns its own plan by a minute still ends.
-            deadline_ticks = MOVE_TICKS_CAP + static_cast<int>(traj.duration() * 1000.0);
+            window_cap = settle_window_ticks_(st, Eigen::Map<const Vector7d>(imp.k_theta.data()));
+            deadline_ticks = DEADLINE_WINDOWS * window_cap + static_cast<int>(traj.duration() * 1000.0);
             // A rejected plan must not let the old trajectory finish this goal as if reached.
             if (!planned) {
               fail_goal_(goal_in_flight, "joint target rejected by the trajectory planner");
@@ -897,7 +913,7 @@ private:
               settle_on_arrival_(goal_in_flight,
                                  arrival_(Eigen::Map<const Vector7d>(pos.data()),
                                           Eigen::Map<const Vector7d>(st.q.data()), traj.active(),
-                                          deadline_ticks, window_min, window_max, window_ticks,
+                                          window_cap, deadline_ticks, window_min, window_max, window_ticks,
                                           move_ticks))) {
             goal_in_flight = 0;
           }
@@ -940,6 +956,7 @@ private:
          move_ticks = 0,
          window_min = Vector7d(Vector7d::Constant(std::numeric_limits<double>::infinity())),
          window_max = Vector7d(Vector7d::Zero()),
+         window_cap = SETTLE_WINDOW_FALLBACK_TICKS,
          stopping = false,
          stop_ticks = 0,
          ref = Vector7d(Vector7d::Zero())](const franka::RobotState& st,
@@ -968,6 +985,7 @@ private:
             move_ticks = 0;
             window_min.setConstant(std::numeric_limits<double>::infinity());
             window_max.setZero();
+            window_cap = settle_window_ticks_(st, Kq);
             has_target_.store(false);
           }
 
@@ -984,9 +1002,9 @@ private:
           // stepped away from the arm when the target arrived, so the check cannot pass until the
           // spring has actually pulled the joints in, and the deadline is the flat one.
           if (goal_in_flight != 0 &&
-              settle_on_arrival_(goal_in_flight, arrival_(ref, q, /*travelling=*/false, MOVE_TICKS_CAP,
-                                                          window_min, window_max, window_ticks,
-                                                          move_ticks))) {
+              settle_on_arrival_(goal_in_flight, arrival_(ref, q, /*travelling=*/false, window_cap,
+                                                          DEADLINE_WINDOWS * window_cap, window_min,
+                                                          window_max, window_ticks, move_ticks))) {
             goal_in_flight = 0;
           }
 
@@ -1083,11 +1101,30 @@ private:
   // worth of no progress, and a move whose error is still rising toward its first turn looks like a
   // move going backwards. The range within a window has neither problem, because motion is motion
   // whatever its phase.
+  // How long the arm must be watched before "it stopped moving" carries information: the slowest
+  // natural period of the configured stiffness against the arm's own inertia, T = 2*pi*sqrt(m/k).
+  // Derived per move because both terms are per configuration and per pose — a soft gain set or a
+  // loaded arm oscillates slowly, and a window shorter than its period sees a stationary-looking
+  // slice of ordinary motion. Joints with no stiffness of their own (a Cartesian-only gain set) are
+  // skipped; if that leaves none, there is no joint-space period and the fallback stands in.
+  int settle_window_ticks_(const franka::RobotState& st, const Vector7d& k) {
+    const std::array<double, 49> m = model_->mass(st);
+    double slowest_period = 0.0;
+    for (int i = 0; i < 7; ++i) {
+      const double stiffness = k[i], inertia = m[i * 7 + i];
+      if (!(stiffness > 0.0) || !(inertia > 0.0)) continue;
+      slowest_period = std::max(slowest_period, TWO_PI * std::sqrt(inertia / stiffness));
+    }
+    if (!(slowest_period > 0.0)) return SETTLE_WINDOW_FALLBACK_TICKS;
+    return std::clamp(static_cast<int>(slowest_period * 1000.0), SETTLE_WINDOW_MIN_TICKS,
+                      SETTLE_WINDOW_MAX_TICKS);
+  }
+
   enum class Arrival { InFlight, Reached, Stalled };
 
   static Arrival arrival_(const Vector7d& ref, const Vector7d& q, bool travelling,
-                          int deadline_ticks, Vector7d& window_min, Vector7d& window_max, int& window_ticks,
-                          int& move_ticks) {
+                          int window_cap, int deadline_ticks, Vector7d& window_min, Vector7d& window_max,
+                          int& window_ticks, int& move_ticks) {
     // The deadline covers the WHOLE move, the shaped phase included — it is the guarantee that a
     // goal cannot stay IN_FLIGHT indefinitely, and a phase excluded from it is a hole in that.
     if (++move_ticks >= deadline_ticks) return Arrival::Stalled;
@@ -1119,7 +1156,7 @@ private:
     const Vector7d e = (ref - q).cwiseAbs();
     window_min = window_min.cwiseMin(e);
     window_max = window_max.cwiseMax(e);
-    if (++window_ticks < STALL_TICKS_CAP) return Arrival::InFlight;
+    if (++window_ticks < window_cap) return Arrival::InFlight;
     if ((window_max - window_min).maxCoeff() <= STALL_PROGRESS_EPSILON) {
       return e.maxCoeff() < SETTLE_POSITION_TOLERANCE ? Arrival::Reached : Arrival::Stalled;
     }
