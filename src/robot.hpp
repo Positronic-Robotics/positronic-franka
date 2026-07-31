@@ -381,6 +381,12 @@ class Robot {
     if (!q_target.allFinite()) {
       throw std::invalid_argument("q_target must be finite");
     }
+    // A deadline that cannot expire is not a deadline: NaN makes every comparison against it false
+    // and infinity never arrives, so either would leave a move that never settles IN_FLIGHT for good
+    // while this API promises it is bounded. Zero or negative would abort on the first callback.
+    if (!std::isfinite(deadline_s) || deadline_s <= 0.0) {
+      throw std::invalid_argument("deadline_s must be finite and strictly positive");
+    }
     std::uint64_t goal_id = 0;
     if (!control_running_.load()) {
       if (control_thread_.joinable()) {
@@ -902,13 +908,18 @@ private:
           // shaped there is no arrival to test — a Ruckig move STARTS with the reference at the arm
           // and the arm at rest, so an ungated check would report REACHED on the first tick — but the
           // deadline must keep running through that phase or it does not bound the move.
-          if (goal_in_flight != 0 &&
-              settle_on_arrival_(goal_in_flight,
-                                 arrival_(Eigen::Map<const Vector7d>(pos.data()),
-                                          Eigen::Map<const Vector7d>(st.q.data()), traj.active(),
-                                          Eigen::Map<const Vector7d>(st.dq.data()), traj.active(),
-                                          period.toSec(), deadline_s, settled_ticks, elapsed_s))) {
-            goal_in_flight = 0;
+          if (goal_in_flight != 0) {
+            const Arrival outcome = arrival_(Eigen::Map<const Vector7d>(pos.data()),
+                                             Eigen::Map<const Vector7d>(st.q.data()),
+                                             Eigen::Map<const Vector7d>(st.dq.data()), traj.active(),
+                                             period.toSec(), deadline_s, settled_ticks, elapsed_s);
+            if (settle_on_arrival_(goal_in_flight, outcome)) {
+              goal_in_flight = 0;
+              // ABORTED tells the caller the move stopped short, so the arm has to actually stop.
+              // Leaving the trajectory running would keep driving it at the expired target while the
+              // caller acts on having been told the move ended.
+              if (outcome == Arrival::Stalled) traj.stop_at_current();
+            }
           }
 
           if (!traj.active() && stopping) {
@@ -994,10 +1005,15 @@ private:
           // The same arrival rule the position loop uses, with nothing shaping the reference — it
           // stepped away from the arm when the target arrived, so the check cannot pass until the
           // spring has actually pulled the joints in, and the deadline is the flat one.
-          if (goal_in_flight != 0 &&
-              settle_on_arrival_(goal_in_flight, arrival_(ref, q, dq, /*travelling=*/false, period.toSec(),
-                                                          deadline_s, settled_ticks, elapsed_s))) {
-            goal_in_flight = 0;
+          if (goal_in_flight != 0) {
+            const Arrival outcome =
+                arrival_(ref, q, dq, /*travelling=*/false, period.toSec(), deadline_s, settled_ticks, elapsed_s);
+            if (settle_on_arrival_(goal_in_flight, outcome)) {
+              goal_in_flight = 0;
+              // As above: hold the arm where it is rather than keep pulling it toward a target the
+              // caller has already been told the move failed to reach.
+              if (outcome == Arrival::Stalled) ref = q;
+            }
           }
 
           // Publish the state and this tick's final reference in one critical section, so a state()
