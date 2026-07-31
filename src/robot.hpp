@@ -839,10 +839,13 @@ private:
             // Plan duration plus the settle budget, so a slow `relative_dynamics_factor` gets the
             // time it asked for while a move that overruns its own plan still ends.
             deadline_s = std::exchange(target_deadline_s_, 0.0);
-            // A rejected plan must not let the old trajectory finish this goal as if reached.
+            // A rejected plan leaves the previous trajectory playing, so stop it: the goal is about
+            // to report ABORTED, and a caller acting on that must not have the arm still driving
+            // toward the superseded target.
             if (!planned) {
               fail_goal_(goal_in_flight, "joint target rejected by the trajectory planner");
               goal_in_flight = 0;
+              traj.stop_at_current();
             }
           }
 
@@ -936,6 +939,10 @@ private:
             Kx = Eigen::Map<const Vector6d>(new_gains_.kx.data());
             Kxd = Eigen::Map<const Vector6d>(new_gains_.kxd.data());
             has_new_gains_.store(false);
+            // The hold so far was observed under the old gains, which no longer control the arm.
+            // Keeping it would let a move report REACHED before the new ones have held it for a
+            // single tick. The deadline is the caller's and keeps running.
+            settled_ticks = 0;
           }
 
           // The position loop's arrival rule with nothing shaping the reference: it stepped away
