@@ -178,8 +178,11 @@ PYBIND11_MODULE(_franka, m) {
           py::arg("target_pose_wxyz"), py::arg("q0"),
           "IK with initial guess and Panda joint limits enforced via OSQP; returns q (7,)")
       .def("set_target_joints", &positronic_franka::Robot::set_target_joints,
-           py::arg("q_target"),
+           py::arg("q_target"), py::arg("deadline_s") = positronic_franka::DEFAULT_MOVE_DEADLINE_S,
            "Command a joint move to target (7,) and return immediately; poll goal() for the outcome. "
+           "deadline_s bounds the move: the goal ABORTS if the arm has not settled at the target by "
+           "then. Pass your own where the move needs longer or shorter than the default — reach, "
+           "gains and payload decide that, and the caller is who knows them. "
            "Never blocks: a caller whose own loop clears robot errors cannot wait inside the library, "
            "or a reflex fired mid-move is never cleared and the move never ends. How the arm gets "
            "there is the control mode's business (InternalImpedance shapes a Ruckig trajectory, "

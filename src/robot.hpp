@@ -39,47 +39,19 @@ constexpr std::array<double, 7> PANDA_JOINT_LOWER_LIMITS = {
 constexpr std::array<double, 7> PANDA_JOINT_UPPER_LIMITS = {
     2.8973, 1.7628, 2.8973, 3.0718, 2.8973, 3.7525, 2.8973};
 
-// Arrival detection, shared by both control loops: the measured joints are within these tolerances of
-// the commanded reference and no longer moving.
+// Arrival: the measured joints are within these tolerances of the commanded reference and no longer
+// moving. Held for SETTLE_HOLD_TICKS rather than judged on one reading, because velocity passes
+// through zero at every turning point of an oscillation — an arm still swinging inside the band
+// satisfies both tests for an instant on each swing, and a settled one satisfies them indefinitely.
 constexpr double SETTLE_POSITION_TOLERANCE = 0.05;  // rad
 constexpr double SETTLE_VELOCITY_TOLERANCE = 0.05;  // rad/s
-// The window over which motion is judged. If the error does not vary across a whole window the arm is
-// going nowhere and the move is given up as stalled — it bounds time spent frozen, NOT the move: an
-// arm still moving (converging, oscillating, creeping) opens a new window each time, so only one
-// actually held fast (contact, a joint limit) trips it. A stalled move ABORTS; it never reports
-// arrival.
-//
-// Its LENGTH is derived per move from the configured stiffness and the arm's own inertia
-// (`settle_window_ticks_`), never fixed. The natural period is what decides how long the arm must be
-// watched before "not moving" means anything, and stiffness is a constructor argument validated only
-// as positive — so any constant here would be right for one configuration and wrong for the rest,
-// which is how a soft enough arm crosses the band looking stationary for whatever interval was
-// assumed.
-//
-// The one bound is a FLOOR, and it is about sampling rather than the plant: a handful of ticks is too
-// few readings to call anything. There is deliberately no ceiling — capping the derived period would
-// put back exactly the fixed window this replaced, and a configuration soft enough to swing for a
-// minute genuinely takes a minute to judge. The library reports the truth for as long as that takes
-// (neither arrived nor stalled); deciding it has waited long enough is the caller's, which is where
-// a reasonable duration is actually known.
-constexpr std::int64_t SETTLE_WINDOW_MIN_TICKS = 250;  // 0.25 s
-// Used only when no joint has a usable stiffness — a Cartesian-only `SoftwareImpedance`, which
-// `validate_half` permits — leaving no joint-space period to derive one from.
-constexpr std::int64_t SETTLE_WINDOW_FALLBACK_TICKS = 1000;
-constexpr double TWO_PI = 6.283185307179586;
-// How much the error must vary across a window to count as motion. Far below any real convergence —
-// a move creeping at a tenth of the rest threshold still covers 500x this in a second — and far
-// above the noise on a joint encoder, so it separates "still moving" from "stopped".
-constexpr double STALL_PROGRESS_EPSILON = 1e-4;  // rad
-// How long a move may run BEYOND the trajectory it was planned (the shaped case) or from the moment
-// it was commanded (the stepped one), counted in SETTLE WINDOWS so it scales with the plant exactly
-// as the window does — a configuration slow enough to need a long window needs a proportionally long
-// deadline, and a fixed one would cut it off. The window rule alone bounds a move only at
-// `distance / STALL_PROGRESS_EPSILON` windows, so an arm making microscopic progress could hold a
-// caller for hours; this is the backstop, generous next to any real settle, and it fires only on a
-// move that has already gone wrong. Adding it to the plan's own duration rather than replacing it is
-// what lets a deliberately slow `relative_dynamics_factor` still finish.
-constexpr std::int64_t DEADLINE_WINDOWS = 60;
+constexpr int SETTLE_HOLD_TICKS = 100;              // 1 kHz ticks — 0.1 s
+// How long a move may run before it is given up as failed, when the caller names no deadline of its
+// own. A deadline is the right shape for this and a plant-derived one is not: whether an arm is going
+// to arrive is a question about the move the caller asked for, and only the caller knows what
+// duration is reasonable for it. Fifteen seconds is generous for a joint move on this arm and short
+// enough that a caller waiting on one is not left indefinitely.
+constexpr double DEFAULT_MOVE_DEADLINE_S = 15.0;
 
 // Common Eigen aliases
 using Vector7d = Eigen::Matrix<double, 7, 1>;
@@ -381,7 +353,13 @@ class Robot {
   // goal, return. How the arm gets there is the mode's business — `InternalImpedance` shapes a
   // Ruckig trajectory, `SoftwareImpedance` steps the reference and lets the impedance law pull the
   // arm in (DROID execution semantics) — but both report the same way, and neither waits.
-  void set_target_joints(const Eigen::Ref<const Vector7d>& q_target) {
+  //
+  // `deadline_s` bounds the move: it ABORTS if the arm has not settled at the target by then. It is
+  // an argument rather than a constant because whether a move is going to arrive is a property of
+  // the move being asked for — reach, gains, payload — and the caller is the only party that knows
+  // what is reasonable for the one it just commanded.
+  void set_target_joints(const Eigen::Ref<const Vector7d>& q_target,
+                         double deadline_s = DEFAULT_MOVE_DEADLINE_S) {
   // Start the control loop if it is not running, then publish `q_target` to it. Every target arms
   // the goal, so the move reports IN_FLIGHT until the loop settles it — one path, because a target's
   // treatment must not depend on whether anyone happens to be watching it.
@@ -458,6 +436,9 @@ class Robot {
       std::lock_guard<std::mutex> lk(target_mutex_);
       target_q_ = q_target;
       target_goal_id_ = goal_id;
+      // Carried with the target rather than read by the loop, so the deadline that applies is the
+      // one this call named — a later call with a different deadline cannot retroactively change it.
+      target_deadline_ticks_ = ticks_from_seconds_(deadline_s);
       has_target_.store(true);
     }
     // The loop can exit between the `control_running_` read above and this publish: its
@@ -861,12 +842,9 @@ private:
         [&, this,
          first = true,
          goal_in_flight = std::uint64_t{0},
-         window_ticks = std::int64_t{0},
+         settled_ticks = 0,
          move_ticks = std::int64_t{0},
-         window_cap = SETTLE_WINDOW_FALLBACK_TICKS,
-         deadline_ticks = std::int64_t{DEADLINE_WINDOWS * SETTLE_WINDOW_FALLBACK_TICKS},
-         window_min = Vector7d(Vector7d::Constant(std::numeric_limits<double>::infinity())),
-         window_max = Vector7d(Vector7d::Zero()),
+         deadline_ticks = std::int64_t{0},
          stopping = false](const franka::RobotState& st, franka::Duration period) mutable -> franka::JointPositions {
           {
             std::lock_guard<std::mutex> lk(last_state_mutex_);
@@ -887,15 +865,12 @@ private:
             const bool planned = traj.set_target(target_q_);
             has_target_.store(false);
             goal_in_flight = std::exchange(target_goal_id_, 0);
-            window_ticks = 0;
+            settled_ticks = 0;
             move_ticks = 0;
-            window_min.setConstant(std::numeric_limits<double>::infinity());
-            window_max.setZero();
             // The deadline is the plan's own duration plus the settle budget, so a deliberately slow
             // `relative_dynamics_factor` gets the time it asked for rather than being cut off by a
             // flat constant — while a move that overruns its own plan by a minute still ends.
-            window_cap = settle_window_ticks_(st, Eigen::Map<const Vector7d>(imp.k_theta.data()), Vector6d::Zero());
-            deadline_ticks = DEADLINE_WINDOWS * window_cap + ticks_from_seconds_(traj.duration());
+            deadline_ticks = std::exchange(target_deadline_ticks_, 0);
             // A rejected plan must not let the old trajectory finish this goal as if reached.
             if (!planned) {
               fail_goal_(goal_in_flight, "joint target rejected by the trajectory planner");
@@ -918,8 +893,8 @@ private:
               settle_on_arrival_(goal_in_flight,
                                  arrival_(Eigen::Map<const Vector7d>(pos.data()),
                                           Eigen::Map<const Vector7d>(st.q.data()), traj.active(),
-                                          window_cap, deadline_ticks, window_min, window_max, window_ticks,
-                                          move_ticks))) {
+                                          Eigen::Map<const Vector7d>(st.dq.data()), traj.active(),
+                                          deadline_ticks, settled_ticks, move_ticks))) {
             goal_in_flight = 0;
           }
 
@@ -957,11 +932,9 @@ private:
         [&, this,
          first = true,
          goal_in_flight = std::uint64_t{0},
-         window_ticks = std::int64_t{0},
          move_ticks = std::int64_t{0},
-         window_min = Vector7d(Vector7d::Constant(std::numeric_limits<double>::infinity())),
-         window_max = Vector7d(Vector7d::Zero()),
-         window_cap = SETTLE_WINDOW_FALLBACK_TICKS,
+         settled_ticks = 0,
+         deadline_ticks = std::int64_t{0},
          stopping = false,
          stop_ticks = 0,
          ref = Vector7d(Vector7d::Zero())](const franka::RobotState& st,
@@ -986,11 +959,9 @@ private:
             std::lock_guard<std::mutex> lk(target_mutex_);
             ref = target_q_;
             goal_in_flight = std::exchange(target_goal_id_, 0);
-            window_ticks = 0;
+            settled_ticks = 0;
             move_ticks = 0;
-            window_min.setConstant(std::numeric_limits<double>::infinity());
-            window_max.setZero();
-            window_cap = settle_window_ticks_(st, Kq, Kx);
+            deadline_ticks = std::exchange(target_deadline_ticks_, 0);
             has_target_.store(false);
           }
 
@@ -1005,19 +976,14 @@ private:
             // applies and the samples taken under the old one describe a different system. Re-derive
             // and restart the observation; softer gains would otherwise have a valid slow
             // continuation judged against the stiffer controller's window and called stalled.
-            window_cap = settle_window_ticks_(st, Kq, Kx);
-            window_min.setConstant(std::numeric_limits<double>::infinity());
-            window_max.setZero();
-            window_ticks = 0;
           }
 
           // The same arrival rule the position loop uses, with nothing shaping the reference — it
           // stepped away from the arm when the target arrived, so the check cannot pass until the
           // spring has actually pulled the joints in, and the deadline is the flat one.
           if (goal_in_flight != 0 &&
-              settle_on_arrival_(goal_in_flight, arrival_(ref, q, /*travelling=*/false, window_cap,
-                                                          DEADLINE_WINDOWS * window_cap, window_min,
-                                                          window_max, window_ticks, move_ticks))) {
+              settle_on_arrival_(goal_in_flight, arrival_(ref, q, dq, /*travelling=*/false,
+                                                          deadline_ticks, settled_ticks, move_ticks))) {
             goal_in_flight = 0;
           }
 
@@ -1124,77 +1090,31 @@ private:
   // counter holds, and converting a double past the integer range is undefined — so it is clamped
   // before the cast rather than after, where the damage would already be done.
   static std::int64_t ticks_from_seconds_(double seconds) {
-    constexpr double kMaxTicks = 4.0e18;  // well inside int64, with room for DEADLINE_WINDOWS
+    constexpr double kMaxTicks = 4.0e18;  // comfortably inside int64
     const double ticks = seconds * 1000.0;
     if (!(ticks > 0.0)) return 0;
     return ticks >= kMaxTicks ? static_cast<std::int64_t>(kMaxTicks) : static_cast<std::int64_t>(ticks);
   }
 
-  std::int64_t settle_window_ticks_(const franka::RobotState& st, const Vector7d& kq, const Vector6d& kx) {
-    // The EFFECTIVE joint stiffness, which is what the control law actually applies:
-    // K = J^T Kx J + Kq. Reading `Kq` alone would see nothing at all in a Cartesian-only gain set —
-    // permitted by `validate_half` — and fall back to a fixed window, which is the assumption this
-    // derivation exists to remove. The Cartesian half reaches the joints through the Jacobian, so
-    // that is where its stiffness has to be read from.
-    const auto J_data = model_->zeroJacobian(franka::Frame::kEndEffector, st);
-    const SpatialJacobian J = Eigen::Map<const SpatialJacobian>(J_data.data());
-    const Matrix7d K = J.transpose() * kx.asDiagonal() * J + Matrix7d(kq.asDiagonal());
-    const std::array<double, 49> m = model_->mass(st);
-
-    double slowest_period = 0.0;
-    for (int i = 0; i < 7; ++i) {
-      const double stiffness = K(i, i), inertia = m[i * 7 + i];
-      if (!(stiffness > 0.0) || !(inertia > 0.0)) continue;
-      slowest_period = std::max(slowest_period, TWO_PI * std::sqrt(inertia / stiffness));
-    }
-    // Only reachable when no joint has any effective stiffness — a Cartesian-only set at a pose
-    // where the Jacobian carries none of it through. Nothing there says how long to watch.
-    if (!(slowest_period > 0.0)) return SETTLE_WINDOW_FALLBACK_TICKS;
-    return std::max(ticks_from_seconds_(slowest_period), SETTLE_WINDOW_MIN_TICKS);
-  }
-
   enum class Arrival { InFlight, Reached, Stalled };
 
-  static Arrival arrival_(const Vector7d& ref, const Vector7d& q, bool travelling,
-                          std::int64_t window_cap, std::int64_t deadline_ticks, Vector7d& window_min,
-                          Vector7d& window_max, std::int64_t& window_ticks, std::int64_t& move_ticks) {
-    // The deadline covers the WHOLE move, the shaped phase included — it is the guarantee that a
-    // goal cannot stay IN_FLIGHT indefinitely, and a phase excluded from it is a hole in that.
+  // Two outcomes and one question each. ARRIVED is measured: every joint inside the tolerance band
+  // and no longer moving, held long enough that a turning point cannot be mistaken for rest. FAILED
+  // is the deadline the caller set — because whether a move is going to arrive is a property of the
+  // move that was asked for, and the caller is the only party that knows what duration is reasonable
+  // for it. Nothing here tries to infer that from the arm.
+  static Arrival arrival_(const Vector7d& ref, const Vector7d& q, const Vector7d& dq, bool travelling,
+                          std::int64_t deadline_ticks, int& settled_ticks, std::int64_t& move_ticks) {
     if (++move_ticks >= deadline_ticks) return Arrival::Stalled;
-    // While the reference is still being shaped the arm is meant to be behind it, so there is no
-    // arrival to test and no stall to detect; only the deadline runs.
+    // While the reference is still being shaped the arm is meant to be behind it; there is nothing to
+    // test yet, and only the deadline runs.
     if (travelling) return Arrival::InFlight;
 
-    // One reading of the same measurement decides both outcomes, at the close of each window: has
-    // the error stopped MOVING, and if so, is it inside the band?
-    //
-    //   moving          -> still in flight, whatever the phase of the motion
-    //   stopped, inside -> REACHED
-    //   stopped, outside-> STALLED (held short — contact, a joint limit)
-    //
-    // Motion is measured, never assumed from a timescale. Every fixed interval this could have used
-    // instead — an instantaneous velocity sample, a hold of N ticks — is defeated by soft enough
-    // gains, because stiffness and damping are validated only as positive and a slow enough arm
-    // crosses the band looking stationary for as long as you care to watch. Range over a window has
-    // no such constant to defeat: an arm traversing the band varies across it however slowly it
-    // travels, and one at rest does not.
-    //
-    // The floor on that is physical, not a gap here: as the configured frequency falls, "creeping"
-    // and "stopped" stop being distinguishable within any finite observation. That case is what the
-    // whole-move deadline is for.
-    // PER JOINT, and only then reduced. Taking the largest error first and watching that scalar
-    // hides every other joint behind it: one joint resting on a residual just inside tolerance holds
-    // the maximum constant while another swings freely underneath, and the arm reports arrival while
-    // it is still moving. The arm is settled when NO joint is moving.
-    const Vector7d e = (ref - q).cwiseAbs();
-    window_min = window_min.cwiseMin(e);
-    window_max = window_max.cwiseMax(e);
-    if (++window_ticks < window_cap) return Arrival::InFlight;
-    if ((window_max - window_min).maxCoeff() <= STALL_PROGRESS_EPSILON) {
-      return e.maxCoeff() < SETTLE_POSITION_TOLERANCE ? Arrival::Reached : Arrival::Stalled;
+    if ((ref - q).cwiseAbs().maxCoeff() < SETTLE_POSITION_TOLERANCE &&
+        dq.cwiseAbs().maxCoeff() < SETTLE_VELOCITY_TOLERANCE) {
+      return ++settled_ticks >= SETTLE_HOLD_TICKS ? Arrival::Reached : Arrival::InFlight;
     }
-    window_min = window_max = e;
-    window_ticks = 0;
+    settled_ticks = 0;
     return Arrival::InFlight;
   }
 
@@ -1206,7 +1126,7 @@ private:
         complete_goal_(id);
         return true;
       case Arrival::Stalled:
-        fail_goal_(id, "the arm did not reach the target: it stopped short, or ran out of time trying");
+        fail_goal_(id, "the arm did not reach the target within the deadline");
         return true;
       case Arrival::InFlight:
         return false;
@@ -1374,6 +1294,8 @@ private:
   // The move `target_q_` belongs to, carried with it so the loop learns which goal it is executing
   // from the same critical section that hands it the target; 0 for a streamed target, which has none.
   std::uint64_t target_goal_id_ = 0;
+  // The deadline the pending target was commanded with, in 1 kHz ticks; taken by the loop with it.
+  std::int64_t target_deadline_ticks_ = 0;
   // A gains-only SoftwareImpedance change, picked up by the running torque loop mid-session.
   SoftwareImpedance new_gains_;
   std::atomic<bool> has_new_gains_{false};

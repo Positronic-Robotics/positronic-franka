@@ -3,6 +3,7 @@
 ## [0.7.0] - 2026-07-31
 
 ### Added
+- `set_target_joints(q_target, deadline_s=15.0)` — the deadline that bounds the move. The goal ABORTS if the arm has not settled at the target by then. An argument rather than a constant because whether a move will arrive is a property of the move being asked for — reach, gains, payload — and the caller is the only party that knows what is reasonable for the one it just commanded.
 - `goal()` — how the joint move in flight is going, read without blocking: `GoalStatus.IN_FLIGHT / REACHED / ABORTED`, with `Goal.reason` carrying why an aborted one stopped. `REACHED` means the arm settled at the commanded reference (within tolerance and no longer moving), the same criterion in both control modes.
 
 ### Changed
