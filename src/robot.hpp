@@ -121,6 +121,33 @@ inline bool operator==(const SoftwareImpedance& a, const SoftwareImpedance& b) {
 
 using ControlMode = std::variant<InternalImpedance, SoftwareImpedance>;
 
+// How a tracked joint move is going. `move_to_joints` and the blocking form of `set_target_joints`
+// start one; streamed (asynchronous) targets do not, since a caller overwriting a target every tick
+// has no arrival to report.
+//
+// Pollable, because a caller whose own loop is the thing that clears robot errors cannot afford to
+// block on a move: a reflex firing during a blocking move is seen by nobody, so it is never cleared
+// and the move never ends.
+enum class GoalStatus {
+  // No move has been tracked yet on this Robot.
+  NONE,
+  // Commanded, not finished.
+  IN_FLIGHT,
+  // The trajectory ran to the target.
+  REACHED,
+  // The move stopped short — a reflex, a rejected plan, a lost connection. `Goal::reason` says which.
+  ABORTED,
+  // A newer target replaced it before it finished. Not a failure and not an arrival: the arm went
+  // somewhere the caller asked for, just not here.
+  SUPERSEDED,
+};
+
+struct Goal {
+  GoalStatus status = GoalStatus::NONE;
+  // Why the move stopped short — libfranka's own text where it had any. Empty unless ABORTED.
+  std::string reason;
+};
+
 struct State {
   Vector7d q;
   Vector7d dq;
@@ -299,60 +326,36 @@ class Robot {
 
   ControlMode control_mode() const { return control_mode_; }
 
+  // Command a joint move and return immediately, tracking it: poll `goal()` for IN_FLIGHT / REACHED /
+  // ABORTED. Prefer this to the blocking form wherever the caller runs a loop of its own — that loop
+  // is what notices and clears robot errors, and it cannot while parked inside a blocking call, so a
+  // reflex firing during a blocking move is seen by nobody and the move never ends.
+  void move_to_joints(const Eigen::Ref<const Vector7d>& q_target) {
+    publish_target_(q_target, /*tracked=*/true);
+  }
+
+  // The tracked move, read without blocking.
+  Goal goal() {
+    std::lock_guard<std::mutex> lk(goal_mutex_);
+    return Goal{goal_status_, goal_error_};
+  }
+
   void set_target_joints(const Eigen::Ref<const Vector7d>& q_target,
                          bool asynchronous = true) {
-    // Reject garbage before it reaches a control loop: an async torque-mode target becomes the reference
-    // verbatim, so a NaN here would become NaN torques.
-    if (!q_target.allFinite()) {
-      throw std::invalid_argument("q_target must be finite");
-    }
-    if (!control_running_.load()) {
-      if (control_thread_.joinable()) {
-        control_thread_.join();
-      }
-      stop_requested_.store(false);
-      // A target or sync request stranded by a dead loop must not feed the replacement loop's first
-      // ticks — those can run before this command publishes its own target below. Anything queued here
-      // is stale: no loop consumed it, and the caller's publish comes after (callers are serialized).
-      has_target_.store(false);
-      sync_request_next_.store(false);
-      control_running_.store(true);
-      // Snapshot the mode here: the caller is GIL-serialized with set_control_mode, while the thread
-      // body would race a concurrent gains handoff writing control_mode_.
-      const ControlMode mode = control_mode_;
-      control_thread_ = std::thread([this, mode] {
-        if (const auto* software = std::get_if<SoftwareImpedance>(&mode)) {
-          this->run_joint_torque_control_(*software);
-        } else {
-          this->run_joint_position_control_();
-        }
-      });
-    }
-    if (!asynchronous) {
-      // Prepare synchronous wait before publishing the target to avoid races.
-      std::lock_guard<std::mutex> glk(goal_mutex_);
-      goal_completed_ = false;
-      goal_failed_ = false;
-      sync_request_next_.store(true);
-    }
-    {
-      std::lock_guard<std::mutex> lk(target_mutex_);
-      // An async target cancels any queued sync request it overwrites (including one stranded by a dead
-      // loop) and releases its waiter — the goal that request belonged to can no longer complete.
-      if (asynchronous && sync_request_next_.exchange(false)) complete_goal_();
-      target_q_ = q_target;
-      has_target_.store(true);
-    }
-    if (!asynchronous) {
-      // Also wake when the control thread dies (reflex, exception): a dead thread can never complete
-      // the goal, and finish_control_thread_ notifies after clearing control_running_.
-      std::unique_lock<std::mutex> lk(goal_mutex_);
-      goal_cv_.wait(lk, [&]{ return goal_completed_ || !control_running_.load(); });
-      // Waking without a completed goal means the loop died between our publish and its bookkeeping.
-      if (goal_failed_ || !goal_completed_) {
-        throw std::runtime_error(goal_failed_ ? goal_error_
-                                              : "control loop stopped before the joint target was reached");
-      }
+    publish_target_(q_target, /*tracked=*/!asynchronous);
+    if (asynchronous) return;
+    // Also wake when the control thread dies (reflex, exception): a dead thread can never complete
+    // the goal, and finish_control_thread_ settles it after clearing control_running_.
+    std::unique_lock<std::mutex> lk(goal_mutex_);
+    goal_cv_.wait(lk, [&]{ return goal_status_ != GoalStatus::IN_FLIGHT || !control_running_.load(); });
+    switch (goal_status_) {
+      case GoalStatus::ABORTED:
+        throw std::runtime_error(goal_error_);
+      case GoalStatus::IN_FLIGHT:
+        // Woken by the loop dying between the publish above and its own bookkeeping.
+        throw std::runtime_error("control loop stopped before the joint target was reached");
+      default:
+        return;
     }
   }
 
@@ -736,6 +739,7 @@ private:
 
  private:
   void run_joint_position_control_() {
+    std::string thread_error;
     try {
       TrajectoryGenerator traj(relative_dynamics_factor_);
 
@@ -763,9 +767,9 @@ private:
             const bool planned = traj.set_target(target_q_);
             has_target_.store(false);
             const bool sync = sync_request_next_.exchange(false);
-            // An async target supersedes a sync goal still in flight; release its waiter rather than
-            // leave it blocked until some unrelated goal completes.
-            if (sync_in_flight && !sync) complete_goal_();
+            // An async target supersedes a tracked move still in flight; release its waiter rather
+            // than leave it blocked until some unrelated goal completes.
+            if (sync_in_flight && !sync) supersede_goal_();
             sync_in_flight = sync && planned;
             // A rejected plan must not let the old trajectory finish this goal as if reached.
             if (sync && !planned) fail_goal_("joint target rejected by the trajectory planner");
@@ -788,9 +792,12 @@ private:
           return franka::JointPositions(pos);
         });
     } catch (const std::exception& e) {
+      // Printed as well as reported: a streamed target arms no goal, so for those this line is the
+      // only record that the loop died and why.
       std::cerr << "Joint control thread error: " << e.what() << std::endl;
+      thread_error = e.what();
     }
-    finish_control_thread_();
+    finish_control_thread_(std::move(thread_error));
   }
 
   // Torque-interface control loop running the polymetis hybrid impedance law:
@@ -804,6 +811,7 @@ private:
     Vector7d Kqd = Eigen::Map<const Vector7d>(imp.kqd.data());
     Vector6d Kx = Eigen::Map<const Vector6d>(imp.kx.data());
     Vector6d Kxd = Eigen::Map<const Vector6d>(imp.kxd.data());
+    std::string thread_error;
     try {
       TrajectoryGenerator traj(relative_dynamics_factor_);
 
@@ -846,9 +854,9 @@ private:
             } else {
               ref = target_q_;
               shaped = false;
-              // A step target supersedes a sync goal still in flight; release its waiter rather than
-              // leave it blocked until some unrelated goal completes.
-              if (sync_in_flight) complete_goal_();
+              // A step target supersedes a tracked move still in flight; release its waiter rather
+              // than leave it blocked until some unrelated goal completes.
+              if (sync_in_flight) supersede_goal_();
             }
             has_target_.store(false);
           }
@@ -916,49 +924,123 @@ private:
         },
         true /* limit_rate */, 100.0 /* cutoff_frequency */);
     } catch (const std::exception& e) {
+      // Printed as well as reported: a streamed target arms no goal, so for those this line is the
+      // only record that the loop died and why.
       std::cerr << "Torque control thread error: " << e.what() << std::endl;
+      thread_error = e.what();
     }
-    finish_control_thread_();
+    finish_control_thread_(std::move(thread_error));
   }
 
-  // Wake any synchronous set_target_joints waiter.
-  void complete_goal_() {
+  // Start the control loop if it is not running, then publish `q_target` to it. `tracked` arms the
+  // goal machinery, so the move reports IN_FLIGHT until the loop settles it; a streamed target does
+  // not, since a caller overwriting the target every tick has no arrival to report.
+  void publish_target_(const Eigen::Ref<const Vector7d>& q_target, bool tracked) {
+    // Reject garbage before it reaches a control loop: an async torque-mode target becomes the reference
+    // verbatim, so a NaN here would become NaN torques.
+    if (!q_target.allFinite()) {
+      throw std::invalid_argument("q_target must be finite");
+    }
+    if (!control_running_.load()) {
+      if (control_thread_.joinable()) {
+        control_thread_.join();
+      }
+      // Starting a loop issues a Move command, and the robot refuses one while it holds an error
+      // ("command not possible in the current mode"), so the fresh thread would die on its first tick.
+      // Report the robot's own error instead of spawning it. Clearing is the caller's call, not this
+      // library's: a reflex means the arm hit something, and only the caller knows whether resuming is
+      // safe. A streamed target is simply dropped — it could not have been executed either way, and the
+      // caller sees the same error on its next `state()`.
+      // Best effort: if the state read itself fails, fall through and let the loop report whatever is
+      // wrong, rather than turning a guard into a new failure mode.
+      std::string robot_errors;
+      try {
+        if (const auto errors = read_robot_state_().current_errors; static_cast<bool>(errors)) {
+          robot_errors = static_cast<std::string>(errors);
+        }
+      } catch (const std::exception&) {  // NOLINT(bugprone-empty-catch)
+      }
+      if (!robot_errors.empty()) {
+        if (tracked) {
+          std::lock_guard<std::mutex> lk(goal_mutex_);
+          goal_status_ = GoalStatus::ABORTED;
+          goal_error_ = "robot reports an error, recover before commanding a move: " + robot_errors;
+        }
+        return;
+      }
+      stop_requested_.store(false);
+      // A target or sync request stranded by a dead loop must not feed the replacement loop's first
+      // ticks — those can run before this command publishes its own target below. Anything queued here
+      // is stale: no loop consumed it, and the caller's publish comes after (callers are serialized).
+      has_target_.store(false);
+      sync_request_next_.store(false);
+      control_running_.store(true);
+      // Snapshot the mode here: the caller is GIL-serialized with set_control_mode, while the thread
+      // body would race a concurrent gains handoff writing control_mode_.
+      const ControlMode mode = control_mode_;
+      control_thread_ = std::thread([this, mode] {
+        if (const auto* software = std::get_if<SoftwareImpedance>(&mode)) {
+          this->run_joint_torque_control_(*software);
+        } else {
+          this->run_joint_position_control_();
+        }
+      });
+    }
+    if (tracked) {
+      // Arm before publishing the target, so the loop cannot settle a goal that is not yet in flight.
+      std::lock_guard<std::mutex> glk(goal_mutex_);
+      goal_status_ = GoalStatus::IN_FLIGHT;
+      goal_error_.clear();
+      sync_request_next_.store(true);
+    }
+    {
+      std::lock_guard<std::mutex> lk(target_mutex_);
+      // A streamed target cancels any queued tracked request it overwrites (including one stranded by a
+      // dead loop) and releases its waiter — the goal that request belonged to can no longer complete.
+      if (!tracked && sync_request_next_.exchange(false)) supersede_goal_();
+      target_q_ = q_target;
+      has_target_.store(true);
+    }
+  }
+
+  // Settle the tracked move and wake any waiter. Only a move still in flight can settle: a status
+  // written over a finished one would report the wrong outcome to a poller, and there is no waiter
+  // left to wake.
+  void settle_goal_(GoalStatus status, std::string reason = {}) {
     {
       std::lock_guard<std::mutex> lk(goal_mutex_);
-      goal_completed_ = true;
+      if (goal_status_ != GoalStatus::IN_FLIGHT) return;
+      goal_status_ = status;
+      goal_error_ = std::move(reason);
     }
     goal_cv_.notify_all();
   }
 
-  // Wake the synchronous waiter with a failure: its set_target_joints raises instead of returning.
-  void fail_goal_(const char* reason) {
-    {
-      std::lock_guard<std::mutex> lk(goal_mutex_);
-      goal_completed_ = true;
-      goal_failed_ = true;
-      goal_error_ = reason;
-    }
-    goal_cv_.notify_all();
-  }
+  // The trajectory ran to the target.
+  void complete_goal_() { settle_goal_(GoalStatus::REACHED); }
 
-  // Every control-thread exit path must clear control_running_ and then wake any synchronous waiter:
-  // a thread that died mid-goal (reflex, NaN, connection loss) otherwise leaves the waiter blocked
-  // forever — and a goal still pending at exit was aborted, not reached, so that waiter raises.
-  void finish_control_thread_() {
+  // A newer target replaced the tracked move. Its waiter returns normally — the caller got the
+  // motion it asked for last — but a poller must not read this as an arrival.
+  void supersede_goal_() { settle_goal_(GoalStatus::SUPERSEDED); }
+
+  // The move stopped short. Its waiter raises instead of returning.
+  void fail_goal_(std::string reason) { settle_goal_(GoalStatus::ABORTED, std::move(reason)); }
+
+  // Every control-thread exit path must clear control_running_ and then settle any tracked move: a
+  // thread that died mid-goal (reflex, NaN, connection loss) otherwise leaves a waiter blocked
+  // forever — and a goal still pending at exit was aborted, not reached.
+  //
+  // `reason` is what the loop caught, so the caller learns *why* ("motion aborted by reflex!
+  // [cartesian_reflex]") rather than only that something stopped. Nothing else knows: the exception
+  // dies with the thread, and by the time the caller looks the robot may already be recovered.
+  void finish_control_thread_(std::string reason = {}) {
     control_running_.store(false);
     {
       std::lock_guard<std::mutex> lk(last_state_mutex_);
       last_software_ref_.reset();
     }
-    {
-      std::lock_guard<std::mutex> lk(goal_mutex_);
-      if (!goal_completed_) {
-        goal_failed_ = true;
-        goal_error_ = "control loop stopped before the joint target was reached";
-      }
-      goal_completed_ = true;
-    }
-    goal_cv_.notify_all();
+    if (reason.empty()) reason = "control loop stopped before the joint target was reached";
+    fail_goal_(std::move(reason));
   }
 
  public:
@@ -1074,13 +1156,12 @@ private:
   std::atomic<bool> stop_requested_{false};
   std::atomic<bool> has_target_{false};
 
-  // Synchronization for synchronous set_target_joints. The goal machinery assumes callers are
-  // serialized — the Python bindings hold the GIL, and a synchronous caller keeps it through its whole
-  // publish-and-wait — so concurrent C++ callers are not supported.
+  // The tracked move. The goal machinery assumes callers are serialized — the Python bindings hold
+  // the GIL, and a synchronous caller keeps it through its whole publish-and-wait — so concurrent
+  // C++ callers are not supported.
   std::mutex goal_mutex_;
   std::condition_variable goal_cv_;
-  bool goal_completed_ = false;
-  bool goal_failed_ = false;
+  GoalStatus goal_status_ = GoalStatus::NONE;
   std::string goal_error_;
   std::atomic<bool> sync_request_next_{false};
 

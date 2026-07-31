@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.7.0] - 2026-07-31
+
+### Added
+- `move_to_joints(q)` + `goal()` — command a joint move and poll how it is going (`GoalStatus.IN_FLIGHT / REACHED / ABORTED / SUPERSEDED`, with `Goal.reason` carrying why an aborted one stopped) instead of blocking until it finishes. A caller whose own loop is what clears robot errors cannot run that loop while parked inside a blocking move, so a reflex during one is seen by nobody: nothing clears it, the move never completes, and the call raises. Streamed (asynchronous) targets arm no goal — a caller overwriting the target every tick has no arrival to report. `set_target_joints(asynchronous=False)` is unchanged, and is now exactly `move_to_joints` plus that wait.
+
+### Fixed
+- A control loop that dies now reports *why*. The goal carries libfranka's own text (`Move command aborted: motion aborted by reflex! ["cartesian_reflex"]`) instead of the generic "control loop stopped before the joint target was reached". The exception was previously printed inside the dying thread and discarded, leaving the caller to infer the cause from `state()` — which by the time it looks may already be recovered. The stderr line stays: a streamed target arms no goal, so for those it remains the only record.
+- A motion command issued while the robot holds an error no longer starts a control thread that libfranka rejects on its first tick (`command not possible in the current mode ("Reflex")`). A tracked move settles ABORTED naming the robot's error; a streamed target is dropped, since it could not have executed either way. Clearing the error stays the caller's decision — a reflex means the arm hit something.
+- A tracked move that a newer target supersedes reports `SUPERSEDED` instead of `REACHED`. Its waiter still returns normally as before, but a poller is no longer told the arm arrived somewhere it never went.
+
 ## [0.6.2] - 2026-07-26
 
 ### Added

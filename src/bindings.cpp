@@ -42,6 +42,32 @@ PYBIND11_MODULE(_franka, m) {
       .def_readonly("kxd", &positronic_franka::SoftwareImpedance::kxd)
       .def(py::self == py::self);
 
+  py::enum_<positronic_franka::GoalStatus>(m, "GoalStatus",
+      "Outcome of a tracked joint move (move_to_joints, or the blocking set_target_joints)")
+      .value("NONE", positronic_franka::GoalStatus::NONE, "No move has been tracked yet")
+      .value("IN_FLIGHT", positronic_franka::GoalStatus::IN_FLIGHT, "Commanded, not finished")
+      .value("REACHED", positronic_franka::GoalStatus::REACHED, "The trajectory ran to the target")
+      .value("ABORTED", positronic_franka::GoalStatus::ABORTED,
+             "Stopped short — reflex, rejected plan, lost connection; see Goal.reason")
+      .value("SUPERSEDED", positronic_franka::GoalStatus::SUPERSEDED,
+             "A newer target replaced it before it finished — neither an arrival nor a failure");
+
+  py::class_<positronic_franka::Goal>(m, "Goal")
+      // Constructible so a caller's tests can stand one in; the driver is the only thing that
+      // produces a real one.
+      .def(py::init([](positronic_franka::GoalStatus status, std::string reason) {
+             return positronic_franka::Goal{status, std::move(reason)};
+           }),
+           py::arg("status") = positronic_franka::GoalStatus::NONE, py::arg("reason") = "")
+      .def_readonly("status", &positronic_franka::Goal::status)
+      .def_readonly("reason", &positronic_franka::Goal::reason,
+                    "Why the move stopped short, in libfranka's own words where it had any; "
+                    "empty unless status is ABORTED")
+      .def("__repr__", [](const positronic_franka::Goal& g) {
+        const std::string status = py::str(py::cast(g.status));
+        return g.reason.empty() ? "<Goal " + status + ">" : "<Goal " + status + ": " + g.reason + ">";
+      });
+
   py::class_<positronic_franka::State>(m, "State")
       .def_property_readonly(
           "q",
@@ -153,6 +179,13 @@ PYBIND11_MODULE(_franka, m) {
       .def("set_target_joints", &positronic_franka::Robot::set_target_joints,
            py::arg("q_target"), py::arg("asynchronous") = true,
            "Move joints to target (7,) via Ruckig; returns immediately if asynchronous else blocks until reached")
+      .def("move_to_joints", &positronic_franka::Robot::move_to_joints,
+           py::arg("q_target"),
+           "Start a tracked move to target (7,) via Ruckig and return immediately; poll goal() for the "
+           "outcome. Use instead of the blocking set_target_joints when the caller runs its own loop — "
+           "that loop is what clears robot errors, and blocking stops it")
+      .def("goal", &positronic_franka::Robot::goal,
+           "How the tracked move is going, without blocking: Goal(status, reason)")
       .def_property_readonly("relative_dynamics_factor",
                              &positronic_franka::Robot::relative_dynamics_factor,
                              "Fixed factor scaling max vel/acc/jerk for Ruckig (0.05..1.0)")
