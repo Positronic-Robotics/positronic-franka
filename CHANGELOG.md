@@ -3,12 +3,21 @@
 ## [0.7.0] - 2026-07-31
 
 ### Added
-- `move_to_joints(q)` + `goal()` — command a joint move and poll how it is going (`GoalStatus.IN_FLIGHT / REACHED / ABORTED / SUPERSEDED`, with `Goal.reason` carrying why an aborted one stopped) instead of blocking until it finishes. Blocking breaks any caller that clears robot errors from its own loop: while it waits inside the call, that loop is not running, so a reflex mid-move goes unseen and uncleared — the move never finishes and the call raises. Polling leaves the loop free to run. Streamed (asynchronous) targets have no goal — a caller overwriting the target every tick has no single arrival to report. `set_target_joints(asynchronous=False)` is unchanged, and is now exactly `move_to_joints` plus that wait.
+- `goal()` — how the joint move in flight is going, read without blocking: `GoalStatus.IN_FLIGHT / REACHED / ABORTED`, with `Goal.reason` carrying why an aborted one stopped. `REACHED` means the arm settled at the commanded reference (within tolerance and no longer moving), the same criterion in both control modes.
+
+### Changed
+- **Breaking.** `set_target_joints(q_target)` no longer takes `asynchronous`, and never blocks. Waiting for a move is the caller's, written as a loop that polls `goal()`. Blocking inside the library breaks any caller whose own loop is what clears robot errors: while it waits, that loop is not running, so a reflex mid-move goes unseen and uncleared, the move never finishes, and the call raises. A caller that wants the old synchronous behaviour polls `goal()` until it leaves `IN_FLIGHT` and raises on `ABORTED` itself.
+- **Breaking.** `SoftwareImpedance` applies every target as an instantly-stepped reference and lets the impedance law pull the arm in — DROID's execution semantics, which is what the mode exists for. Ruckig shaping there was the old synchronous path; a target's motion profile no longer depends on who was waiting for it. `InternalImpedance` still shapes a Ruckig trajectory.
+- Every target arms a goal, streamed ones included. One path, so a target's treatment does not depend on whether anyone is watching it.
+
+### Removed
+- **Breaking.** `move_to_joints(q)` — `set_target_joints` now does exactly this, so the two had become one function under two names.
+- **Breaking.** `GoalStatus.SUPERSEDED`. A newer target replaces an older one and only the move in flight has a status, so nothing observes the replacement.
 
 ### Fixed
-- A control loop that dies now reports *why*. The goal carries libfranka's own text (`Move command aborted: motion aborted by reflex! ["cartesian_reflex"]`) instead of the generic "control loop stopped before the joint target was reached". The exception was previously printed inside the dying thread and discarded, leaving the caller to infer the cause from `state()` — which by the time it looks may already be recovered. The stderr line stays: a streamed target has no goal, so for those it remains the only record.
-- A motion command issued while the robot holds an error no longer starts a control thread that libfranka rejects on its first tick (`command not possible in the current mode ("Reflex")`). A tracked move settles ABORTED naming the robot's error; a streamed target is dropped, since it could not have executed either way. Clearing the error stays the caller's decision — a reflex means the arm hit something.
-- A tracked move that a newer target supersedes reports `SUPERSEDED` instead of `REACHED`. Its waiter still returns normally as before, but a poller is no longer told the arm arrived somewhere it never went.
+- A control loop that dies now reports *why*. The goal carries libfranka's own text (`Move command aborted: motion aborted by reflex! ["cartesian_reflex"]`) instead of the generic "control loop stopped before the joint target was reached". The exception was previously printed inside the dying thread and discarded, leaving the caller to infer the cause from `state()` — which by the time it looks may already be recovered. The stderr line stays as a second record.
+- A motion command issued while the robot holds an error no longer starts a control thread that libfranka rejects on its first tick (`command not possible in the current mode ("Reflex")`). The move settles ABORTED naming the robot's error. Clearing it stays the caller's decision — a reflex means the arm hit something.
+- An older trajectory can no longer settle the goal that replaced it. Each move carries an id, handed to the control loop with its target, and a settle that does not name the move in flight is ignored — previously a move replaced just as its trajectory ended completed the newly armed goal as `REACHED`, telling a poller the arm had reached a target it never started for.
 
 ## [0.6.2] - 2026-07-26
 

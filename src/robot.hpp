@@ -15,7 +15,6 @@
 #include <thread>
 #include <atomic>
 #include <mutex>
-#include <condition_variable>
 #include <cstdint>
 #include <cstring>
 #include <optional>
@@ -39,8 +38,9 @@ constexpr std::array<double, 7> PANDA_JOINT_LOWER_LIMITS = {
 constexpr std::array<double, 7> PANDA_JOINT_UPPER_LIMITS = {
     2.8973, 1.7628, 2.8973, 3.0718, 2.8973, 3.7525, 2.8973};
 
-// Rest detection for the software-impedance loop: position/velocity tolerances and the tick cap (1 kHz
-// ticks, so 1 s) bounding how long a waiter can be held.
+// Arrival detection, shared by both control loops: the measured joints are within these tolerances of
+// the commanded reference and no longer moving. The tick cap (1 kHz ticks, so 1 s) bounds how long a
+// caller polling for arrival can be held when the arm holds short of the reference under contact.
 constexpr double SETTLE_POSITION_TOLERANCE = 0.05;  // rad
 constexpr double SETTLE_VELOCITY_TOLERANCE = 0.05;  // rad/s
 constexpr int SETTLE_TICKS_CAP = 1000;
@@ -53,9 +53,9 @@ using SpatialJacobian = Eigen::Matrix<double, 6, 7>;
 
 // Control modes. InternalImpedance drives the robot's built-in joint impedance controller through the
 // joint position motion generator with Ruckig-shaped references. SoftwareImpedance owns the impedance law
-// itself: it runs the polymetis hybrid joint/Cartesian impedance over the torque interface, with async
-// targets applied as instantly-stepped references (DROID execution semantics) and sync targets shaped by
-// Ruckig. Defaults are the factory joint stiffness and DROID's polymetis gains respectively.
+// itself: it runs the polymetis hybrid joint/Cartesian impedance over the torque interface, with every
+// target applied as an instantly-stepped reference (DROID execution semantics). Defaults are the factory
+// joint stiffness and DROID's polymetis gains respectively.
 template <size_t N>
 bool all_zero(const std::array<double, N>& v) {
   for (double x : v) {
@@ -123,25 +123,25 @@ inline bool operator==(const SoftwareImpedance& a, const SoftwareImpedance& b) {
 
 using ControlMode = std::variant<InternalImpedance, SoftwareImpedance>;
 
-// How a tracked joint move is going. `move_to_joints` and the blocking form of `set_target_joints`
-// start one; streamed (asynchronous) targets do not, since a caller overwriting a target every tick
-// has no arrival to report.
+// How the joint move now in flight is going. Every `set_target_joints` starts one.
 //
-// Pollable, because a caller whose own loop is the thing that clears robot errors cannot afford to
-// block on a move: a reflex firing during a blocking move is seen by nobody, so it is never cleared
-// and the move never ends.
+// Pollable, never blocking, because a caller whose own loop is the thing that clears robot errors
+// cannot afford to wait inside the library: a reflex firing during a blocking move is seen by
+// nobody, so it is never cleared and the move never ends. Waiting is the caller's to write, in a
+// loop that keeps doing its other work.
+//
+// A newer target simply replaces an older one — the arm goes where the caller last asked. The
+// replaced move is not reported: only the move in flight has a status, so a caller that cares about
+// arrival sends one target and waits for it.
 enum class GoalStatus {
-  // No move has been tracked yet on this Robot.
+  // No move has been commanded yet on this Robot.
   NONE,
   // Commanded, not finished.
   IN_FLIGHT,
-  // The trajectory ran to the target.
+  // The arm settled at the commanded target.
   REACHED,
   // The move stopped short — a reflex, a rejected plan, a lost connection. `Goal::reason` says which.
   ABORTED,
-  // A newer target replaced it before it finished. Not a failure and not an arrival: the arm went
-  // somewhere the caller asked for, just not here.
-  SUPERSEDED,
 };
 
 struct Goal {
@@ -328,37 +328,20 @@ class Robot {
 
   ControlMode control_mode() const { return control_mode_; }
 
-  // Command a joint move and return immediately, tracking it: poll `goal()` for IN_FLIGHT / REACHED /
-  // ABORTED. Prefer this to the blocking form wherever the caller runs a loop of its own — that loop
-  // is what notices and clears robot errors, and it cannot while parked inside a blocking call, so a
-  // reflex firing during a blocking move is seen by nobody and the move never ends.
-  void move_to_joints(const Eigen::Ref<const Vector7d>& q_target) {
-    publish_target_(q_target, /*tracked=*/true);
-  }
-
-  // The tracked move, read without blocking.
+  // The move in flight, read without blocking.
   Goal goal() {
     std::lock_guard<std::mutex> lk(goal_mutex_);
     return Goal{goal_status_, goal_error_};
   }
 
-  void set_target_joints(const Eigen::Ref<const Vector7d>& q_target,
-                         bool asynchronous = true) {
-    publish_target_(q_target, /*tracked=*/!asynchronous);
-    if (asynchronous) return;
-    // Also wake when the control thread dies (reflex, exception): a dead thread can never complete
-    // the goal, and finish_control_thread_ settles it after clearing control_running_.
-    std::unique_lock<std::mutex> lk(goal_mutex_);
-    goal_cv_.wait(lk, [&]{ return goal_status_ != GoalStatus::IN_FLIGHT || !control_running_.load(); });
-    switch (goal_status_) {
-      case GoalStatus::ABORTED:
-        throw std::runtime_error(goal_error_);
-      case GoalStatus::IN_FLIGHT:
-        // Woken by the loop dying between the publish above and its own bookkeeping.
-        throw std::runtime_error("control loop stopped before the joint target was reached");
-      default:
-        return;
-    }
+  // Command a joint move and return immediately. Poll `goal()` for IN_FLIGHT / REACHED / ABORTED.
+  //
+  // One behaviour, whatever the control mode and whoever is calling: publish the target, arm the
+  // goal, return. How the arm gets there is the mode's business — `InternalImpedance` shapes a
+  // Ruckig trajectory, `SoftwareImpedance` steps the reference and lets the impedance law pull the
+  // arm in (DROID execution semantics) — but both report the same way, and neither waits.
+  void set_target_joints(const Eigen::Ref<const Vector7d>& q_target) {
+    publish_target_(q_target);
   }
 
   // Forward Kinematics: compute EE pose (tx, ty, tz, qw, qx, qy, qz) from joints q (7,)
@@ -748,7 +731,8 @@ private:
       robot_->control(
         [&, this,
          first = true,
-         sync_in_flight = std::uint64_t{0},
+         goal_in_flight = std::uint64_t{0},
+         settle_ticks = 0,
          stopping = false](const franka::RobotState& st, franka::Duration period) mutable -> franka::JointPositions {
           {
             std::lock_guard<std::mutex> lk(last_state_mutex_);
@@ -768,27 +752,37 @@ private:
             std::lock_guard<std::mutex> lk(target_mutex_);
             const bool planned = traj.set_target(target_q_);
             has_target_.store(false);
-            const std::uint64_t goal_id = std::exchange(target_goal_id_, 0);
-            // An async target supersedes a tracked move still in flight; release its waiter rather
-            // than leave it blocked until some unrelated goal completes.
-            if (sync_in_flight != 0 && goal_id == 0) supersede_goal_(sync_in_flight);
-            sync_in_flight = planned ? goal_id : 0;
+            goal_in_flight = std::exchange(target_goal_id_, 0);
+            settle_ticks = 0;
             // A rejected plan must not let the old trajectory finish this goal as if reached.
-            if (goal_id != 0 && !planned) fail_goal_(goal_id, "joint target rejected by the trajectory planner");
+            if (!planned) {
+              fail_goal_(goal_in_flight, "joint target rejected by the trajectory planner");
+              goal_in_flight = 0;
+            }
           }
 
           auto pos = traj.step(period);
 
-          if (!traj.active()) {
-            if (sync_in_flight != 0) {
-              complete_goal_(sync_in_flight);
-              sync_in_flight = 0;
-            }
-            if (stopping) {
-              auto cmd = franka::JointPositions(pos);
-              cmd.motion_finished = true;
-              return cmd;
-            }
+          // Arrival is PHYSICAL and the criterion is the same in both control modes: the arm is at
+          // the commanded reference and no longer moving. An exhausted reference is not arrival —
+          // the internal controller tracks closely but not exactly, and the torque loop has no
+          // trajectory to exhaust at all.
+          //
+          // Here it is gated on the trajectory being done, which the torque loop needs no equivalent
+          // of: a Ruckig move STARTS with the reference at the current pose and the arm at rest, so
+          // an ungated check would report REACHED on the first tick of every move. A stepped
+          // reference starts far from the arm, so the same check is safe unguarded there.
+          if (goal_in_flight != 0 && !traj.active() &&
+              settled_(Eigen::Map<const Vector7d>(pos.data()), Eigen::Map<const Vector7d>(st.q.data()),
+                       Eigen::Map<const Vector7d>(st.dq.data()), ++settle_ticks)) {
+            complete_goal_(goal_in_flight);
+            goal_in_flight = 0;
+          }
+
+          if (!traj.active() && stopping) {
+            auto cmd = franka::JointPositions(pos);
+            cmd.motion_finished = true;
+            return cmd;
           }
 
           return franka::JointPositions(pos);
@@ -804,10 +798,10 @@ private:
 
   // Torque-interface control loop running the polymetis hybrid impedance law:
   //   tau = (J^T Kx J + Kq)(q_d - q) - (J^T Kxd J + Kqd) dq + coriolis
-  // Gravity is compensated by libfranka underneath the torque command. Shares the target/stop/sync
-  // machinery with the position loop; only the reference semantics differ: async targets step the
-  // reference q_d instantly (DROID execution semantics), sync targets are Ruckig-shaped and tracked
-  // by the same law.
+  // Gravity is compensated by libfranka underneath the torque command. Shares the target/stop/goal
+  // machinery with the position loop; only the reference semantics differ: every target steps the
+  // reference q_d instantly and the law pulls the arm in (DROID execution semantics), where the
+  // position loop shapes a Ruckig trajectory.
   void run_joint_torque_control_(SoftwareImpedance imp) {
     Vector7d Kq = Eigen::Map<const Vector7d>(imp.kq.data());
     Vector7d Kqd = Eigen::Map<const Vector7d>(imp.kqd.data());
@@ -815,19 +809,15 @@ private:
     Vector6d Kxd = Eigen::Map<const Vector6d>(imp.kxd.data());
     std::string thread_error;
     try {
-      TrajectoryGenerator traj(relative_dynamics_factor_);
-
       robot_->control(
         [&, this,
          first = true,
-         shaped = false,
-         settling = false,
-         sync_in_flight = std::uint64_t{0},
+         goal_in_flight = std::uint64_t{0},
          settle_ticks = 0,
          stopping = false,
          stop_ticks = 0,
          ref = Vector7d(Vector7d::Zero())](const franka::RobotState& st,
-                                           franka::Duration period) mutable -> franka::Torques {
+                                           franka::Duration /*period*/) mutable -> franka::Torques {
           const Vector7d q = Eigen::Map<const Vector7d>(st.q.data());
           const Vector7d dq = Eigen::Map<const Vector7d>(st.dq.data());
 
@@ -837,33 +827,18 @@ private:
           } else if (!stopping && stop_requested_.load()) {
             stopping = true;
             has_target_.store(false);
-            shaped = false;
-            settling = false;
             ref = q;
           }
 
+          // No trajectory here, by design: the reference STEPS to the target and the impedance law
+          // is what moves the arm (DROID execution semantics, which is what this mode exists for).
+          // Shaping it with Ruckig was the old sync path, and having two profiles behind one flag is
+          // what made a target's motion depend on who was waiting for it.
           if (!stopping && has_target_.load()) {
             std::lock_guard<std::mutex> lk(target_mutex_);
-            const std::uint64_t previous = (shaped || settling) ? sync_in_flight : 0;
-            settling = false;
-            const std::uint64_t goal_id = std::exchange(target_goal_id_, 0);
-            if (goal_id != 0) {
-              traj.reset(ref);
-              if (traj.set_target(target_q_)) {
-                shaped = true;
-                sync_in_flight = goal_id;
-              } else {
-                // A rejected plan must not let settling at the old reference report the goal reached.
-                sync_in_flight = 0;
-                fail_goal_(goal_id, "joint target rejected by the trajectory planner");
-              }
-            } else {
-              ref = target_q_;
-              shaped = false;
-              // A step target supersedes a tracked move still in flight; release its waiter rather
-              // than leave it blocked until some unrelated goal completes.
-              if (previous != 0) supersede_goal_(previous);
-            }
+            ref = target_q_;
+            goal_in_flight = std::exchange(target_goal_id_, 0);
+            settle_ticks = 0;
             has_target_.store(false);
           }
 
@@ -876,27 +851,12 @@ private:
             has_new_gains_.store(false);
           }
 
-          if (shaped) {
-            const auto pos = traj.step(period);
-            ref = Eigen::Map<const Vector7d>(pos.data());
-            if (!traj.active()) {
-              shaped = false;
-              settling = true;
-              settle_ticks = 0;
-            }
-          }
-
-          // An exhausted reference is not arrival: the loop is a compliant spring, and under load the
-          // measured joints settle well after ref reaches the target. Complete the sync goal once q/dq
-          // are close (capped so contact can never hang the caller).
-          if (settling) {
-            ++settle_ticks;
-            const bool close = (ref - q).cwiseAbs().maxCoeff() < SETTLE_POSITION_TOLERANCE &&
-                               dq.cwiseAbs().maxCoeff() < SETTLE_VELOCITY_TOLERANCE;
-            if (close || settle_ticks >= SETTLE_TICKS_CAP) {
-              settling = false;
-              complete_goal_(sync_in_flight);
-            }
+          // The same arrival rule the position loop uses. No gate on a trajectory is needed: the
+          // reference stepped away from the arm when the target arrived, so the check cannot pass
+          // until the spring has actually pulled the joints in.
+          if (goal_in_flight != 0 && settled_(ref, q, dq, ++settle_ticks)) {
+            complete_goal_(goal_in_flight);
+            goal_in_flight = 0;
           }
 
           // Publish the state and this tick's final reference in one critical section, so a state()
@@ -938,11 +898,11 @@ private:
     finish_control_thread_(std::move(thread_error));
   }
 
-  // Start the control loop if it is not running, then publish `q_target` to it. `tracked` arms the
-  // goal machinery, so the move reports IN_FLIGHT until the loop settles it; a streamed target does
-  // not, since a caller overwriting the target every tick has no arrival to report.
-  void publish_target_(const Eigen::Ref<const Vector7d>& q_target, bool tracked) {
-    // Reject garbage before it reaches a control loop: an async torque-mode target becomes the reference
+  // Start the control loop if it is not running, then publish `q_target` to it. Every target arms
+  // the goal, so the move reports IN_FLIGHT until the loop settles it — one path, because a target's
+  // treatment must not depend on whether anyone happens to be watching it.
+  void publish_target_(const Eigen::Ref<const Vector7d>& q_target) {
+    // Reject garbage before it reaches a control loop: a torque-mode target becomes the reference
     // verbatim, so a NaN here would become NaN torques.
     if (!q_target.allFinite()) {
       throw std::invalid_argument("q_target must be finite");
@@ -958,13 +918,12 @@ private:
       // belongs to a dead thread, so a poller waits on a move nothing will ever settle. Arming any
       // earlier would expose it to the loop being replaced — the join is what guarantees that one has
       // finished settling, so it cannot abort the move its successor is about to run.
-      if (tracked) goal_id = arm_goal_();
+      goal_id = arm_goal_();
       // Starting a loop issues a Move command, and the robot refuses one while it holds an error
       // ("command not possible in the current mode"), so the fresh thread would die on its first tick.
       // Report the robot's own error instead of spawning it. Clearing is the caller's call, not this
       // library's: a reflex means the arm hit something, and only the caller knows whether resuming is
-      // safe. A streamed target is simply dropped — it could not have been executed either way, and the
-      // caller sees the same error on its next `state()`.
+      // safe — the goal aborts with the robot's own text so the caller sees why.
       // Best effort: if the state read itself fails, fall through and let the loop report whatever is
       // wrong, rather than turning a guard into a new failure mode.
       std::string robot_errors;
@@ -1005,31 +964,23 @@ private:
         fail_goal_(goal_id, "could not start the control loop");
         throw;
       }
-    } else if (tracked) {
-      // The loop is ALREADY running, which is every tracked move after the first. Arming only when
-      // starting a loop left those with goal_id 0 — the id that names no move — so the loop settled
-      // nothing, `goal()` kept reporting the PREVIOUS move's outcome, and the blocking form returned
-      // at once on that stale status instead of waiting for the target it was given.
-      //
-      // There is no join to order against here: the loop that will consume this target is the one
-      // already running, so arming immediately before publishing is the whole requirement. If that
-      // loop dies in the window, `finish_control_thread_` settles the goal armed here as ABORTED
-      // with the loop's own reason, which is the outcome the caller should see.
+    } else {
+      // The loop is ALREADY running, which is every move after the first. There is no join to order
+      // against here: the loop that will consume this target is the one already running, so arming
+      // immediately before publishing is the whole requirement. If that loop dies in the window,
+      // `finish_control_thread_` settles the goal armed here as ABORTED with the loop's own reason.
       goal_id = arm_goal_();
     }
     {
       std::lock_guard<std::mutex> lk(target_mutex_);
-      // A streamed target cancels any queued tracked request it overwrites (including one stranded by a
-      // dead loop) and releases its waiter — the goal that request belonged to can no longer complete.
-      if (!tracked && target_goal_id_ != 0) supersede_goal_(target_goal_id_);
       target_q_ = q_target;
       target_goal_id_ = goal_id;
       has_target_.store(true);
     }
   }
 
-  // Arm a tracked move and return the id that names it. Every move gets its own id, so an outcome
-  // reported by whatever was running before can be told apart from the move now in flight.
+  // Arm a move and return the id that names it. Every move gets its own id, so an outcome reported by
+  // whatever was running before can be told apart from the move now in flight.
   std::uint64_t arm_goal_() {
     std::lock_guard<std::mutex> lk(goal_mutex_);
     goal_status_ = GoalStatus::IN_FLIGHT;
@@ -1037,19 +988,18 @@ private:
     return ++goal_id_;
   }
 
-  // Settle the move `id` names and wake any waiter. Two moves are refused: one already settled (a
-  // status written over a finished one would report the wrong outcome to a poller, and there is no
-  // waiter left to wake), and one that is no longer the move in flight — an older trajectory
-  // finishing must not report the arrival of the move that replaced it. Ids start at 1, so 0 names
-  // no move and settles nothing, which is what a streamed target passes.
+  // Settle the move `id` names. Two moves are refused: one already settled (a status written over a
+  // finished one would report the wrong outcome to a poller), and one that is no longer the move in
+  // flight — an older trajectory finishing must not report the arrival of the move that replaced it.
+  // Ids start at 1, so 0 names no move and settles nothing.
+  //
+  // The id is never exposed. It exists for this check: a caller sees one status, and what it needs
+  // is for that status to belong to the move it last commanded.
   void settle_goal_(std::uint64_t id, GoalStatus status, std::string reason = {}) {
-    {
-      std::lock_guard<std::mutex> lk(goal_mutex_);
-      if (goal_status_ != GoalStatus::IN_FLIGHT || goal_id_ != id) return;
-      goal_status_ = status;
-      goal_error_ = std::move(reason);
-    }
-    goal_cv_.notify_all();
+    std::lock_guard<std::mutex> lk(goal_mutex_);
+    if (goal_status_ != GoalStatus::IN_FLIGHT || goal_id_ != id) return;
+    goal_status_ = status;
+    goal_error_ = std::move(reason);
   }
 
   // Settle whichever move is in flight, for the paths that end every move there is: a dying control
@@ -1063,21 +1013,26 @@ private:
     settle_goal_(id, status, std::move(reason));
   }
 
-  // The trajectory ran to the target.
+  // Has the arm arrived? The one arrival criterion, shared by both control loops so a caller reads
+  // REACHED the same way whatever mode the arm is in: the measured joints are at the commanded
+  // reference and no longer moving. `ticks` caps the wait — under sustained contact the arm can
+  // hold short of the reference forever, and a caller polling for arrival must not be hung by it.
+  static bool settled_(const Vector7d& ref, const Vector7d& q, const Vector7d& dq, int ticks) {
+    const bool close = (ref - q).cwiseAbs().maxCoeff() < SETTLE_POSITION_TOLERANCE &&
+                       dq.cwiseAbs().maxCoeff() < SETTLE_VELOCITY_TOLERANCE;
+    return close || ticks >= SETTLE_TICKS_CAP;
+  }
+
   void complete_goal_(std::uint64_t id) { settle_goal_(id, GoalStatus::REACHED); }
 
-  // A newer target replaced the tracked move. Its waiter returns normally — the caller got the
-  // motion it asked for last — but a poller must not read this as an arrival.
-  void supersede_goal_(std::uint64_t id) { settle_goal_(id, GoalStatus::SUPERSEDED); }
-
-  // The move stopped short. Its waiter raises instead of returning.
+  // The move stopped short.
   void fail_goal_(std::uint64_t id, std::string reason) {
     settle_goal_(id, GoalStatus::ABORTED, std::move(reason));
   }
 
-  // Every control-thread exit path must clear control_running_ and then settle any tracked move: a
-  // thread that died mid-goal (reflex, NaN, connection loss) otherwise leaves a waiter blocked
-  // forever — and a goal still pending at exit was aborted, not reached.
+  // Every control-thread exit path must clear control_running_ and then settle the move in flight: a
+  // thread that died mid-goal (reflex, NaN, connection loss) otherwise leaves a poller waiting
+  // forever on a move nothing can finish — and a goal still pending at exit was aborted, not reached.
   //
   // `reason` is what the loop caught, so the caller learns *why* ("motion aborted by reflex!
   // [cartesian_reflex]") rather than only that something stopped. Nothing else knows: the exception
@@ -1205,11 +1160,9 @@ private:
   std::atomic<bool> stop_requested_{false};
   std::atomic<bool> has_target_{false};
 
-  // The tracked move. The goal machinery assumes callers are serialized — the Python bindings hold
-  // the GIL, and a synchronous caller keeps it through its whole publish-and-wait — so concurrent
-  // C++ callers are not supported.
+  // The move in flight. The goal machinery assumes callers are serialized — the Python bindings hold
+  // the GIL for the whole publish — so concurrent C++ callers are not supported.
   std::mutex goal_mutex_;
-  std::condition_variable goal_cv_;
   GoalStatus goal_status_ = GoalStatus::NONE;
   std::string goal_error_;
   // Names the move `goal_status_` describes. Ids start at 1; 0 names no move.

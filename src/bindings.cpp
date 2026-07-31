@@ -43,14 +43,14 @@ PYBIND11_MODULE(_franka, m) {
       .def(py::self == py::self);
 
   py::enum_<positronic_franka::GoalStatus>(m, "GoalStatus",
-      "Outcome of a tracked joint move (move_to_joints, or the blocking set_target_joints)")
-      .value("NONE", positronic_franka::GoalStatus::NONE, "No move has been tracked yet")
+      "How the joint move now in flight is going. Every set_target_joints starts one; a newer "
+      "target replaces an older one, and only the move in flight has a status")
+      .value("NONE", positronic_franka::GoalStatus::NONE, "No move has been commanded yet")
       .value("IN_FLIGHT", positronic_franka::GoalStatus::IN_FLIGHT, "Commanded, not finished")
-      .value("REACHED", positronic_franka::GoalStatus::REACHED, "The trajectory ran to the target")
+      .value("REACHED", positronic_franka::GoalStatus::REACHED,
+             "The arm settled at the commanded target (within tolerance, and no longer moving)")
       .value("ABORTED", positronic_franka::GoalStatus::ABORTED,
-             "Stopped short — reflex, rejected plan, lost connection; see Goal.reason")
-      .value("SUPERSEDED", positronic_franka::GoalStatus::SUPERSEDED,
-             "A newer target replaced it before it finished — neither an arrival nor a failure");
+             "Stopped short — reflex, rejected plan, lost connection; see Goal.reason");
 
   py::class_<positronic_franka::Goal>(m, "Goal")
       // Constructible so a caller's tests can stand one in; the driver is the only thing that
@@ -177,15 +177,14 @@ PYBIND11_MODULE(_franka, m) {
           py::arg("target_pose_wxyz"), py::arg("q0"),
           "IK with initial guess and Panda joint limits enforced via OSQP; returns q (7,)")
       .def("set_target_joints", &positronic_franka::Robot::set_target_joints,
-           py::arg("q_target"), py::arg("asynchronous") = true,
-           "Move joints to target (7,) via Ruckig; returns immediately if asynchronous else blocks until reached")
-      .def("move_to_joints", &positronic_franka::Robot::move_to_joints,
            py::arg("q_target"),
-           "Start a tracked move to target (7,) via Ruckig and return immediately; poll goal() for the "
-           "outcome. Use instead of the blocking set_target_joints when the caller runs its own loop — "
-           "that loop is what clears robot errors, and blocking stops it")
+           "Command a joint move to target (7,) and return immediately; poll goal() for the outcome. "
+           "Never blocks: a caller whose own loop clears robot errors cannot wait inside the library, "
+           "or a reflex fired mid-move is never cleared and the move never ends. How the arm gets "
+           "there is the control mode's business (InternalImpedance shapes a Ruckig trajectory, "
+           "SoftwareImpedance steps the reference), but both report the same way")
       .def("goal", &positronic_franka::Robot::goal,
-           "How the tracked move is going, without blocking: Goal(status, reason)")
+           "How the move in flight is going, without blocking: Goal(status, reason)")
       .def_property_readonly("relative_dynamics_factor",
                              &positronic_franka::Robot::relative_dynamics_factor,
                              "Fixed factor scaling max vel/acc/jerk for Ruckig (0.05..1.0)")
