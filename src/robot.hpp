@@ -1005,6 +1005,17 @@ private:
         fail_goal_(goal_id, "could not start the control loop");
         throw;
       }
+    } else if (tracked) {
+      // The loop is ALREADY running, which is every tracked move after the first. Arming only when
+      // starting a loop left those with goal_id 0 — the id that names no move — so the loop settled
+      // nothing, `goal()` kept reporting the PREVIOUS move's outcome, and the blocking form returned
+      // at once on that stale status instead of waiting for the target it was given.
+      //
+      // There is no join to order against here: the loop that will consume this target is the one
+      // already running, so arming immediately before publishing is the whole requirement. If that
+      // loop dies in the window, `finish_control_thread_` settles the goal armed here as ABORTED
+      // with the loop's own reason, which is the outcome the caller should see.
+      goal_id = arm_goal_();
     }
     {
       std::lock_guard<std::mutex> lk(target_mutex_);
