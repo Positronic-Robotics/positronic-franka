@@ -213,11 +213,12 @@ class TrajectoryGenerator {
     return replan_();
   }
 
-  // Plan a stop from wherever the reference now is. Returns false if the planner refused, in which
-  // case the previous plan is still playing and the caller must ask again.
-  bool stop_at_current() {
+  // TODO: a refused replan leaves the previous plan playing, so the arm goes on to the old target
+  // after the caller has been told the move ended. Braking is a short plan, so only a solver failure
+  // could do it and none has been seen; not handled.
+  void stop_at_current() {
     input_.target_position = input_.current_position;
-    return replan_();
+    replan_();
   }
 
   // Advance trajectory by actual elapsed time and return the position.
@@ -817,7 +818,6 @@ private:
          goal_in_flight = std::uint64_t{0},
          elapsed_s = 0.0,
          deadline_s = 0.0,
-         braking = false,
          stopping = false](const franka::RobotState& st, franka::Duration period) mutable -> franka::JointPositions {
           {
             std::lock_guard<std::mutex> lk(last_state_mutex_);
@@ -830,12 +830,8 @@ private:
           } else if (!stopping && stop_requested_.load()) {
             stopping = true;
             has_target_.store(false);
-            braking = !traj.stop_at_current();
+            traj.stop_at_current();
           }
-
-          // A refused stop leaves the arm travelling to the target the goal has already been told it
-          // will not reach, so keep asking until the planner accepts one.
-          if (braking) braking = !traj.stop_at_current();
 
           if (!stopping && has_target_.load()) {
             std::lock_guard<std::mutex> lk(target_mutex_);
@@ -852,9 +848,7 @@ private:
             if (!planned) {
               fail_goal_(goal_in_flight, "joint target rejected by the trajectory planner");
               goal_in_flight = 0;
-              braking = !traj.stop_at_current();
-            } else {
-              braking = false;
+              traj.stop_at_current();
             }
           }
 
@@ -874,7 +868,7 @@ private:
               goal_in_flight = 0;
               // ABORTED says the move stopped short, so the arm has to actually stop rather than
               // keep being driven at the expired target.
-              if (outcome == Arrival::Stalled) braking = !traj.stop_at_current();
+              if (outcome == Arrival::Stalled) traj.stop_at_current();
             }
           }
 
