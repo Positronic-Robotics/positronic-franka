@@ -39,16 +39,16 @@ constexpr std::array<double, 7> PANDA_JOINT_LOWER_LIMITS = {
 constexpr std::array<double, 7> PANDA_JOINT_UPPER_LIMITS = {
     2.8973, 1.7628, 2.8973, 3.0718, 2.8973, 3.7525, 2.8973};
 
-// Arrival: joints within tolerance of the reference and not moving, held for SETTLE_HOLD_TICKS.
-// The hold is needed because velocity passes through zero at every turning point of an oscillation.
+// Arrival: joints within tolerance of the reference and no longer moving, judged on one reading.
 //
-// KNOWN LIMITATION: fixed tolerances. Under soft `SoftwareImpedance` gains a slow, large oscillation
-// stays inside both bands for longer than the hold, so a swinging arm reports REACHED. Fix, if it
-// ever bites: let the caller pass tolerances as it passes the deadline. Not hit in practice —
-// deployed config is `InternalImpedance`, too stiff to oscillate that slowly. internal#162.
+// KNOWN LIMITATION, accepted: an arm whose resting point is offset from the target by load or
+// friction dips into the band at near-zero speed at one end of its swing and settles outside it, so
+// that single reading reports REACHED. The status is only a report — the loop goes on driving the
+// target until a new one arrives — but it is never taken back, so a caller polling at that instant
+// acts on it. Fix, if it ever bites: let the caller pass the tolerances as it passes the deadline.
+// internal#162.
 constexpr double SETTLE_POSITION_TOLERANCE = 0.05;  // rad
 constexpr double SETTLE_VELOCITY_TOLERANCE = 0.05;  // rad/s
-constexpr int SETTLE_HOLD_TICKS = 100;              // 1 kHz ticks — 0.1 s
 // Deadline used when the caller names none. Generous for a joint move on this arm.
 constexpr double DEFAULT_MOVE_DEADLINE_S = 15.0;
 
@@ -811,7 +811,6 @@ private:
         [&, this,
          first = true,
          goal_in_flight = std::uint64_t{0},
-         settled_ticks = 0,
          elapsed_s = 0.0,
          deadline_s = 0.0,
          stopping = false](const franka::RobotState& st, franka::Duration period) mutable -> franka::JointPositions {
@@ -834,7 +833,6 @@ private:
             const bool planned = traj.set_target(target_q_);
             has_target_.store(false);
             goal_in_flight = std::exchange(target_goal_id_, 0);
-            settled_ticks = 0;
             elapsed_s = 0.0;
             // Plan duration plus the settle budget, so a slow `relative_dynamics_factor` gets the
             // time it asked for while a move that overruns its own plan still ends.
@@ -860,7 +858,7 @@ private:
             const Arrival outcome = arrival_(Eigen::Map<const Vector7d>(pos.data()),
                                              Eigen::Map<const Vector7d>(st.q.data()),
                                              Eigen::Map<const Vector7d>(st.dq.data()), traj.active(),
-                                             period.toSec(), deadline_s, settled_ticks, elapsed_s);
+                                             period.toSec(), deadline_s, elapsed_s);
             if (settle_on_arrival_(goal_in_flight, outcome)) {
               goal_in_flight = 0;
               // ABORTED says the move stopped short, so the arm has to actually stop rather than
@@ -901,7 +899,6 @@ private:
         [&, this,
          first = true,
          goal_in_flight = std::uint64_t{0},
-         settled_ticks = 0,
          elapsed_s = 0.0,
          deadline_s = 0.0,
          stopping = false,
@@ -926,7 +923,6 @@ private:
             std::lock_guard<std::mutex> lk(target_mutex_);
             ref = target_q_;
             goal_in_flight = std::exchange(target_goal_id_, 0);
-            settled_ticks = 0;
             elapsed_s = 0.0;
             deadline_s = std::exchange(target_deadline_s_, 0.0);
             has_target_.store(false);
@@ -939,17 +935,13 @@ private:
             Kx = Eigen::Map<const Vector6d>(new_gains_.kx.data());
             Kxd = Eigen::Map<const Vector6d>(new_gains_.kxd.data());
             has_new_gains_.store(false);
-            // The hold so far was observed under the old gains, which no longer control the arm.
-            // Keeping it would let a move report REACHED before the new ones have held it for a
-            // single tick. The deadline is the caller's and keeps running.
-            settled_ticks = 0;
           }
 
           // The position loop's arrival rule with nothing shaping the reference: it stepped away
           // from the arm on arrival, so this cannot pass until the spring has pulled the joints in.
           if (goal_in_flight != 0) {
             const Arrival outcome =
-                arrival_(ref, q, dq, /*travelling=*/false, period.toSec(), deadline_s, settled_ticks, elapsed_s);
+                arrival_(ref, q, dq, /*travelling=*/false, period.toSec(), deadline_s, elapsed_s);
             if (settle_on_arrival_(goal_in_flight, outcome)) {
               goal_in_flight = 0;
               // As above: hold position rather than keep pulling toward a target already reported
@@ -1028,12 +1020,11 @@ private:
 
   enum class Arrival { InFlight, Reached, Stalled };
 
-  // The one criterion both control loops share, so REACHED means the same thing in either mode.
-  // Reached is measured — every joint inside the tolerance band and at rest, held long enough that a
-  // turning point cannot pass for rest. Stalled is the caller's deadline; nothing here infers a
-  // timescale from the arm. An arm held short by contact is stalled, never reached.
+  // The one criterion both control loops share, so REACHED means the same thing in either mode:
+  // every joint inside the tolerance band and no longer moving. Stalled is the caller's deadline;
+  // nothing here infers a timescale from the arm. An arm held short by contact is stalled.
   static Arrival arrival_(const Vector7d& ref, const Vector7d& q, const Vector7d& dq, bool travelling,
-                          double dt, double deadline_s, int& settled_ticks, double& elapsed_s) {
+                          double dt, double deadline_s, double& elapsed_s) {
     // Seconds accumulated from the callback's own period, not a tick count: a callback is only
     // nominally 1 ms, so counting invocations under-measures real time under bad scheduling.
     elapsed_s += dt;
@@ -1042,12 +1033,10 @@ private:
     // yet, only the deadline runs.
     if (travelling) return Arrival::InFlight;
 
-    if ((ref - q).cwiseAbs().maxCoeff() < SETTLE_POSITION_TOLERANCE &&
-        dq.cwiseAbs().maxCoeff() < SETTLE_VELOCITY_TOLERANCE) {
-      return ++settled_ticks >= SETTLE_HOLD_TICKS ? Arrival::Reached : Arrival::InFlight;
-    }
-    settled_ticks = 0;
-    return Arrival::InFlight;
+    return (ref - q).cwiseAbs().maxCoeff() < SETTLE_POSITION_TOLERANCE &&
+                   dq.cwiseAbs().maxCoeff() < SETTLE_VELOCITY_TOLERANCE
+               ? Arrival::Reached
+               : Arrival::InFlight;
   }
 
   // Apply that outcome to the goal `id` names. Returns true once the move is over, so the caller

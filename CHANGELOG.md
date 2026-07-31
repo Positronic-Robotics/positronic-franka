@@ -4,7 +4,7 @@
 
 ### Added
 - `set_target_joints(q_target, deadline_s=15.0)` — the deadline bounding the move; the goal ABORTS if the arm has not settled by then. An argument, not a constant: reach, gains and payload decide what is reasonable, and only the caller knows them.
-- `goal()` — the joint move in flight, read without blocking: `GoalStatus.IN_FLIGHT / REACHED / ABORTED`, with `Goal.reason` for an aborted one. `REACHED` means the arm settled at the commanded reference (within tolerance, not moving), the same criterion in both control modes.
+- `goal()` — the joint move in flight, read without blocking: `GoalStatus.IN_FLIGHT / REACHED / ABORTED`, with `Goal.reason` for an aborted one. `REACHED` means the arm is inside the tolerance band of the commanded reference and no longer moving, the same criterion in both control modes. It is a report, not a latch: the loop goes on driving that target until a new one arrives. It is also never taken back, so an arm whose resting point is offset by load or friction can dip into the band at near-zero speed and report REACHED once while settling outside it.
 
 ### Changed
 - **Breaking.** `set_target_joints(q_target)` no longer takes `asynchronous`, and never blocks. Waiting is the caller's, as a loop that polls `goal()`. Blocking inside the library stops the caller's own loop from clearing robot errors, so a reflex mid-move goes uncleared and the move never finishes. For the old synchronous behaviour, poll `goal()` until it leaves `IN_FLIGHT` and raise on `ABORTED`.
@@ -19,7 +19,6 @@
 - A control loop that dies now reports *why*: the goal carries libfranka's own text (`Move command aborted: motion aborted by reflex! ["cartesian_reflex"]`) instead of the generic "control loop stopped before the joint target was reached". Previously the exception was printed in the dying thread and discarded, leaving the caller to infer the cause from `state()` — which may already have recovered. The stderr line stays as a second record.
 - A motion command issued while the robot holds an error no longer starts a control thread that libfranka rejects on its first tick (`command not possible in the current mode ("Reflex")`). The move settles ABORTED naming the robot's error. Clearing it stays the caller's decision — a reflex means the arm hit something.
 - A rejected joint target now stops the arm. `TrajectoryGenerator` keeps the previous plan when a replan fails, so the goal reported ABORTED while the arm kept driving toward the superseded target.
-- Handing new `SoftwareImpedance` gains to an in-flight move now restarts the settle hold. The hold accumulated under the old gains, so a move could report REACHED before the new ones had held the arm for a single tick.
 - An older trajectory can no longer settle the goal that replaced it. Each move carries an id, handed to the control loop with its target, and a settle that does not name the move in flight is ignored. Previously a move replaced just as its trajectory ended completed the newly armed goal as `REACHED`.
 
 ## [0.6.2] - 2026-07-26
