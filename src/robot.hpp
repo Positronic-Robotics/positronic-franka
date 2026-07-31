@@ -39,11 +39,14 @@ constexpr std::array<double, 7> PANDA_JOINT_UPPER_LIMITS = {
     2.8973, 1.7628, 2.8973, 3.0718, 2.8973, 3.7525, 2.8973};
 
 // Arrival detection, shared by both control loops: the measured joints are within these tolerances of
-// the commanded reference and no longer moving. The tick cap (1 kHz ticks, so 1 s) bounds how long a
-// caller polling for arrival can be held when the arm holds short of the reference under contact.
+// the commanded reference and no longer moving.
 constexpr double SETTLE_POSITION_TOLERANCE = 0.05;  // rad
 constexpr double SETTLE_VELOCITY_TOLERANCE = 0.05;  // rad/s
-constexpr int SETTLE_TICKS_CAP = 1000;
+// How long the arm may sit AT REST short of the target before the move is given up as stalled (1 kHz
+// ticks, so 1 s). It bounds time spent going nowhere, NOT the move: a long move keeps resetting the
+// count while it is still travelling, so only an arm actually held short — contact, a joint limit —
+// trips it. A stalled move ABORTS; it never reports arrival, because it did not arrive.
+constexpr int STALL_TICKS_CAP = 1000;
 
 // Common Eigen aliases
 using Vector7d = Eigen::Matrix<double, 7, 1>;
@@ -732,7 +735,7 @@ private:
         [&, this,
          first = true,
          goal_in_flight = std::uint64_t{0},
-         settle_ticks = 0,
+         stall_ticks = 0,
          stopping = false](const franka::RobotState& st, franka::Duration period) mutable -> franka::JointPositions {
           {
             std::lock_guard<std::mutex> lk(last_state_mutex_);
@@ -753,7 +756,7 @@ private:
             const bool planned = traj.set_target(target_q_);
             has_target_.store(false);
             goal_in_flight = std::exchange(target_goal_id_, 0);
-            settle_ticks = 0;
+            stall_ticks = 0;
             // A rejected plan must not let the old trajectory finish this goal as if reached.
             if (!planned) {
               fail_goal_(goal_in_flight, "joint target rejected by the trajectory planner");
@@ -773,9 +776,10 @@ private:
           // an ungated check would report REACHED on the first tick of every move. A stepped
           // reference starts far from the arm, so the same check is safe unguarded there.
           if (goal_in_flight != 0 && !traj.active() &&
-              settled_(Eigen::Map<const Vector7d>(pos.data()), Eigen::Map<const Vector7d>(st.q.data()),
-                       Eigen::Map<const Vector7d>(st.dq.data()), ++settle_ticks)) {
-            complete_goal_(goal_in_flight);
+              settle_on_arrival_(goal_in_flight,
+                                 arrival_(Eigen::Map<const Vector7d>(pos.data()),
+                                          Eigen::Map<const Vector7d>(st.q.data()),
+                                          Eigen::Map<const Vector7d>(st.dq.data()), stall_ticks))) {
             goal_in_flight = 0;
           }
 
@@ -813,7 +817,7 @@ private:
         [&, this,
          first = true,
          goal_in_flight = std::uint64_t{0},
-         settle_ticks = 0,
+         stall_ticks = 0,
          stopping = false,
          stop_ticks = 0,
          ref = Vector7d(Vector7d::Zero())](const franka::RobotState& st,
@@ -838,7 +842,7 @@ private:
             std::lock_guard<std::mutex> lk(target_mutex_);
             ref = target_q_;
             goal_in_flight = std::exchange(target_goal_id_, 0);
-            settle_ticks = 0;
+            stall_ticks = 0;
             has_target_.store(false);
           }
 
@@ -854,8 +858,7 @@ private:
           // The same arrival rule the position loop uses. No gate on a trajectory is needed: the
           // reference stepped away from the arm when the target arrived, so the check cannot pass
           // until the spring has actually pulled the joints in.
-          if (goal_in_flight != 0 && settled_(ref, q, dq, ++settle_ticks)) {
-            complete_goal_(goal_in_flight);
+          if (goal_in_flight != 0 && settle_on_arrival_(goal_in_flight, arrival_(ref, q, dq, stall_ticks))) {
             goal_in_flight = 0;
           }
 
@@ -977,6 +980,17 @@ private:
       target_goal_id_ = goal_id;
       has_target_.store(true);
     }
+    // The loop can exit between the `control_running_` read above and this publish: its
+    // `finish_control_thread_` then settles whatever goal was in flight BEFORE this one was armed,
+    // and the target just published belongs to a thread that is gone — leaving `goal()` IN_FLIGHT
+    // with nothing left that could ever settle it. Re-read after publishing and abort the goal
+    // ourselves. `control_running_` only goes false when a loop ends and only back to true when a
+    // caller starts one (callers are serialized), so a false read here is final, not a race.
+    // `settle_goal_` ignores a goal already settled, so a `finish_control_thread_` landing in
+    // between wins with its own, better reason.
+    if (!control_running_.load()) {
+      fail_goal_(goal_id, "the control loop stopped before it took up the target");
+    }
   }
 
   // Arm a move and return the id that names it. Every move gets its own id, so an outcome reported by
@@ -1013,14 +1027,37 @@ private:
     settle_goal_(id, status, std::move(reason));
   }
 
-  // Has the arm arrived? The one arrival criterion, shared by both control loops so a caller reads
-  // REACHED the same way whatever mode the arm is in: the measured joints are at the commanded
-  // reference and no longer moving. `ticks` caps the wait — under sustained contact the arm can
-  // hold short of the reference forever, and a caller polling for arrival must not be hung by it.
-  static bool settled_(const Vector7d& ref, const Vector7d& q, const Vector7d& dq, int ticks) {
-    const bool close = (ref - q).cwiseAbs().maxCoeff() < SETTLE_POSITION_TOLERANCE &&
-                       dq.cwiseAbs().maxCoeff() < SETTLE_VELOCITY_TOLERANCE;
-    return close || ticks >= SETTLE_TICKS_CAP;
+  // How the move in flight is doing, by the one criterion both control loops share so a caller reads
+  // REACHED the same way whatever mode the arm is in.
+  //
+  // REACHED requires actual arrival — at the commanded reference and no longer moving. A move that
+  // runs out of patience is STALLED, never REACHED: an arm held short by contact has not arrived,
+  // and telling a poller it has lets an experiment advance on a robot that is nowhere near its
+  // target. `stall_ticks` counts only ticks spent AT REST short of the reference, so a long move
+  // resets it while it is still travelling and is never mistaken for a stalled one.
+  enum class Arrival { InFlight, Reached, Stalled };
+
+  static Arrival arrival_(const Vector7d& ref, const Vector7d& q, const Vector7d& dq, int& stall_ticks) {
+    const bool still = dq.cwiseAbs().maxCoeff() < SETTLE_VELOCITY_TOLERANCE;
+    if (still && (ref - q).cwiseAbs().maxCoeff() < SETTLE_POSITION_TOLERANCE) return Arrival::Reached;
+    stall_ticks = still ? stall_ticks + 1 : 0;
+    return stall_ticks >= STALL_TICKS_CAP ? Arrival::Stalled : Arrival::InFlight;
+  }
+
+  // Apply that outcome to the goal `id` names. Returns true once the move is over, so the caller
+  // clears its in-flight id.
+  bool settle_on_arrival_(std::uint64_t id, Arrival a) {
+    switch (a) {
+      case Arrival::Reached:
+        complete_goal_(id);
+        return true;
+      case Arrival::Stalled:
+        fail_goal_(id, "the arm stopped short of the target and stayed there");
+        return true;
+      case Arrival::InFlight:
+        return false;
+    }
+    return false;
   }
 
   void complete_goal_(std::uint64_t id) { settle_goal_(id, GoalStatus::REACHED); }
