@@ -53,6 +53,12 @@ constexpr int STALL_TICKS_CAP = 1000;
 // convergence — a move creeping at a tenth of the rest threshold still closes 500x this in a second —
 // and far above the noise on a joint encoder, so it separates "converging slowly" from "not moving".
 constexpr double STALL_PROGRESS_EPSILON = 1e-4;  // rad
+// The whole move's deadline, whatever it is doing. The progress rule alone bounds a move only at
+// `distance / STALL_PROGRESS_EPSILON` seconds — 1 rad of travel buys ~9500 resets, so an arm making
+// microscopic progress could hold a caller for hours. This is the backstop: generous next to any real
+// move (the impedance spring settles in seconds, a full-range Ruckig move at 0.2 dynamics in ~10),
+// so it never cuts a legitimate one short, and it turns the worst case from hours into a minute.
+constexpr int MOVE_TICKS_CAP = 60000;  // 1 kHz ticks — 60 s
 
 // Common Eigen aliases
 using Vector7d = Eigen::Matrix<double, 7, 1>;
@@ -830,6 +836,7 @@ private:
          first = true,
          goal_in_flight = std::uint64_t{0},
          stall_ticks = 0,
+         move_ticks = 0,
          best_err = std::numeric_limits<double>::infinity(),
          stopping = false](const franka::RobotState& st, franka::Duration period) mutable -> franka::JointPositions {
           {
@@ -852,6 +859,7 @@ private:
             has_target_.store(false);
             goal_in_flight = std::exchange(target_goal_id_, 0);
             stall_ticks = 0;
+            move_ticks = 0;
             best_err = std::numeric_limits<double>::infinity();
             // A rejected plan must not let the old trajectory finish this goal as if reached.
             if (!planned) {
@@ -875,7 +883,8 @@ private:
               settle_on_arrival_(goal_in_flight,
                                  arrival_(Eigen::Map<const Vector7d>(pos.data()),
                                           Eigen::Map<const Vector7d>(st.q.data()),
-                                          Eigen::Map<const Vector7d>(st.dq.data()), best_err, stall_ticks))) {
+                                          Eigen::Map<const Vector7d>(st.dq.data()), best_err, stall_ticks,
+                                          move_ticks))) {
             goal_in_flight = 0;
           }
 
@@ -914,6 +923,7 @@ private:
          first = true,
          goal_in_flight = std::uint64_t{0},
          stall_ticks = 0,
+         move_ticks = 0,
          best_err = std::numeric_limits<double>::infinity(),
          stopping = false,
          stop_ticks = 0,
@@ -940,6 +950,7 @@ private:
             ref = target_q_;
             goal_in_flight = std::exchange(target_goal_id_, 0);
             stall_ticks = 0;
+            move_ticks = 0;
             best_err = std::numeric_limits<double>::infinity();
             has_target_.store(false);
           }
@@ -956,7 +967,8 @@ private:
           // The same arrival rule the position loop uses. No gate on a trajectory is needed: the
           // reference stepped away from the arm when the target arrived, so the check cannot pass
           // until the spring has actually pulled the joints in.
-          if (goal_in_flight != 0 && settle_on_arrival_(goal_in_flight, arrival_(ref, q, dq, best_err, stall_ticks))) {
+          if (goal_in_flight != 0 &&
+              settle_on_arrival_(goal_in_flight, arrival_(ref, q, dq, best_err, stall_ticks, move_ticks))) {
             goal_in_flight = 0;
           }
 
@@ -1046,10 +1058,15 @@ private:
   // still genuinely closing — judging by velocity alone would reject that legitimate slow move. So
   // the count advances only while the smallest error yet seen for this move stops improving, which
   // an arm held against something does and a converging one does not.
+  //
+  // Two guards, because that one bounds a move only at `distance / STALL_PROGRESS_EPSILON` seconds:
+  // an arm creeping by a hair every second resets the count indefinitely. `move_ticks` is the flat
+  // deadline on the move as a whole, and the pair covers both shapes — held fast (1 s) and never
+  // quite finishing (60 s).
   enum class Arrival { InFlight, Reached, Stalled };
 
   static Arrival arrival_(const Vector7d& ref, const Vector7d& q, const Vector7d& dq, double& best_err,
-                          int& stall_ticks) {
+                          int& stall_ticks, int& move_ticks) {
     const double err = (ref - q).cwiseAbs().maxCoeff();
     if (err < SETTLE_POSITION_TOLERANCE && dq.cwiseAbs().maxCoeff() < SETTLE_VELOCITY_TOLERANCE) {
       return Arrival::Reached;
@@ -1060,7 +1077,8 @@ private:
     } else {
       ++stall_ticks;
     }
-    return stall_ticks >= STALL_TICKS_CAP ? Arrival::Stalled : Arrival::InFlight;
+    return (stall_ticks >= STALL_TICKS_CAP || ++move_ticks >= MOVE_TICKS_CAP) ? Arrival::Stalled
+                                                                             : Arrival::InFlight;
   }
 
   // Apply that outcome to the goal `id` names. Returns true once the move is over, so the caller
@@ -1071,7 +1089,7 @@ private:
         complete_goal_(id);
         return true;
       case Arrival::Stalled:
-        fail_goal_(id, "the arm stopped short of the target and stayed there");
+        fail_goal_(id, "the arm did not reach the target: it stopped short, or ran out of time trying");
         return true;
       case Arrival::InFlight:
         return false;
