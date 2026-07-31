@@ -28,11 +28,9 @@ PYBIND11_MODULE(_franka, m) {
   py::class_<positronic_franka::SoftwareImpedance>(m, "SoftwareImpedance",
       "Software impedance law on the torque interface (polymetis HybridJointImpedanceControl): "
       "tau = (J^T Kx J + Kq)(q_d - q) - (J^T Kxd J + Kqd) dq + coriolis. Every target steps the "
-      "reference instantly and the law pulls the arm in, which is DROID's execution semantics. "
-      "Constructed with no arguments it carries "
-      "the gains DROID's polymetis deployment uses; otherwise all four must be passed together, and "
-      "each half (joint kq/kqd, Cartesian kx/kxd) is either all zero — disabled — or strictly positive, "
-      "with at least one half active.")
+      "reference instantly and the law pulls the arm in. Default gains are polymetis'. Otherwise "
+      "all four are passed together, and each half (joint kq/kqd, Cartesian kx/kxd) is either all "
+      "zero — disabled — or strictly positive, with at least one half active.")
       .def(py::init<>())
       .def(py::init<const std::array<double, 7>&, const std::array<double, 7>&,
                     const std::array<double, 6>&, const std::array<double, 6>&>(),
@@ -44,26 +42,25 @@ PYBIND11_MODULE(_franka, m) {
       .def(py::self == py::self);
 
   py::enum_<positronic_franka::GoalStatus>(m, "GoalStatus",
-      "How the joint move now in flight is going. Every set_target_joints starts one; a newer "
-      "target replaces an older one, and only the move in flight has a status")
+      "The joint move in flight. Every set_target_joints starts one; a newer target replaces an "
+      "older one, and only the move in flight has a status")
       .value("NONE", positronic_franka::GoalStatus::NONE, "No move has been commanded yet")
       .value("IN_FLIGHT", positronic_franka::GoalStatus::IN_FLIGHT, "Commanded, not finished")
       .value("REACHED", positronic_franka::GoalStatus::REACHED,
-             "The arm settled at the commanded target (within tolerance, and no longer moving)")
+             "The arm settled at the target — within tolerance and no longer moving")
       .value("ABORTED", positronic_franka::GoalStatus::ABORTED,
              "Stopped short — reflex, rejected plan, lost connection; see Goal.reason");
 
   py::class_<positronic_franka::Goal>(m, "Goal")
-      // Constructible so a caller's tests can stand one in; the driver is the only thing that
-      // produces a real one.
+      // Constructible so tests can stand one in; only the driver produces a real one.
       .def(py::init([](positronic_franka::GoalStatus status, std::string reason) {
              return positronic_franka::Goal{status, std::move(reason)};
            }),
            py::arg("status") = positronic_franka::GoalStatus::NONE, py::arg("reason") = "")
       .def_readonly("status", &positronic_franka::Goal::status)
       .def_readonly("reason", &positronic_franka::Goal::reason,
-                    "Why the move stopped short, in libfranka's own words where it had any; "
-                    "empty unless status is ABORTED")
+                    "Why the move stopped short, in libfranka's own words where it had any; empty "
+                    "unless ABORTED")
       .def("__repr__", [](const positronic_franka::Goal& g) {
         const std::string status = py::str(py::cast(g.status));
         return g.reason.empty() ? "<Goal " + status + ">" : "<Goal " + status + ": " + g.reason + ">";
@@ -180,13 +177,10 @@ PYBIND11_MODULE(_franka, m) {
       .def("set_target_joints", &positronic_franka::Robot::set_target_joints,
            py::arg("q_target"), py::arg("deadline_s") = positronic_franka::DEFAULT_MOVE_DEADLINE_S,
            "Command a joint move to target (7,) and return immediately; poll goal() for the outcome. "
-           "deadline_s bounds the move: the goal ABORTS if the arm has not settled at the target by "
-           "then. Pass your own where the move needs longer or shorter than the default — reach, "
-           "gains and payload decide that, and the caller is who knows them. "
-           "Never blocks: a caller whose own loop clears robot errors cannot wait inside the library, "
-           "or a reflex fired mid-move is never cleared and the move never ends. How the arm gets "
-           "there is the control mode's business (InternalImpedance shapes a Ruckig trajectory, "
-           "SoftwareImpedance steps the reference), but both report the same way")
+           "Never blocks — waiting inside the library would stop the caller's own loop from clearing "
+           "robot errors, so a reflex mid-move would never be cleared. deadline_s bounds the move: "
+           "the goal ABORTS if the arm has not settled by then; pass your own where reach, gains or "
+           "payload make the default wrong")
       .def("goal", &positronic_franka::Robot::goal,
            "How the move in flight is going, without blocking: Goal(status, reason)")
       .def_property_readonly("relative_dynamics_factor",

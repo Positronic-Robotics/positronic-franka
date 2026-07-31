@@ -39,31 +39,17 @@ constexpr std::array<double, 7> PANDA_JOINT_LOWER_LIMITS = {
 constexpr std::array<double, 7> PANDA_JOINT_UPPER_LIMITS = {
     2.8973, 1.7628, 2.8973, 3.0718, 2.8973, 3.7525, 2.8973};
 
-// Arrival: the measured joints are within these tolerances of the commanded reference and no longer
-// moving. Held for SETTLE_HOLD_TICKS rather than judged on one reading, because velocity passes
-// through zero at every turning point of an oscillation — an arm still swinging inside the band
-// satisfies both tests for an instant on each swing, and a settled one satisfies them indefinitely.
+// Arrival: joints within tolerance of the reference and not moving, held for SETTLE_HOLD_TICKS.
+// The hold is needed because velocity passes through zero at every turning point of an oscillation.
 //
-// KNOWN LIMITATION, accepted deliberately: all three are fixed, and soft enough `SoftwareImpedance`
-// gains can defeat them. A slow, large oscillation has low velocity everywhere, not only at its
-// turning points, so a joint can sit inside both tolerances for longer than the hold while still
-// crossing the target — reporting REACHED to a caller whose arm is still swinging. The deadline does
-// not cover this: it bounds a move that never arrives, and this is a false arrival.
-//
-// A fixed hold cannot be made safe by lengthening it, and deriving one from the gains means
-// reconstructing the plant inside the control loop, which was tried and removed. The fix, if this
-// ever bites, is to let the caller pass the tolerances the way it passes the deadline — what counts
-// as arrived is a property of the task, not of the arm. Not done because nothing has hit it: the
-// deployed configuration is `InternalImpedance`, whose stiff internal controller does not produce
-// oscillations this slow. Tracked with the rest of this work in internal#162.
+// KNOWN LIMITATION: fixed tolerances. Under soft `SoftwareImpedance` gains a slow, large oscillation
+// stays inside both bands for longer than the hold, so a swinging arm reports REACHED. Fix, if it
+// ever bites: let the caller pass tolerances as it passes the deadline. Not hit in practice —
+// deployed config is `InternalImpedance`, too stiff to oscillate that slowly. internal#162.
 constexpr double SETTLE_POSITION_TOLERANCE = 0.05;  // rad
 constexpr double SETTLE_VELOCITY_TOLERANCE = 0.05;  // rad/s
 constexpr int SETTLE_HOLD_TICKS = 100;              // 1 kHz ticks — 0.1 s
-// How long a move may run before it is given up as failed, when the caller names no deadline of its
-// own. A deadline is the right shape for this and a plant-derived one is not: whether an arm is going
-// to arrive is a question about the move the caller asked for, and only the caller knows what
-// duration is reasonable for it. Fifteen seconds is generous for a joint move on this arm and short
-// enough that a caller waiting on one is not left indefinitely.
+// Deadline used when the caller names none. Generous for a joint move on this arm.
 constexpr double DEFAULT_MOVE_DEADLINE_S = 15.0;
 
 // Common Eigen aliases
@@ -73,10 +59,8 @@ using Matrix7d = Eigen::Matrix<double, 7, 7>;
 using SpatialJacobian = Eigen::Matrix<double, 6, 7>;
 
 // Control modes. InternalImpedance drives the robot's built-in joint impedance controller through the
-// joint position motion generator with Ruckig-shaped references. SoftwareImpedance owns the impedance law
-// itself: it runs the polymetis hybrid joint/Cartesian impedance over the torque interface, with every
-// target applied as an instantly-stepped reference (DROID execution semantics). Defaults are the factory
-// joint stiffness and DROID's polymetis gains respectively.
+// joint position motion generator with Ruckig-shaped references. SoftwareImpedance runs the impedance
+// law here instead, over the torque interface, stepping the reference straight to each target.
 template <size_t N>
 bool all_zero(const std::array<double, N>& v) {
   for (double x : v) {
@@ -112,10 +96,8 @@ struct InternalImpedance {
   }
 };
 
-// Gain defaults are the metadata defaults of DROID's polymetis deployment — fairo
-// polymetis/conf/robot_client/franka_hardware.yaml, loaded by DROID's `launch_robot.py
-// robot_client=franka_hardware` — i.e. the exact configuration HybridJointImpedanceControl runs with
-// in the DROID data-collection stack.
+// Gain defaults are copied from fairo polymetis/conf/robot_client/franka_hardware.yaml, the
+// configuration HybridJointImpedanceControl runs with in the DROID data-collection stack.
 struct SoftwareImpedance {
   std::array<double, 7> kq{40.0, 30.0, 50.0, 25.0, 35.0, 25.0, 10.0};
   std::array<double, 7> kqd{4.0, 6.0, 5.0, 5.0, 3.0, 2.0, 1.0};
@@ -144,16 +126,10 @@ inline bool operator==(const SoftwareImpedance& a, const SoftwareImpedance& b) {
 
 using ControlMode = std::variant<InternalImpedance, SoftwareImpedance>;
 
-// How the joint move now in flight is going. Every `set_target_joints` starts one.
-//
-// Pollable, never blocking, because a caller whose own loop is the thing that clears robot errors
-// cannot afford to wait inside the library: a reflex firing during a blocking move is seen by
-// nobody, so it is never cleared and the move never ends. Waiting is the caller's to write, in a
-// loop that keeps doing its other work.
-//
-// A newer target simply replaces an older one — the arm goes where the caller last asked. The
-// replaced move is not reported: only the move in flight has a status, so a caller that cares about
-// arrival sends one target and waits for it.
+// How the joint move now in flight is going. Every `set_target_joints` starts one; a newer target
+// replaces an older one, and only the move in flight has a status — the replaced one is never
+// reported. Polled, never blocking: a caller that blocks inside the library stops running the loop
+// that clears robot errors, so a reflex mid-move goes uncleared and the move never ends.
 enum class GoalStatus {
   // No move has been commanded yet on this Robot.
   NONE,
@@ -190,10 +166,8 @@ struct State {
   Vector6d end_effector_wrench = Vector6d::Zero();
 };
 
-// Smooth trajectory generator that tracks real elapsed time.
-// Uses Ruckig for trajectory computation but evaluates positions at actual
-// wall-clock offsets (from libfranka's period) rather than fixed 1ms steps.
-// This prevents velocity/acceleration discontinuity errors under non-RT scheduling.
+// Ruckig trajectory generator evaluated at libfranka's actual period rather than fixed 1 ms steps,
+// which would produce velocity/acceleration discontinuities under non-RT scheduling.
 class TrajectoryGenerator {
  public:
   static constexpr double NOMINAL_DT = 1.0 / 1000.0;
@@ -265,15 +239,13 @@ class TrajectoryGenerator {
   bool active() const { return active_; }
 
   // How long the planned trajectory runs, in seconds. The move deadline adds it to the settle
-  // budget: a slow `relative_dynamics_factor` (down to 0.0001) can make a full-range move take
-  // hours, and a flat deadline would abort it long before the plan it was given had finished.
+  // budget, so a slow `relative_dynamics_factor` (down to 0.0001) is not cut off by a flat constant.
   double duration() const { return duration_; }
 
  private:
   bool replan_() {
-    // Calculate into a scratch trajectory and swap only on success: a failed calculate must not leave a
-    // default-constructed/stale trajectory in place — evaluating one feeds garbage (NaN) into libfranka
-    // and kills the control thread. On failure the previous plan keeps playing.
+    // Swap only on success: evaluating a default-constructed trajectory feeds NaN into libfranka and
+    // kills the control thread. On failure the previous plan keeps playing.
     ruckig::Trajectory<7> next;
     auto result = otg_.calculate(input_, next);
     if (result < 0) {
@@ -342,11 +314,10 @@ class Robot {
     return st;
   }
 
-  // Apply a control mode with the least interruption the change allows: an equal mode is a no-op; a
-  // gains-only SoftwareImpedance change is handed to the running torque loop without interrupting motion;
-  // any other change stops the control loop (clearing the pending target) and the next motion command
-  // starts the matching loop. k_theta is pushed to the robot (the internal controller reads robot-side
-  // config); software gains live purely in the torque loop.
+  // Apply a mode with the least interruption it allows: an equal mode is a no-op; a gains-only
+  // SoftwareImpedance change reaches the running torque loop without stopping motion; anything else
+  // stops the loop (clearing the pending target) and the next command starts the matching one.
+  // k_theta is pushed to the robot; software gains live only in the torque loop.
   void set_control_mode(const ControlMode& mode) {
     if (mode == control_mode_) return;
     apply_control_mode_(mode);
@@ -362,28 +333,20 @@ class Robot {
 
   // Command a joint move and return immediately. Poll `goal()` for IN_FLIGHT / REACHED / ABORTED.
   //
-  // One behaviour, whatever the control mode and whoever is calling: publish the target, arm the
-  // goal, return. How the arm gets there is the mode's business — `InternalImpedance` shapes a
-  // Ruckig trajectory, `SoftwareImpedance` steps the reference and lets the impedance law pull the
-  // arm in (DROID execution semantics) — but both report the same way, and neither waits.
+  // Starts the control loop if it is not running, then publishes the target to it. Both control
+  // modes report the same way; how the arm gets there is the mode's business.
   //
-  // `deadline_s` bounds the move: it ABORTS if the arm has not settled at the target by then. It is
-  // an argument rather than a constant because whether a move is going to arrive is a property of
-  // the move being asked for — reach, gains, payload — and the caller is the only party that knows
-  // what is reasonable for the one it just commanded.
+  // `deadline_s` bounds the move: it ABORTS if the arm has not settled by then. An argument, not a
+  // constant, because reach, gains and payload decide what is reasonable and only the caller knows
+  // them.
   void set_target_joints(const Eigen::Ref<const Vector7d>& q_target,
                          double deadline_s = DEFAULT_MOVE_DEADLINE_S) {
-  // Start the control loop if it is not running, then publish `q_target` to it. Every target arms
-  // the goal, so the move reports IN_FLIGHT until the loop settles it — one path, because a target's
-  // treatment must not depend on whether anyone happens to be watching it.
-    // Reject garbage before it reaches a control loop: a torque-mode target becomes the reference
-    // verbatim, so a NaN here would become NaN torques.
+    // A torque-mode target becomes the reference verbatim, so a NaN here would become NaN torques.
     if (!q_target.allFinite()) {
       throw std::invalid_argument("q_target must be finite");
     }
-    // A deadline that cannot expire is not a deadline: NaN makes every comparison against it false
-    // and infinity never arrives, so either would leave a move that never settles IN_FLIGHT for good
-    // while this API promises it is bounded. Zero or negative would abort on the first callback.
+    // NaN fails every comparison and infinity never arrives, so either would leave a stuck move
+    // IN_FLIGHT for good; zero or negative would abort on the first callback.
     if (!std::isfinite(deadline_s) || deadline_s <= 0.0) {
       throw std::invalid_argument("deadline_s must be finite and strictly positive");
     }
@@ -392,20 +355,15 @@ class Robot {
       if (control_thread_.joinable()) {
         control_thread_.join();
       }
-      // Arm here, after the join and before the launch below, and the goal has exactly one loop that
-      // can settle it. Arming any later would leave a window where the loop dies before the goal
-      // exists: the abort finds nothing in flight and is dropped, and the goal armed afterwards then
-      // belongs to a dead thread, so a poller waits on a move nothing will ever settle. Arming any
-      // earlier would expose it to the loop being replaced — the join is what guarantees that one has
-      // finished settling, so it cannot abort the move its successor is about to run.
+      // Arm between the join and the launch, so exactly one loop can settle this goal. Later, and a
+      // loop dying before the goal exists leaves it armed on a dead thread, IN_FLIGHT forever.
+      // Earlier, and the outgoing loop can abort the move its successor is about to run.
       goal_id = arm_goal_();
-      // Starting a loop issues a Move command, and the robot refuses one while it holds an error
-      // ("command not possible in the current mode"), so the fresh thread would die on its first tick.
-      // Report the robot's own error instead of spawning it. Clearing is the caller's call, not this
-      // library's: a reflex means the arm hit something, and only the caller knows whether resuming is
-      // safe — the goal aborts with the robot's own text so the caller sees why.
-      // Best effort: if the state read itself fails, fall through and let the loop report whatever is
-      // wrong, rather than turning a guard into a new failure mode.
+      // Starting a loop issues a Move command, which the robot refuses while it holds an error
+      // ("command not possible in the current mode"), so the fresh thread would die on its first
+      // tick. Report the robot's own error instead. Clearing is the caller's call: a reflex means
+      // the arm hit something, and only the caller knows whether resuming is safe.
+      // Best effort — if the state read itself fails, let the loop report what is wrong.
       std::string robot_errors;
       try {
         if (const auto errors = read_robot_state_().current_errors; static_cast<bool>(errors)) {
@@ -418,9 +376,8 @@ class Robot {
         return;
       }
       stop_requested_.store(false);
-      // A target or sync request stranded by a dead loop must not feed the replacement loop's first
-      // ticks — those can run before this command publishes its own target below. Anything queued here
-      // is stale: no loop consumed it, and the caller's publish comes after (callers are serialized).
+      // Drop anything a dead loop left queued — no loop consumed it, and this call's own publish
+      // comes below, so the replacement loop's first ticks must not see the stale target.
       has_target_.store(false);
       {
         std::lock_guard<std::mutex> lk(target_mutex_);
@@ -445,29 +402,23 @@ class Robot {
         throw;
       }
     } else {
-      // The loop is ALREADY running, which is every move after the first. There is no join to order
-      // against here: the loop that will consume this target is the one already running, so arming
-      // immediately before publishing is the whole requirement. If that loop dies in the window,
-      // `finish_control_thread_` settles the goal armed here as ABORTED with the loop's own reason.
+      // Loop already running (every move after the first): no join to order against, so arming
+      // immediately before the publish below is enough. If it dies in the window,
+      // `finish_control_thread_` aborts this goal with the loop's own reason.
       goal_id = arm_goal_();
     }
     {
       std::lock_guard<std::mutex> lk(target_mutex_);
       target_q_ = q_target;
       target_goal_id_ = goal_id;
-      // Carried with the target rather than read by the loop, so the deadline that applies is the
-      // one this call named — a later call with a different deadline cannot retroactively change it.
+      // Carried with the target, so a later call cannot retroactively change this move's deadline.
       target_deadline_s_ = deadline_s;
       has_target_.store(true);
     }
-    // The loop can exit between the `control_running_` read above and this publish: its
-    // `finish_control_thread_` then settles whatever goal was in flight BEFORE this one was armed,
-    // and the target just published belongs to a thread that is gone — leaving `goal()` IN_FLIGHT
-    // with nothing left that could ever settle it. Re-read after publishing and abort the goal
-    // ourselves. `control_running_` only goes false when a loop ends and only back to true when a
-    // caller starts one (callers are serialized), so a false read here is final, not a race.
-    // `settle_goal_` ignores a goal already settled, so a `finish_control_thread_` landing in
-    // between wins with its own, better reason.
+    // The loop can exit between the `control_running_` read above and this publish, leaving the goal
+    // IN_FLIGHT with nothing left to settle it — so re-read and abort it here. A false read is final
+    // (callers are serialized), and `settle_goal_` ignores an already-settled goal, so a
+    // `finish_control_thread_` landing in between wins with its own, better reason.
     if (!control_running_.load()) {
       fail_goal_(goal_id, "the control loop stopped before it took up the target");
     }
@@ -490,9 +441,8 @@ class Robot {
     return pose;
   }
 
-  // Model terms at explicit joint values, using the connected robot's current frames and load
-  // configuration. These mirror the exact terms the SoftwareImpedance loop uses, so logged traces can
-  // be validated offline against the implemented law.
+  // Model terms at explicit joint values, with the robot's current frames and load. The same terms
+  // the SoftwareImpedance loop uses, so logged traces can be checked offline against the law.
   SpatialJacobian zero_jacobian(const Eigen::Ref<const Vector7d>& q) {
     franka::RobotState st = read_robot_state_();
     st.q = to_std_array7_(q);
@@ -886,9 +836,8 @@ private:
             goal_in_flight = std::exchange(target_goal_id_, 0);
             settled_ticks = 0;
             elapsed_s = 0.0;
-            // The deadline is the plan's own duration plus the settle budget, so a deliberately slow
-            // `relative_dynamics_factor` gets the time it asked for rather than being cut off by a
-            // flat constant — while a move that overruns its own plan by a minute still ends.
+            // Plan duration plus the settle budget, so a slow `relative_dynamics_factor` gets the
+            // time it asked for while a move that overruns its own plan still ends.
             deadline_s = std::exchange(target_deadline_s_, 0.0);
             // A rejected plan must not let the old trajectory finish this goal as if reached.
             if (!planned) {
@@ -899,15 +848,11 @@ private:
 
           auto pos = traj.step(period);
 
-          // Arrival is PHYSICAL and the criterion is the same in both control modes: the arm is at
-          // the commanded reference and no longer moving. An exhausted reference is not arrival —
-          // the internal controller tracks closely but not exactly, and the torque loop has no
-          // trajectory to exhaust at all.
-          //
-          // `traj.active()` is passed rather than gating the call: while the reference is still being
-          // shaped there is no arrival to test — a Ruckig move STARTS with the reference at the arm
-          // and the arm at rest, so an ungated check would report REACHED on the first tick — but the
-          // deadline must keep running through that phase or it does not bound the move.
+          // Arrival is physical — at the reference and not moving — not an exhausted trajectory,
+          // which the internal controller only tracks approximately. `traj.active()` is passed
+          // rather than gating the call: there is no arrival to test while the reference is still
+          // being shaped (a Ruckig move starts with both at rest, which would read as REACHED on
+          // tick one), but the deadline must keep running through that phase.
           if (goal_in_flight != 0) {
             const Arrival outcome = arrival_(Eigen::Map<const Vector7d>(pos.data()),
                                              Eigen::Map<const Vector7d>(st.q.data()),
@@ -915,9 +860,8 @@ private:
                                              period.toSec(), deadline_s, settled_ticks, elapsed_s);
             if (settle_on_arrival_(goal_in_flight, outcome)) {
               goal_in_flight = 0;
-              // ABORTED tells the caller the move stopped short, so the arm has to actually stop.
-              // Leaving the trajectory running would keep driving it at the expired target while the
-              // caller acts on having been told the move ended.
+              // ABORTED says the move stopped short, so the arm has to actually stop rather than
+              // keep being driven at the expired target.
               if (outcome == Arrival::Stalled) traj.stop_at_current();
             }
           }
@@ -931,8 +875,7 @@ private:
           return franka::JointPositions(pos);
         });
     } catch (const std::exception& e) {
-      // Printed as well as reported: a streamed target arms no goal, so for those this line is the
-      // only record that the loop died and why.
+      // Printed as well as reported: a streamed target arms no goal, so this is its only record.
       std::cerr << "Joint control thread error: " << e.what() << std::endl;
       thread_error = e.what();
     }
@@ -942,9 +885,8 @@ private:
   // Torque-interface control loop running the polymetis hybrid impedance law:
   //   tau = (J^T Kx J + Kq)(q_d - q) - (J^T Kxd J + Kqd) dq + coriolis
   // Gravity is compensated by libfranka underneath the torque command. Shares the target/stop/goal
-  // machinery with the position loop; only the reference semantics differ: every target steps the
-  // reference q_d instantly and the law pulls the arm in (DROID execution semantics), where the
-  // position loop shapes a Ruckig trajectory.
+  // machinery with the position loop; only the reference differs — every target steps q_d instantly
+  // and the law pulls the arm in, where the position loop shapes a Ruckig trajectory.
   void run_joint_torque_control_(SoftwareImpedance imp) {
     Vector7d Kq = Eigen::Map<const Vector7d>(imp.kq.data());
     Vector7d Kqd = Eigen::Map<const Vector7d>(imp.kqd.data());
@@ -975,10 +917,8 @@ private:
             ref = q;
           }
 
-          // No trajectory here, by design: the reference STEPS to the target and the impedance law
-          // is what moves the arm (DROID execution semantics, which is what this mode exists for).
-          // Shaping it with Ruckig was the old sync path, and having two profiles behind one flag is
-          // what made a target's motion depend on who was waiting for it.
+          // No trajectory here, by design: the reference steps to the target and the impedance law
+          // is what moves the arm. That is what this mode is for.
           if (!stopping && has_target_.load()) {
             std::lock_guard<std::mutex> lk(target_mutex_);
             ref = target_q_;
@@ -996,22 +936,17 @@ private:
             Kx = Eigen::Map<const Vector6d>(new_gains_.kx.data());
             Kxd = Eigen::Map<const Vector6d>(new_gains_.kxd.data());
             has_new_gains_.store(false);
-            // New gains are a new plant, so the timescale the move is being judged on no longer
-            // applies and the samples taken under the old one describe a different system. Re-derive
-            // and restart the observation; softer gains would otherwise have a valid slow
-            // continuation judged against the stiffer controller's window and called stalled.
           }
 
-          // The same arrival rule the position loop uses, with nothing shaping the reference — it
-          // stepped away from the arm when the target arrived, so the check cannot pass until the
-          // spring has actually pulled the joints in, and the deadline is the flat one.
+          // The position loop's arrival rule with nothing shaping the reference: it stepped away
+          // from the arm on arrival, so this cannot pass until the spring has pulled the joints in.
           if (goal_in_flight != 0) {
             const Arrival outcome =
                 arrival_(ref, q, dq, /*travelling=*/false, period.toSec(), deadline_s, settled_ticks, elapsed_s);
             if (settle_on_arrival_(goal_in_flight, outcome)) {
               goal_in_flight = 0;
-              // As above: hold the arm where it is rather than keep pulling it toward a target the
-              // caller has already been told the move failed to reach.
+              // As above: hold position rather than keep pulling toward a target already reported
+              // as not reached.
               if (outcome == Arrival::Stalled) ref = q;
             }
           }
@@ -1047,16 +982,15 @@ private:
         },
         true /* limit_rate */, 100.0 /* cutoff_frequency */);
     } catch (const std::exception& e) {
-      // Printed as well as reported: a streamed target arms no goal, so for those this line is the
-      // only record that the loop died and why.
+      // Printed as well as reported: a streamed target arms no goal, so this is its only record.
       std::cerr << "Torque control thread error: " << e.what() << std::endl;
       thread_error = e.what();
     }
     finish_control_thread_(std::move(thread_error));
   }
 
-  // Arm a move and return the id that names it. Every move gets its own id, so an outcome reported by
-  // whatever was running before can be told apart from the move now in flight.
+  // Arm a move and return the id that names it, so an outcome from whatever ran before can be told
+  // apart from the move now in flight.
   std::uint64_t arm_goal_() {
     std::lock_guard<std::mutex> lk(goal_mutex_);
     goal_status_ = GoalStatus::IN_FLIGHT;
@@ -1064,13 +998,9 @@ private:
     return ++goal_id_;
   }
 
-  // Settle the move `id` names. Two moves are refused: one already settled (a status written over a
-  // finished one would report the wrong outcome to a poller), and one that is no longer the move in
-  // flight — an older trajectory finishing must not report the arrival of the move that replaced it.
-  // Ids start at 1, so 0 names no move and settles nothing.
-  //
-  // The id is never exposed. It exists for this check: a caller sees one status, and what it needs
-  // is for that status to belong to the move it last commanded.
+  // Settle the move `id` names. Refuses one already settled, and one that is no longer in flight —
+  // an older trajectory finishing must not report the arrival of the move that replaced it. Ids
+  // start at 1, so 0 names no move. Never exposed; it exists only for this check.
   void settle_goal_(std::uint64_t id, GoalStatus status, std::string reason = {}) {
     std::lock_guard<std::mutex> lk(goal_mutex_);
     if (goal_status_ != GoalStatus::IN_FLIGHT || goal_id_ != id) return;
@@ -1078,8 +1008,8 @@ private:
     goal_error_ = std::move(reason);
   }
 
-  // Settle whichever move is in flight, for the paths that end every move there is: a dying control
-  // loop and a torn-down one. They cannot name an id — the move they end was armed by someone else.
+  // Settle whichever move is in flight, for the paths that cannot name an id: a dying control loop
+  // and a torn-down one.
   void settle_current_goal_(GoalStatus status, std::string reason = {}) {
     std::uint64_t id = 0;
     {
@@ -1089,50 +1019,20 @@ private:
     settle_goal_(id, status, std::move(reason));
   }
 
-  // How the move in flight is doing, by the one criterion both control loops share so a caller reads
-  // REACHED the same way whatever mode the arm is in.
-  //
-  // REACHED requires actual arrival — at the commanded reference and no longer moving. A move that
-  // runs out of patience is STALLED, never REACHED: an arm held short by contact has not arrived,
-  // and telling a poller it has lets an experiment advance on a robot that is nowhere near its
-  // target.
-  //
-  // Two guards, and each answers a question the other cannot. The WINDOW asks whether anything is
-  // happening at all — an arm pinned against contact is the case it exists for, and it catches that
-  // in a second. The DEADLINE asks whether the move is ever going to end, which no local reading
-  // can: a marginally stable arm oscillates forever while looking busy every window.
-  //
-  // Stalling is deliberately not judged from velocity, nor by comparing one window against another.
-  // Velocity rejects a legitimate slow move — under soft gains every joint can sit below the rest
-  // threshold while the arm is still genuinely closing. Comparing windows breaks on oscillation:
-  // where a boundary falls decides what is compared, so one turning peak can be read as two windows'
-  // worth of no progress, and a move whose error is still rising toward its first turn looks like a
-  // move going backwards. The range within a window has neither problem, because motion is motion
-  // whatever its phase.
-  // How long the arm must be watched before "it stopped moving" carries information: the slowest
-  // natural period of the configured stiffness against the arm's own inertia, T = 2*pi*sqrt(m/k).
-  // Derived per move because both terms are per configuration and per pose — a soft gain set or a
-  // loaded arm oscillates slowly, and a window shorter than its period sees a stationary-looking
-  // slice of ordinary motion. Joints with no stiffness of their own (a Cartesian-only gain set) are
-  // skipped; if that leaves none, there is no joint-space period and the fallback stands in.
   enum class Arrival { InFlight, Reached, Stalled };
 
-  // Two outcomes and one question each. ARRIVED is measured: every joint inside the tolerance band
-  // and no longer moving, held long enough that a turning point cannot be mistaken for rest. FAILED
-  // is the deadline the caller set — because whether a move is going to arrive is a property of the
-  // move that was asked for, and the caller is the only party that knows what duration is reasonable
-  // for it. Nothing here tries to infer that from the arm.
+  // The one criterion both control loops share, so REACHED means the same thing in either mode.
+  // Reached is measured — every joint inside the tolerance band and at rest, held long enough that a
+  // turning point cannot pass for rest. Stalled is the caller's deadline; nothing here infers a
+  // timescale from the arm. An arm held short by contact is stalled, never reached.
   static Arrival arrival_(const Vector7d& ref, const Vector7d& q, const Vector7d& dq, bool travelling,
                           double dt, double deadline_s, int& settled_ticks, double& elapsed_s) {
-    // Elapsed SECONDS, accumulated from the callback's own period, not a count of callbacks. The
-    // deadline is advertised in seconds, and a control callback is only nominally 1 ms — a delayed
-    // one or a skipped packet arrives with a longer period, so counting invocations under-measures
-    // real time and would hold a move past the deadline the caller set, by more the worse the
-    // scheduling gets.
+    // Seconds accumulated from the callback's own period, not a tick count: a callback is only
+    // nominally 1 ms, so counting invocations under-measures real time under bad scheduling.
     elapsed_s += dt;
     if (elapsed_s >= deadline_s) return Arrival::Stalled;
-    // While the reference is still being shaped the arm is meant to be behind it; there is nothing to
-    // test yet, and only the deadline runs.
+    // While the reference is still being shaped the arm is meant to be behind it — nothing to test
+    // yet, only the deadline runs.
     if (travelling) return Arrival::InFlight;
 
     if ((ref - q).cwiseAbs().maxCoeff() < SETTLE_POSITION_TOLERANCE &&
@@ -1166,13 +1066,11 @@ private:
     settle_goal_(id, GoalStatus::ABORTED, std::move(reason));
   }
 
-  // Every control-thread exit path must clear control_running_ and then settle the move in flight: a
-  // thread that died mid-goal (reflex, NaN, connection loss) otherwise leaves a poller waiting
-  // forever on a move nothing can finish — and a goal still pending at exit was aborted, not reached.
-  //
-  // `reason` is what the loop caught, so the caller learns *why* ("motion aborted by reflex!
-  // [cartesian_reflex]") rather than only that something stopped. Nothing else knows: the exception
-  // dies with the thread, and by the time the caller looks the robot may already be recovered.
+  // Every control-thread exit path clears control_running_ and settles the move in flight: a thread
+  // that died mid-goal (reflex, NaN, connection loss) would otherwise leave a poller waiting forever,
+  // and a goal still pending at exit was aborted, not reached. `reason` is what the loop caught
+  // ("motion aborted by reflex! [cartesian_reflex]") — nothing else knows it, the exception dies
+  // with the thread.
   void finish_control_thread_(std::string reason = {}) {
     control_running_.store(false);
     {
@@ -1213,11 +1111,9 @@ private:
   std::string getRobotModel() {
     std::string urdf = robot_->getRobotModel();
 
-    // Read F_T_EE (flange-to-end-effector transform) from current robot state.
-    // This accounts for the mounted gripper/tool and is used by libfranka's
-    // model->pose(kEndEffector) for FK and IK. The base URDF from
-    // robot->getRobotModel() only describes kinematics up to the flange
-    // (link8), so we append a fixed joint + link to complete the chain.
+    // F_T_EE (flange-to-end-effector) accounts for the mounted tool and is what libfranka's
+    // model->pose(kEndEffector) uses. The base URDF stops at the flange (link8), so append a fixed
+    // joint + link to complete the chain.
     auto state = read_robot_state_();
     Eigen::Map<const Eigen::Matrix4d> F_T_EE(state.F_T_EE.data());
     const Eigen::Vector3d t = F_T_EE.block<3, 1>(0, 3);
@@ -1296,8 +1192,8 @@ private:
   std::atomic<bool> stop_requested_{false};
   std::atomic<bool> has_target_{false};
 
-  // The move in flight. The goal machinery assumes callers are serialized — the Python bindings hold
-  // the GIL for the whole publish — so concurrent C++ callers are not supported.
+  // The move in flight. Assumes serialized callers (the bindings hold the GIL for the whole
+  // publish); concurrent C++ callers are not supported.
   std::mutex goal_mutex_;
   GoalStatus goal_status_ = GoalStatus::NONE;
   std::string goal_error_;
@@ -1316,8 +1212,8 @@ private:
   ControlMode control_mode_;
   std::mutex target_mutex_;
   Vector7d target_q_ = Vector7d::Zero();
-  // The move `target_q_` belongs to, carried with it so the loop learns which goal it is executing
-  // from the same critical section that hands it the target; 0 for a streamed target, which has none.
+  // The move `target_q_` belongs to, handed to the loop in the same critical section as the target;
+  // 0 for a streamed target, which has none.
   std::uint64_t target_goal_id_ = 0;
   // The deadline the pending target was commanded with, in seconds; taken by the loop with it.
   double target_deadline_s_ = 0.0;
