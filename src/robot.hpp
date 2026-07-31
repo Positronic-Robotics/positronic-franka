@@ -43,6 +43,19 @@ constexpr std::array<double, 7> PANDA_JOINT_UPPER_LIMITS = {
 // moving. Held for SETTLE_HOLD_TICKS rather than judged on one reading, because velocity passes
 // through zero at every turning point of an oscillation — an arm still swinging inside the band
 // satisfies both tests for an instant on each swing, and a settled one satisfies them indefinitely.
+//
+// KNOWN LIMITATION, accepted deliberately: all three are fixed, and soft enough `SoftwareImpedance`
+// gains can defeat them. A slow, large oscillation has low velocity everywhere, not only at its
+// turning points, so a joint can sit inside both tolerances for longer than the hold while still
+// crossing the target — reporting REACHED to a caller whose arm is still swinging. The deadline does
+// not cover this: it bounds a move that never arrives, and this is a false arrival.
+//
+// A fixed hold cannot be made safe by lengthening it, and deriving one from the gains means
+// reconstructing the plant inside the control loop, which was tried and removed. The fix, if this
+// ever bites, is to let the caller pass the tolerances the way it passes the deadline — what counts
+// as arrived is a property of the task, not of the arm. Not done because nothing has hit it: the
+// deployed configuration is `InternalImpedance`, whose stiff internal controller does not produce
+// oscillations this slow. Tracked with the rest of this work in internal#162.
 constexpr double SETTLE_POSITION_TOLERANCE = 0.05;  // rad
 constexpr double SETTLE_VELOCITY_TOLERANCE = 0.05;  // rad/s
 constexpr int SETTLE_HOLD_TICKS = 100;              // 1 kHz ticks — 0.1 s
