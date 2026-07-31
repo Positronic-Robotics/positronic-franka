@@ -62,10 +62,10 @@ constexpr double SETTLE_VELOCITY_TOLERANCE = 0.05;  // rad/s
 // minute genuinely takes a minute to judge. The library reports the truth for as long as that takes
 // (neither arrived nor stalled); deciding it has waited long enough is the caller's, which is where
 // a reasonable duration is actually known.
-constexpr int SETTLE_WINDOW_MIN_TICKS = 250;  // 0.25 s
+constexpr std::int64_t SETTLE_WINDOW_MIN_TICKS = 250;  // 0.25 s
 // Used only when no joint has a usable stiffness — a Cartesian-only `SoftwareImpedance`, which
 // `validate_half` permits — leaving no joint-space period to derive one from.
-constexpr int SETTLE_WINDOW_FALLBACK_TICKS = 1000;
+constexpr std::int64_t SETTLE_WINDOW_FALLBACK_TICKS = 1000;
 constexpr double TWO_PI = 6.283185307179586;
 // How much the error must vary across a window to count as motion. Far below any real convergence —
 // a move creeping at a tenth of the rest threshold still covers 500x this in a second — and far
@@ -79,7 +79,7 @@ constexpr double STALL_PROGRESS_EPSILON = 1e-4;  // rad
 // caller for hours; this is the backstop, generous next to any real settle, and it fires only on a
 // move that has already gone wrong. Adding it to the plan's own duration rather than replacing it is
 // what lets a deliberately slow `relative_dynamics_factor` still finish.
-constexpr int DEADLINE_WINDOWS = 60;
+constexpr std::int64_t DEADLINE_WINDOWS = 60;
 
 // Common Eigen aliases
 using Vector7d = Eigen::Matrix<double, 7, 1>;
@@ -861,10 +861,10 @@ private:
         [&, this,
          first = true,
          goal_in_flight = std::uint64_t{0},
-         window_ticks = 0,
-         move_ticks = 0,
+         window_ticks = std::int64_t{0},
+         move_ticks = std::int64_t{0},
          window_cap = SETTLE_WINDOW_FALLBACK_TICKS,
-         deadline_ticks = DEADLINE_WINDOWS * SETTLE_WINDOW_FALLBACK_TICKS,
+         deadline_ticks = std::int64_t{DEADLINE_WINDOWS * SETTLE_WINDOW_FALLBACK_TICKS},
          window_min = Vector7d(Vector7d::Constant(std::numeric_limits<double>::infinity())),
          window_max = Vector7d(Vector7d::Zero()),
          stopping = false](const franka::RobotState& st, franka::Duration period) mutable -> franka::JointPositions {
@@ -894,8 +894,8 @@ private:
             // The deadline is the plan's own duration plus the settle budget, so a deliberately slow
             // `relative_dynamics_factor` gets the time it asked for rather than being cut off by a
             // flat constant — while a move that overruns its own plan by a minute still ends.
-            window_cap = settle_window_ticks_(st, Eigen::Map<const Vector7d>(imp.k_theta.data()));
-            deadline_ticks = DEADLINE_WINDOWS * window_cap + static_cast<int>(traj.duration() * 1000.0);
+            window_cap = settle_window_ticks_(st, Eigen::Map<const Vector7d>(imp.k_theta.data()), Vector6d::Zero());
+            deadline_ticks = DEADLINE_WINDOWS * window_cap + ticks_from_seconds_(traj.duration());
             // A rejected plan must not let the old trajectory finish this goal as if reached.
             if (!planned) {
               fail_goal_(goal_in_flight, "joint target rejected by the trajectory planner");
@@ -957,8 +957,8 @@ private:
         [&, this,
          first = true,
          goal_in_flight = std::uint64_t{0},
-         window_ticks = 0,
-         move_ticks = 0,
+         window_ticks = std::int64_t{0},
+         move_ticks = std::int64_t{0},
          window_min = Vector7d(Vector7d::Constant(std::numeric_limits<double>::infinity())),
          window_max = Vector7d(Vector7d::Zero()),
          window_cap = SETTLE_WINDOW_FALLBACK_TICKS,
@@ -990,7 +990,7 @@ private:
             move_ticks = 0;
             window_min.setConstant(std::numeric_limits<double>::infinity());
             window_max.setZero();
-            window_cap = settle_window_ticks_(st, Kq);
+            window_cap = settle_window_ticks_(st, Kq, Kx);
             has_target_.store(false);
           }
 
@@ -1005,7 +1005,7 @@ private:
             // applies and the samples taken under the old one describe a different system. Re-derive
             // and restart the observation; softer gains would otherwise have a valid slow
             // continuation judged against the stiffer controller's window and called stalled.
-            window_cap = settle_window_ticks_(st, Kq);
+            window_cap = settle_window_ticks_(st, Kq, Kx);
             window_min.setConstant(std::numeric_limits<double>::infinity());
             window_max.setZero();
             window_ticks = 0;
@@ -1120,23 +1120,44 @@ private:
   // loaded arm oscillates slowly, and a window shorter than its period sees a stationary-looking
   // slice of ordinary motion. Joints with no stiffness of their own (a Cartesian-only gain set) are
   // skipped; if that leaves none, there is no joint-space period and the fallback stands in.
-  int settle_window_ticks_(const franka::RobotState& st, const Vector7d& k) {
+  // Seconds to ticks, saturating. A period derived from a near-zero stiffness can exceed what the
+  // counter holds, and converting a double past the integer range is undefined — so it is clamped
+  // before the cast rather than after, where the damage would already be done.
+  static std::int64_t ticks_from_seconds_(double seconds) {
+    constexpr double kMaxTicks = 4.0e18;  // well inside int64, with room for DEADLINE_WINDOWS
+    const double ticks = seconds * 1000.0;
+    if (!(ticks > 0.0)) return 0;
+    return ticks >= kMaxTicks ? static_cast<std::int64_t>(kMaxTicks) : static_cast<std::int64_t>(ticks);
+  }
+
+  std::int64_t settle_window_ticks_(const franka::RobotState& st, const Vector7d& kq, const Vector6d& kx) {
+    // The EFFECTIVE joint stiffness, which is what the control law actually applies:
+    // K = J^T Kx J + Kq. Reading `Kq` alone would see nothing at all in a Cartesian-only gain set —
+    // permitted by `validate_half` — and fall back to a fixed window, which is the assumption this
+    // derivation exists to remove. The Cartesian half reaches the joints through the Jacobian, so
+    // that is where its stiffness has to be read from.
+    const auto J_data = model_->zeroJacobian(franka::Frame::kEndEffector, st);
+    const SpatialJacobian J = Eigen::Map<const SpatialJacobian>(J_data.data());
+    const Matrix7d K = J.transpose() * kx.asDiagonal() * J + Matrix7d(kq.asDiagonal());
     const std::array<double, 49> m = model_->mass(st);
+
     double slowest_period = 0.0;
     for (int i = 0; i < 7; ++i) {
-      const double stiffness = k[i], inertia = m[i * 7 + i];
+      const double stiffness = K(i, i), inertia = m[i * 7 + i];
       if (!(stiffness > 0.0) || !(inertia > 0.0)) continue;
       slowest_period = std::max(slowest_period, TWO_PI * std::sqrt(inertia / stiffness));
     }
+    // Only reachable when no joint has any effective stiffness — a Cartesian-only set at a pose
+    // where the Jacobian carries none of it through. Nothing there says how long to watch.
     if (!(slowest_period > 0.0)) return SETTLE_WINDOW_FALLBACK_TICKS;
-    return std::max(static_cast<int>(slowest_period * 1000.0), SETTLE_WINDOW_MIN_TICKS);
+    return std::max(ticks_from_seconds_(slowest_period), SETTLE_WINDOW_MIN_TICKS);
   }
 
   enum class Arrival { InFlight, Reached, Stalled };
 
   static Arrival arrival_(const Vector7d& ref, const Vector7d& q, bool travelling,
-                          int window_cap, int deadline_ticks, Vector7d& window_min, Vector7d& window_max,
-                          int& window_ticks, int& move_ticks) {
+                          std::int64_t window_cap, std::int64_t deadline_ticks, Vector7d& window_min,
+                          Vector7d& window_max, std::int64_t& window_ticks, std::int64_t& move_ticks) {
     // The deadline covers the WHOLE move, the shaped phase included — it is the guarantee that a
     // goal cannot stay IN_FLIGHT indefinitely, and a phase excluded from it is a hole in that.
     if (++move_ticks >= deadline_ticks) return Arrival::Stalled;
