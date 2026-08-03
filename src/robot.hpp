@@ -373,8 +373,10 @@ class Robot {
       // the arm hit something, and only the caller knows whether resuming is safe.
       // Best effort — if the state read itself fails, let the loop report what is wrong.
       std::string robot_errors;
+      std::unique_ptr<franka::RobotState> preflight;
       try {
-        if (const auto errors = read_robot_state_().current_errors; static_cast<bool>(errors)) {
+        preflight = std::make_unique<franka::RobotState>(read_robot_state_());
+        if (const auto errors = preflight->current_errors; static_cast<bool>(errors)) {
           robot_errors = static_cast<std::string>(errors);
         }
       } catch (const std::exception&) {  // NOLINT(bugprone-empty-catch)
@@ -390,6 +392,15 @@ class Robot {
       {
         std::lock_guard<std::mutex> lk(target_mutex_);
         target_goal_id_ = 0;
+      }
+      // Seed the cache from the read above, so state() has something to serve the moment the loop
+      // counts as running. libfranka allows one operation on the connection at a time, so a state()
+      // that falls through to readOnce() in the gap before the loop's first tick takes the
+      // connection the control thread is claiming, and one of the two dies.
+      {
+        std::lock_guard<std::mutex> lk(last_state_mutex_);
+        last_state_ = std::move(preflight);
+        last_software_ref_.reset();
       }
       control_running_.store(true);
       // Snapshot the mode here: the caller is GIL-serialized with set_control_mode, while the thread
