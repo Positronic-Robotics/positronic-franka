@@ -1,5 +1,31 @@
 # Changelog
 
+## [0.7.0] - 2026-08-04
+
+A joint move is now commanded and observed instead of waited on: `set_target_joints` returns at once and `goal()` reports how it went.
+
+### Added
+- `goal()` — the move in flight, read without blocking: `IN_FLIGHT / REACHED / ABORTED`, with `Goal.reason` on an abort. `REACHED` means every joint is within tolerance of the commanded reference and no longer moving, in either control mode. It is a report, not a latch, and is never taken back — an arm held off target by load or friction can dip into the band at near-zero speed and report `REACHED` while settling outside it.
+- `deadline_s` on `set_target_joints`, default 15 s: the goal ABORTS if the arm has not settled by then. An argument, not a constant, because reach, gains and payload decide what is reasonable. One that cannot expire (non-finite, zero, negative) raises `invalid_argument`.
+- `state()` may be called while a move is in flight, as polling for the outcome requires.
+
+### Changed
+- **Breaking.** `set_target_joints` drops `asynchronous` and never blocks. For the old synchronous behaviour, poll `goal()` until it leaves `IN_FLIGHT` and raise on `ABORTED`. Blocking inside the library stopped the caller's own loop from clearing robot errors, so a reflex mid-move went uncleared and the move could never finish.
+- **Breaking.** `SoftwareImpedance` steps the reference to every target and lets the impedance law pull the arm in; Ruckig shaping there was the old synchronous path. `InternalImpedance` still shapes a Ruckig trajectory.
+- Every target arms a goal, streamed ones included.
+
+### Removed
+- **Breaking.** `move_to_joints(q)` — `set_target_joints` does exactly this.
+- **Breaking.** `GoalStatus.SUPERSEDED` — only the move in flight has a status, so nothing ever observed the replacement.
+
+### Fixed
+- An aborted goal carries libfranka's own text (`Move command aborted: motion aborted by reflex! ["cartesian_reflex"]`) rather than a generic message; the dying thread's exception was previously printed and discarded. The stderr line stays as a second record.
+- A move commanded while the robot holds an error settles ABORTED naming that error, instead of starting a control thread libfranka rejects on its first tick. Clearing stays the caller's decision.
+- A move that arrives on the tick its deadline expires reports `REACHED` — arrival is tested first.
+- A rejected target stops the arm, which used to keep driving toward the superseded one while the goal read ABORTED.
+- `stop()`, `recover_from_errors()` and a control-mode change settle an in-flight move ABORTED, not `REACHED`.
+- An older trajectory can no longer settle the goal that replaced it; each move carries an id and a settle that does not name the move in flight is ignored.
+
 ## [0.6.2] - 2026-07-26
 
 ### Added
