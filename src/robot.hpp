@@ -49,6 +49,9 @@ constexpr std::array<double, 7> PANDA_JOINT_UPPER_LIMITS = {
 // internal#162.
 constexpr double SETTLE_POSITION_TOLERANCE = 0.05;  // rad
 constexpr double SETTLE_VELOCITY_TOLERANCE = 0.05;  // rad/s
+// The stop-and-settle phase gives up after this many ticks (1 kHz), so an arm that never goes quiet
+// still releases the control loop.
+constexpr int SETTLE_TICKS_CAP = 1000;
 // Deadline used when the caller names none. Generous for a joint move on this arm.
 constexpr double DEFAULT_MOVE_DEADLINE_S = 15.0;
 
