@@ -1,9 +1,10 @@
 # Changelog
 
-## [0.7.0] - 2026-07-31
+## [0.7.0] - 2026-08-04
 
 ### Added
-- `set_target_joints(q_target, deadline_s=15.0)` — the deadline bounding the move; the goal ABORTS if the arm has not settled by then. An argument, not a constant: reach, gains and payload decide what is reasonable, and only the caller knows them.
+- `set_target_joints(q_target, deadline_s=15.0)` — the deadline bounding the move; the goal ABORTS if the arm has not settled by then. An argument, not a constant: reach, gains and payload decide what is reasonable, and only the caller knows them. A deadline that cannot expire — non-finite, zero or negative — raises `invalid_argument`, since it would either leave a move `IN_FLIGHT` for good or abort it on the first callback.
+- `state()` is safe to call while a move is in flight, which is what the polling loop this release asks for needs. It serves the control loop's own reading rather than reaching for the robot connection that loop holds; libfranka permits one operation at a time, so a read that reached for it would take the connection out from under the loop.
 - `goal()` — the joint move in flight, read without blocking: `GoalStatus.IN_FLIGHT / REACHED / ABORTED`, with `Goal.reason` for an aborted one. `REACHED` means the arm is inside the tolerance band of the commanded reference and no longer moving, the same criterion in both control modes. It is a report, not a latch: the loop goes on driving that target until a new one arrives. It is also never taken back, so an arm whose resting point is offset by load or friction can dip into the band at near-zero speed and report REACHED once while settling outside it.
 
 ### Changed
