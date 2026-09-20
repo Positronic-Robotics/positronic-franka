@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.7.1] - 2026-09-18
+
+### Fixed
+- `jointPositionError` is acknowledged like the other recoverable errors. It was absent from the flag-to-id map, so `run_self_test()` acknowledged nothing and the TD2 execute that follows it answered `424 Failed Dependency` for as long as the error stood. A rig carries this error after any unclean stop, so the self-test failed exactly when it was needed. Desk's own web client names the id `JointPosition`, which is not the flag name and is why the map needed the entry rather than a derivation.
+
 ## [0.7.0] - 2026-08-04
 
 A joint move is now commanded and observed instead of waited on: `set_target_joints` returns at once and `goal()` reports how it went.

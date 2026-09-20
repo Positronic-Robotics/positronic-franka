@@ -47,7 +47,11 @@ _CONTROL_HELD_MSG = (
 # An active recoverable safety error puts the safety controller into Recovery, where Desk refuses every action
 # (424 ActionUnavailable/RecoverableErrorActive) — including unlocking the brakes and running the self-test — until
 # the error is acknowledged. Maps the flags Desk reports to the error ids its acknowledge endpoint expects.
-_ACKNOWLEDGEABLE_ERRORS = {'td2Timeout': 'TD2Timeout', 'genericJointError': 'GenericJointError'}
+_ACKNOWLEDGEABLE_ERRORS = {
+    'td2Timeout': 'TD2Timeout',
+    'genericJointError': 'GenericJointError',
+    'jointPositionError': 'JointPosition',
+}
 
 
 def _acknowledgeable_errors(status: dict) -> list[str]:
