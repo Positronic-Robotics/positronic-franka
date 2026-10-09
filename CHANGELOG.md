@@ -3,6 +3,7 @@
 ## [0.7.1] - 2026-09-18
 
 ### Fixed
+- `run_self_test()` returns when the TD2 self-test has ended, also when no test was due. It returned when `timeToTd2` read above `SELF_TEST_LEAD_SEC`. When no test is due, that is true before the test starts, so the call returned at its first read while Desk ran the test for about 30 s. A caller that opened the brakes next got `503 Service Unavailable`. `prepare()` takes this path when it runs the test to acknowledge an error. The call now waits until `timeToTd2` rises between two reads: Desk restarts the countdown when a test ends, and nothing else raises it.
 - `jointPositionError` is acknowledged like the other recoverable errors. It was absent from the flag-to-id map, so `run_self_test()` acknowledged nothing and the TD2 execute that follows it answered `424 Failed Dependency` for as long as the error stood. A rig carries this error after any unclean stop, so the self-test failed exactly when it was needed. Desk's own web client names the id `JointPosition`, which is not the flag name and is why the map needed the entry rather than a derivation.
 
 ## [0.7.0] - 2026-08-04

@@ -1,0 +1,21 @@
+name: Tests
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  desk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+
+      # The Desk client needs no compiled extension, so these tests run without libfranka.
+      - name: Run the Desk client tests
+        run: uvx --python 3.11 --with requests pytest tests
