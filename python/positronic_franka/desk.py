@@ -247,15 +247,19 @@ class Desk:
         raise TimeoutError(f'Control box did not settle within {_REBOOT_UP_TIMEOUT_SEC:.0f}s of the reboot')
 
     def run_self_test(self) -> None:
-        """Acknowledge any recoverable safety error, then run the TD2 self-test. Mirrors Desk's "Acknowledge &
-        Execute": once the tests are overdue the error must be acknowledged before Desk allows anything else."""
+        """Acknowledge any recoverable safety error, run the TD2 self-test, and return when the test has ended.
+        Mirrors Desk's "Acknowledge & Execute": once the tests are overdue the error must be acknowledged before Desk
+        allows anything else."""
         for error_id in _acknowledgeable_errors(self.safety_status()):
             logger.info('Acknowledging recoverable safety error %s', error_id)
             self._request('POST', f'/admin/api/safety/recoverable-safety-errors/acknowledge?error_id={error_id}')
+        # Desk restarts the countdown when the test ends. A test that was not due starts with the countdown above
+        # SELF_TEST_LEAD_SEC, so only a rise from its value at the execute marks the end.
+        time_to_td2_at_execute = self.safety_status()['timeToTd2']
         self._request('POST', '/admin/api/safety/td2-tests/execute')
         deadline = time.monotonic() + _SELF_TEST_TIMEOUT_SEC
         while time.monotonic() < deadline:
-            if self.safety_status()['timeToTd2'] > SELF_TEST_LEAD_SEC:
+            if self.safety_status()['timeToTd2'] > time_to_td2_at_execute:
                 return
             time.sleep(_POLL_INTERVAL_SEC)
         raise TimeoutError(f'TD2 self-test did not complete within {_SELF_TEST_TIMEOUT_SEC}s')
