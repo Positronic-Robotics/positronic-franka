@@ -253,14 +253,16 @@ class Desk:
         for error_id in _acknowledgeable_errors(self.safety_status()):
             logger.info('Acknowledging recoverable safety error %s', error_id)
             self._request('POST', f'/admin/api/safety/recoverable-safety-errors/acknowledge?error_id={error_id}')
-        # Desk restarts the countdown when the test ends. A test that was not due starts with the countdown above
-        # SELF_TEST_LEAD_SEC, so only a rise from its value at the execute marks the end.
-        time_to_td2_at_execute = self.safety_status()['timeToTd2']
+        # The countdown falls, and only the restart at the end of the test raises it. The restart value is not known,
+        # so a rise between two reads marks the end.
+        last_time_to_td2 = self.safety_status()['timeToTd2']
         self._request('POST', '/admin/api/safety/td2-tests/execute')
         deadline = time.monotonic() + _SELF_TEST_TIMEOUT_SEC
         while time.monotonic() < deadline:
-            if self.safety_status()['timeToTd2'] > time_to_td2_at_execute:
+            time_to_td2 = self.safety_status()['timeToTd2']
+            if time_to_td2 > last_time_to_td2:
                 return
+            last_time_to_td2 = time_to_td2
             time.sleep(_POLL_INTERVAL_SEC)
         raise TimeoutError(f'TD2 self-test did not complete within {_SELF_TEST_TIMEOUT_SEC}s')
 
