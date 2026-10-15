@@ -130,20 +130,24 @@ class Desk:
         response = self._session.request(
             method, f'https://{self.host}{path}', headers=headers, timeout=timeout, **kwargs
         )
+        self._raise_for_status(response, method, path)
+        return response
+
+    @staticmethod
+    def _raise_for_status(response: requests.Response, method: str, path: str) -> None:
+        """Raise the `HTTPError` of a refused request, and log the body Desk answered with."""
         if not response.ok:
             # The status names no cause. Desk states it in the body, for example the error that blocks a 424.
             logger.error('Desk answered %s %s with %d: %s', method, path, response.status_code, response.text)
         response.raise_for_status()
-        return response
 
     def _authenticate(self) -> None:
         encoded = encode_password(self._login, self._password)
+        path = '/admin/api/login'
         response = self._session.post(
-            f'https://{self.host}/admin/api/login',
-            json={'login': self._login, 'password': encoded},
-            timeout=self._timeout,
+            f'https://{self.host}{path}', json={'login': self._login, 'password': encoded}, timeout=self._timeout
         )
-        response.raise_for_status()
+        self._raise_for_status(response, 'POST', path)
         self._session.cookies.set('authorization', response.text.strip())
 
     def _take_control(self) -> None:
@@ -327,9 +331,10 @@ class Desk:
             self.run_self_test()
         try:
             self.open_brakes()
-        except requests.HTTPError:
+        except requests.HTTPError as refused:
             # The self-test can itself leave a joint that demands a recovery; Desk then refuses the unlock with 424.
-            self._refuse_demanded_recoveries(self.safety_status())
+            if refused.response is not None and refused.response.status_code == requests.codes.failed_dependency:
+                self._refuse_demanded_recoveries(self.safety_status())
             raise
         self.activate_fci()
 

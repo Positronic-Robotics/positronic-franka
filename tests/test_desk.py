@@ -51,11 +51,17 @@ class FakeDesk:
         reads_per_second: int = 1,
         recovery_joints: tuple[int, ...] = (),
         test_demands_recovery_of: tuple[int, ...] = (),
+        unlock_fails_with: int | None = None,
     ):
-        """``recovery_joints`` and ``test_demands_recovery_of`` are joint indices as Desk sends them, from 0."""
+        """``recovery_joints`` and ``test_demands_recovery_of`` are joint indices as Desk sends them, from 0.
+
+        ``unlock_fails_with`` is a status the brake unlock answers, after which the box answers nothing.
+        """
         self.time_to_td2 = time_to_td2
         self.recovery_joints = recovery_joints
         self.test_demands_recovery_of = test_demands_recovery_of
+        self.unlock_fails_with = unlock_fails_with
+        self.offline = False
         self.requests: list[str] = []
         self.recoverable_errors = {flag: flag in recoverable_errors for flag in desk._ACKNOWLEDGEABLE_ERRORS}
         self.restart_to = restart_to
@@ -68,12 +74,22 @@ class FakeDesk:
     def test_running(self) -> bool:
         return self.test_polls_left > 0
 
+    def post(self, url: str, **kwargs) -> FakeResponse:
+        return self.request('POST', url, **kwargs)
+
     def request(self, method: str, url: str, **kwargs) -> FakeResponse:
+        if self.offline:
+            raise requests.ConnectionError('the control box does not answer')
         path = url.split('://', 1)[1].split('/', 1)[1]
         if method == 'GET' and path == 'admin/api/safety/status':
             return FakeResponse(self._status())
         self.requests.append(f'{method} {path}')
+        if method == 'POST' and path == 'admin/api/login':
+            return FakeResponse(status_code=401, text='{"error": "WrongCredentials"}')
         if method == 'POST' and path == 'desk/api/joints/unlock':
+            if self.unlock_fails_with is not None:
+                self.offline = True
+                return FakeResponse(status_code=self.unlock_fails_with)
             if self.recovery_joints:
                 return FakeResponse(status_code=424, text='{"error": "ActionUnavailable"}')
             raise AssertionError('the fake does not open brakes')
@@ -202,6 +218,24 @@ def test_self_test_refuses_a_demanded_recovery_without_turning_the_robot_off():
         _desk_on(box).run_self_test()
 
     assert box.requests == []
+
+
+def test_prepare_raises_an_unlock_refusal_that_is_not_424_as_desk_answered_it():
+    box = FakeDesk(time_to_td2=TD2_PERIOD_SEC, unlock_fails_with=503)
+
+    with pytest.raises(requests.HTTPError) as raised:
+        _desk_on(box).prepare()
+
+    assert raised.value.response.status_code == 503
+
+
+def test_a_refused_login_logs_the_body_desk_answered(caplog):
+    box = FakeDesk(time_to_td2=TD2_PERIOD_SEC)
+
+    with caplog.at_level(logging.ERROR), pytest.raises(requests.HTTPError):
+        _desk_on(box)._authenticate()
+
+    assert 'POST /admin/api/login with 401: {"error": "WrongCredentials"}' in caplog.text
 
 
 def test_a_refused_request_logs_the_body_desk_answered(caplog):
