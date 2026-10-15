@@ -85,9 +85,8 @@ class SafetyControllerError(RuntimeError):
 class JointRecoveryRequired(RuntimeError):
     """Desk demands a recovery that a person does at the robot with the X4 enabling device.
 
-    Desk refuses to open the brakes until the recovery is done. An acknowledge or a self-test does not clear it, and a
-    self-test turns the robot power off for about 30 s. ``joints`` maps each demanded recovery to its joints, numbered
-    from 1.
+    Desk refuses to open the brakes until the recovery is done, and an acknowledge or a self-test does not clear it.
+    ``joints`` maps each demanded recovery to its joints, numbered from 1.
     """
 
     def __init__(self, joints: dict[str, tuple[int, ...]]):
