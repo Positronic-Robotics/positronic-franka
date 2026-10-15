@@ -82,6 +82,34 @@ class SafetyControllerError(RuntimeError):
         )
 
 
+class JointRecoveryRequired(RuntimeError):
+    """Desk demands a recovery that a person does at the robot with the X4 enabling device.
+
+    Desk refuses to open the brakes until the recovery is done, and an acknowledge or a self-test does not clear it.
+    ``joints`` maps each demanded recovery to its joints, numbered from 1.
+    """
+
+    def __init__(self, joints: dict[str, tuple[int, ...]]):
+        # The one argument is the whole state, so the error pickles across a process boundary.
+        super().__init__(joints)
+        self.joints = joints
+
+    @staticmethod
+    def _joint_names(numbers: tuple[int, ...]) -> str:
+        return f'joint {numbers[0]}' if len(numbers) == 1 else f'joints {", ".join(map(str, numbers))}'
+
+    def __str__(self) -> str:
+        demands = '; '.join(
+            f'{self._joint_names(numbers)} ({recovery})' if numbers else recovery
+            for recovery, numbers in self.joints.items()
+        )
+        return (
+            f'Desk demands a recovery at the robot: {demands}. Desk does not open the brakes until a person does it, '
+            'and a self-test does not clear it. In Desk, start the recovery for the joint, then hold the X4 enabling '
+            'device at the arm base while Desk moves the joint to its reference mark.'
+        )
+
+
 class Desk:
     def __init__(self, host: str, login: str, password: str, timeout: float = 10.0):
         self.host = host
@@ -102,17 +130,24 @@ class Desk:
         response = self._session.request(
             method, f'https://{self.host}{path}', headers=headers, timeout=timeout, **kwargs
         )
-        response.raise_for_status()
+        self._raise_for_status(response, method, path)
         return response
+
+    @staticmethod
+    def _raise_for_status(response: requests.Response, method: str, path: str) -> None:
+        """Raise the `HTTPError` of a refused request, and log the body Desk answered with."""
+        if not response.ok:
+            # The status names no cause. Desk states it in the body, for example the error that blocks a 424.
+            logger.error('Desk answered %s %s with %d: %s', method, path, response.status_code, response.text)
+        response.raise_for_status()
 
     def _authenticate(self) -> None:
         encoded = encode_password(self._login, self._password)
+        path = '/admin/api/login'
         response = self._session.post(
-            f'https://{self.host}/admin/api/login',
-            json={'login': self._login, 'password': encoded},
-            timeout=self._timeout,
+            f'https://{self.host}{path}', json={'login': self._login, 'password': encoded}, timeout=self._timeout
         )
-        response.raise_for_status()
+        self._raise_for_status(response, 'POST', path)
         self._session.cookies.set('authorization', response.text.strip())
 
     def _take_control(self) -> None:
@@ -246,11 +281,26 @@ class Desk:
             time.sleep(_REBOOT_POLL_INTERVAL_SEC)
         raise TimeoutError(f'Control box did not settle within {_REBOOT_UP_TIMEOUT_SEC:.0f}s of the reboot')
 
+    @staticmethod
+    def _refuse_demanded_recoveries(status: dict) -> None:
+        """Raise `JointRecoveryRequired` naming each joint, from 1 as Desk's recovery screen shows it."""
+        demanded = {}
+        for recovery, joints in status['demandedRecoveries'].items():
+            if isinstance(joints, list):
+                if any(joints):
+                    demanded[recovery] = tuple(index + 1 for index, flagged in enumerate(joints) if flagged)
+            elif joints:
+                demanded[recovery] = ()
+        if demanded:
+            raise JointRecoveryRequired(demanded)
+
     def run_self_test(self) -> None:
         """Acknowledge any recoverable safety error, run the TD2 self-test, and return when the test has ended.
         Mirrors Desk's "Acknowledge & Execute": once the tests are overdue the error must be acknowledged before Desk
-        allows anything else."""
-        for error_id in _acknowledgeable_errors(self.safety_status()):
+        allows anything else. Raises `JointRecoveryRequired` before either step while Desk demands a recovery."""
+        status = self.safety_status()
+        self._refuse_demanded_recoveries(status)
+        for error_id in _acknowledgeable_errors(status):
             logger.info('Acknowledging recoverable safety error %s', error_id)
             self._request('POST', f'/admin/api/safety/recoverable-safety-errors/acknowledge?error_id={error_id}')
         # The countdown falls, and only the restart at the end of the test raises it. The restart value is not known,
@@ -267,14 +317,25 @@ class Desk:
         raise TimeoutError(f'TD2 self-test did not complete within {_SELF_TEST_TIMEOUT_SEC}s')
 
     def prepare(self) -> None:
-        """Run the TD2 self-test if one is due or overdue, open the brakes, and activate FCI. Requires held control."""
+        """Run the TD2 self-test if one is due or overdue, open the brakes, and activate FCI. Requires held control.
+
+        Raises `JointRecoveryRequired` while Desk demands a recovery: before any acknowledge or self-test, and when
+        the self-test leaves one.
+        """
         status = self.safety_status()
         if status['safetyControllerStatus'] == 'SafetyError':
             raise SafetyControllerError(_safety_error_reasons(status))
+        self._refuse_demanded_recoveries(status)
         if status['timeToTd2'] <= SELF_TEST_LEAD_SEC or _acknowledgeable_errors(status):
             logger.info('TD2 self-test due within %ds, running it now', SELF_TEST_LEAD_SEC)
             self.run_self_test()
-        self.open_brakes()
+        try:
+            self.open_brakes()
+        except requests.HTTPError as refused:
+            # The self-test can itself leave a joint that demands a recovery; Desk then refuses the unlock with 424.
+            if refused.response is not None and refused.response.status_code == requests.codes.failed_dependency:
+                self._refuse_demanded_recoveries(self.safety_status())
+            raise
         self.activate_fci()
 
     def __enter__(self) -> 'Desk':

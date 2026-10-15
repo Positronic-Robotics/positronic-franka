@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.7.2] - 2026-10-15
+
+### Added
+- `JointRecoveryRequired`, a `RuntimeError`. `prepare()` and `run_self_test()` raise it while Desk demands a recovery (`demandedRecoveries`), for example for a joint that lost its stored position. A person does this recovery at the robot with the X4 enabling device. The message names each joint as Desk's recovery screen numbers it, from 1, and `joints` holds the same numbers.
+
+### Fixed
+- `prepare()` reads `demandedRecoveries` before it acknowledges an error or runs the TD2 self-test. It acknowledged and ran the test on any active error, and the test turns the robot power off for about 30 s. Neither clears a demanded recovery, so Desk then refused the brake unlock with `424 Failed Dependency`, and a caller that retried `prepare()` turned the robot off on each try. When the self-test itself leaves a demanded recovery, `prepare()` raises the same error in place of the 424.
+- A request that Desk refuses, the login included, logs the response body. Desk states the cause there, and the `HTTPError` that the call raises does not carry it.
+
 ## [0.7.1] - 2026-10-09
 
 ### Fixed
