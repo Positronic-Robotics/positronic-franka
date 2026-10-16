@@ -19,3 +19,18 @@ jobs:
       # The Desk client needs no compiled extension, so these tests run without libfranka.
       - name: Run the Desk client tests
         run: uvx --python 3.11 --with requests pytest tests
+
+  impedance-law:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Eigen
+        run: sudo apt-get update && sudo apt-get install -y libeigen3-dev
+
+      # The impedance law needs only Eigen, so this test runs without libfranka.
+      - name: Run the impedance law tests
+        run: |
+          g++ -std=c++17 -Wall -Wextra -Werror -I src $(pkg-config --cflags eigen3) \
+            tests/test_impedance_law.cpp -o test_impedance_law
+          ./test_impedance_law
