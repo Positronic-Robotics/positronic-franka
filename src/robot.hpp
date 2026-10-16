@@ -80,14 +80,6 @@ bool all_positive(const std::array<double, N>& v) {
   return true;
 }
 
-template <size_t N>
-bool all_non_negative(const std::array<double, N>& v) {
-  for (double x : v) {
-    if (!(x >= 0.0) || !std::isfinite(x)) return false;  // NaN fails the comparison, inf fails isfinite
-  }
-  return true;
-}
-
 // A gain space is either disabled (stiffness and damping all zero) or a damped spring (both strictly
 // positive); anything in between is a configuration error.
 template <size_t N>
@@ -164,7 +156,9 @@ struct SoftwareImpedance {
     if (!all_positive(overspeed_threshold)) {
       throw std::invalid_argument("overspeed_threshold must be finite and strictly positive");
     }
-    if (!all_non_negative(overspeed_brake_gain)) {
+    // NaN fails the comparison, inf fails isfinite.
+    if (!std::all_of(overspeed_brake_gain.begin(), overspeed_brake_gain.end(),
+                     [](double x) { return x >= 0.0 && std::isfinite(x); })) {
       throw std::invalid_argument("overspeed_brake_gain must be finite and not negative");
     }
   }
