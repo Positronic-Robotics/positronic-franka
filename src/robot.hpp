@@ -1013,9 +1013,9 @@ private:
           franka::Torques cmd(tau_arr);
 
           if (stopping) {
-            // The spring at ref = q plus damping brings the arm to rest; finish once quiet (capped).
+            // The spring at ref = q plus damping brings the arm to rest; finish once settled (capped).
             ++stop_ticks;
-            if (dq.cwiseAbs().maxCoeff() < SETTLE_VELOCITY_TOLERANCE || stop_ticks >= SETTLE_TICKS_CAP) {
+            if (stop_has_settled(spring_limiter, dq, SETTLE_VELOCITY_TOLERANCE) || stop_ticks >= SETTLE_TICKS_CAP) {
               cmd.motion_finished = true;
             }
           }

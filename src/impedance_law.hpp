@@ -23,13 +23,25 @@ class SpringTorqueRateLimiter {
       const double step = max_rate_(i) * dt;
       last_(i) = std::clamp(spring(i), last_(i) - step, last_(i) + step);
     }
+    ramping_ = last_ != spring;
     return last_;
   }
+
+  // True while the last call returned less than the spring torque it was given.
+  bool ramping() const { return ramping_; }
 
  private:
   Vector7d max_rate_;
   Vector7d last_ = Vector7d::Zero();
+  bool ramping_ = false;
 };
+
+// A stop is over once the arm is quiet and the capped spring torque has ramped out; a still arm with
+// spring torque left in the ramp would drop that torque at once when the loop ends.
+inline bool stop_has_settled(const SpringTorqueRateLimiter& spring_limiter, const Vector7d& dq,
+                             double velocity_tolerance) {
+  return !spring_limiter.ramping() && dq.cwiseAbs().maxCoeff() < velocity_tolerance;
+}
 
 // The software impedance law: tau = Kp (q_d - q) - Kd dq + coriolis. Only the spring term goes
 // through the limiter; damping and Coriolis pass through as computed.

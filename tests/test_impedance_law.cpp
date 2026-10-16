@@ -16,6 +16,7 @@
 namespace {
 
 using positronic_franka::impedance_torque;
+using positronic_franka::stop_has_settled;
 using positronic_franka::Matrix7d;
 using positronic_franka::SpringTorqueRateLimiter;
 using positronic_franka::Vector7d;
@@ -84,7 +85,8 @@ void a_target_on_the_first_tick_ramps_from_zero_spring_torque() {
   const Vector7d full = stiffness() * Vector7d::Constant(0.3);
   const Vector7d first = limiter.limit(full, dt);
   for (int i = 0; i < 7; ++i) {
-    check(near(first(i), std::copysign(rate * dt, full(i))), "joint " + std::to_string(i) + " moves one step from zero");
+    check(near(first(i), std::copysign(rate * dt, full(i))),
+          "joint " + std::to_string(i) + " moves one step from zero");
   }
 }
 
@@ -134,6 +136,26 @@ void a_cap_change_mid_session_ramps_from_the_last_spring_torque() {
         "the first tick at the new cap moves one new step from the torque the arm already had");
 }
 
+void a_stop_with_a_still_arm_settles_only_once_the_spring_torque_ramps_to_zero() {
+  const double tolerance = 0.05;  // rad/s
+  const Vector7d still = Vector7d::Zero();
+  SpringTorqueRateLimiter limiter(uniform(35.0));
+  for (int tick = 0; tick < 2000; ++tick) limiter.limit(Vector7d::Constant(10.0), 1e-3);  // held at 10 Nm
+
+  // The stop sets q_d = q, so the spring torque the limiter is given drops to zero.
+  int ticks = 0;
+  for (; ticks < 2000; ++ticks) {
+    const Vector7d spring = limiter.limit(Vector7d::Zero(), 1e-3);
+    if (stop_has_settled(limiter, still, tolerance)) {
+      check(spring.isZero(), "a settled stop holds no spring torque");
+      break;
+    }
+  }
+  check(ticks >= 285, "10 Nm at 35 Nm/s takes about 286 ticks to ramp out, it took " + std::to_string(ticks));
+  check(ticks < 2000, "the stop settles once the ramp ends");
+  check(!stop_has_settled(limiter, Vector7d::Constant(0.2), tolerance), "a moving arm has not settled");
+}
+
 }  // namespace
 
 int main() {
@@ -146,6 +168,8 @@ int main() {
        a_cap_above_the_spring_torque_change_leaves_the_law_unchanged},
       {"a_cap_change_mid_session_ramps_from_the_last_spring_torque",
        a_cap_change_mid_session_ramps_from_the_last_spring_torque},
+      {"a_stop_with_a_still_arm_settles_only_once_the_spring_torque_ramps_to_zero",
+       a_stop_with_a_still_arm_settles_only_once_the_spring_torque_ramps_to_zero},
   };
   int failed = 0;
   for (const auto& [name, test] : tests) {
