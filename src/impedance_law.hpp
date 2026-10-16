@@ -2,7 +2,6 @@
 
 #include <algorithm>
 #include <array>
-#include <optional>
 
 #include <Eigen/Core>
 
@@ -11,8 +10,8 @@ namespace positronic_franka {
 using Vector7d = Eigen::Matrix<double, 7, 1>;
 using Matrix7d = Eigen::Matrix<double, 7, 7>;
 
-// Caps how fast the spring torque Kp (q_d - q) may change, per joint, in Nm/s. The first call has
-// nothing to ramp from and passes the spring torque through.
+// Caps how fast the spring torque Kp (q_d - q) may change, per joint, in Nm/s. It starts from zero
+// spring torque, which is the torque at q_d = q, where every control loop starts.
 class SpringTorqueRateLimiter {
  public:
   explicit SpringTorqueRateLimiter(const std::array<double, 7>& max_rate) { set_max_rate(max_rate); }
@@ -20,20 +19,16 @@ class SpringTorqueRateLimiter {
   void set_max_rate(const std::array<double, 7>& max_rate) { max_rate_ = Eigen::Map<const Vector7d>(max_rate.data()); }
 
   Vector7d limit(const Vector7d& spring, double dt) {
-    Vector7d out = spring;
-    if (last_) {
-      for (int i = 0; i < 7; ++i) {
-        const double step = max_rate_(i) * dt;
-        out(i) = std::clamp(spring(i), (*last_)(i) - step, (*last_)(i) + step);
-      }
+    for (int i = 0; i < 7; ++i) {
+      const double step = max_rate_(i) * dt;
+      last_(i) = std::clamp(spring(i), last_(i) - step, last_(i) + step);
     }
-    last_ = out;
-    return out;
+    return last_;
   }
 
  private:
   Vector7d max_rate_;
-  std::optional<Vector7d> last_;
+  Vector7d last_ = Vector7d::Zero();
 };
 
 // The software impedance law: tau = Kp (q_d - q) - Kd dq + coriolis. Only the spring term goes

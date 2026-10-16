@@ -58,14 +58,11 @@ void a_target_step_ramps_the_spring_torque_at_the_cap_rate() {
   const double rate = 100.0;  // Nm/s
   const double dt = 1.3e-3;   // not 1 ms, so a fixed-period step would show
   SpringTorqueRateLimiter limiter(uniform(rate));
-
-  // At rest at q: the first tick passes the zero spring torque through and becomes the state.
-  const Vector7d at_rest = limiter.limit(Kp * (q - q), 0.0);
-  check(at_rest.isZero(), "first tick passes the spring torque through");
+  limiter.limit(Kp * (q - q), dt);  // at rest at q
 
   const Vector7d full = Kp * (target - q);
   check((full.cwiseAbs().array() > 10.0 * rate * dt).all(), "the step is many cap steps away");
-  Vector7d previous = at_rest;
+  Vector7d previous = Vector7d::Zero();
   for (int tick = 1; tick <= 5; ++tick) {
     const Vector7d spring = limiter.limit(full, dt);
     for (int i = 0; i < 7; ++i) {
@@ -78,6 +75,17 @@ void a_target_step_ramps_the_spring_torque_at_the_cap_rate() {
   // Once inside one step of the target torque it lands on it exactly.
   for (int tick = 0; tick < 10000 && previous != full; ++tick) previous = limiter.limit(full, dt);
   check(previous == full, "the ramp ends on the uncapped spring torque");
+}
+
+void a_target_on_the_first_tick_ramps_from_zero_spring_torque() {
+  const double rate = 100.0;
+  const double dt = 1e-3;
+  SpringTorqueRateLimiter limiter(uniform(rate));
+  const Vector7d full = stiffness() * Vector7d::Constant(0.3);
+  const Vector7d first = limiter.limit(full, dt);
+  for (int i = 0; i < 7; ++i) {
+    check(near(first(i), std::copysign(rate * dt, full(i))), "joint " + std::to_string(i) + " moves one step from zero");
+  }
 }
 
 void damping_and_coriolis_pass_through_uncapped() {
@@ -131,6 +139,8 @@ void a_cap_change_mid_session_ramps_from_the_last_spring_torque() {
 int main() {
   const std::vector<std::pair<const char*, std::function<void()>>> tests = {
       {"a_target_step_ramps_the_spring_torque_at_the_cap_rate", a_target_step_ramps_the_spring_torque_at_the_cap_rate},
+      {"a_target_on_the_first_tick_ramps_from_zero_spring_torque",
+       a_target_on_the_first_tick_ramps_from_zero_spring_torque},
       {"damping_and_coriolis_pass_through_uncapped", damping_and_coriolis_pass_through_uncapped},
       {"a_cap_above_the_spring_torque_change_leaves_the_law_unchanged",
        a_cap_above_the_spring_torque_change_leaves_the_law_unchanged},
