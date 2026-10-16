@@ -1,5 +1,13 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+- An overspeed brake in `SoftwareImpedance`, set by two keyword arguments: `overspeed_threshold` (7,), in rad/s, and `overspeed_brake_gain` (7,), in Nm*s/rad. When a joint moves faster than its threshold, the law adds `-gain * (|dq| - threshold) * sign(dq)` on that joint. Below the threshold it adds nothing, so the torque is unchanged. At the threshold the brake starts from zero, so it does not step the torque. The brake reads only the measured joint speed. It is on the damping side of the law, so the spring torque rate cap does not apply to it; libfranka's own torque rate limit applies to the total. A change of either argument reaches the running torque loop like a gain change.
+
+### Changed
+- **Behaviour.** The brake is always on. The defaults are `DEFAULT_OVERSPEED_THRESHOLD`, 2.0 rad/s on every joint, and `DEFAULT_OVERSPEED_BRAKE_GAIN`, `[50, 50, 50, 20, 20, 20, 10]` Nm*s/rad for joints 1 to 7. A gain of zero turns the brake off on that joint.
+
 ## [0.8.0] - 2026-10-16
 
 ### Added
