@@ -3,8 +3,11 @@
 ## [Unreleased]
 
 ### Added
-- `max_spring_torque_rate` on `SoftwareImpedance`, a keyword argument: a per-joint cap (7,), in Nm/s, on how fast the spring term `(J^T Kx J + Kq)(q_d - q)` may change. A new target steps the reference in one tick, so the spring torque stepped with it and the arm jerked at each target. With the cap set, the spring torque ramps to its new value at the cap rate, measured on the period that libfranka reports. Damping and Coriolis are not capped. The default, `None`, sets no cap, so the law is unchanged. A change of the cap reaches the running torque loop like a gain change, and the ramp starts from the spring torque that the loop sent last.
+- `max_spring_torque_rate` on `SoftwareImpedance`, a keyword argument: a per-joint cap (7,), in Nm/s, on how fast the spring term `(J^T Kx J + Kq)(q_d - q)` may change. A new target steps the reference in one tick, so the spring torque stepped with it and the arm jerked at each target. Now the spring torque ramps to its new value at the cap rate, measured on the period that libfranka reports. Damping and Coriolis are not capped. A change of the cap reaches the running torque loop like a gain change, and the ramp starts from the spring torque that the loop sent last.
 - `tests/test_impedance_law.cpp`, which checks the impedance law with Eigen only. CI builds and runs it.
+
+### Changed
+- **Behaviour.** The cap is always on. The default, `DEFAULT_MAX_SPRING_TORQUE_RATE`, is `[130, 130, 130, 130, 85, 60, 35]` Nm/s for joints 1 to 7, tuned for the default gains. A caller with other gains sets its own values. Values at or above libfranka's own 1000 Nm/s torque rate limit have no practical effect.
 
 ## [0.7.2] - 2026-10-15
 

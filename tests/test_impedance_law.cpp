@@ -57,8 +57,7 @@ void a_target_step_ramps_the_spring_torque_at_the_cap_rate() {
   const Vector7d target = q + Vector7d::Constant(0.3);
   const double rate = 100.0;  // Nm/s
   const double dt = 1.3e-3;   // not 1 ms, so a fixed-period step would show
-  SpringTorqueRateLimiter limiter;
-  limiter.set_max_rate(uniform(rate));
+  SpringTorqueRateLimiter limiter(uniform(rate));
 
   // At rest at q: the first tick passes the zero spring torque through and becomes the state.
   const Vector7d at_rest = limiter.limit(Kp * (q - q), 0.0);
@@ -87,8 +86,7 @@ void damping_and_coriolis_pass_through_uncapped() {
   const Vector7d q = Vector7d::Constant(-0.4);
   const Vector7d q_d = q;  // no spring torque, so the cap has nothing to hold back
   const Vector7d coriolis = Vector7d::LinSpaced(-2.0, 3.0);
-  SpringTorqueRateLimiter limiter;
-  limiter.set_max_rate(uniform(1.0));
+  SpringTorqueRateLimiter limiter(uniform(1.0));
   impedance_torque(Kp, Kd, q_d, q, Vector7d::Zero(), Vector7d::Zero(), limiter, 0.0);
 
   // A velocity step makes a damping step far past the 1 Nm/s cap.
@@ -97,16 +95,19 @@ void damping_and_coriolis_pass_through_uncapped() {
   check(tau == -(Kd * dq) + coriolis, "damping and coriolis arrive in full on the first tick");
 }
 
-void no_cap_matches_the_uncapped_law_bit_for_bit() {
+void a_cap_above_the_spring_torque_change_leaves_the_law_unchanged() {
   const Matrix7d Kp = stiffness();
   const Matrix7d Kd = damping();
-  SpringTorqueRateLimiter limiter;  // no cap set
+  SpringTorqueRateLimiter limiter(uniform(1000.0));  // 1 Nm per 1 ms tick
   Vector7d q = Vector7d::LinSpaced(-1.1, 1.3);
   Vector7d dq = Vector7d::LinSpaced(0.7, -0.2);
   const Vector7d coriolis = Vector7d::LinSpaced(0.01, 0.09);
+  Vector7d previous_spring = Vector7d::Zero();
   for (int tick = 0; tick < 50; ++tick) {
-    // Targets jump every few ticks, as streamed targets do.
-    const Vector7d q_d = q + Vector7d::Constant(tick % 7 == 0 ? 0.9 : 0.013 * tick);
+    const Vector7d q_d = q + Vector7d::Constant(0.0001 * (tick % 5));
+    const Vector7d spring = Kp * (q_d - q);
+    if (tick > 0) check((spring - previous_spring).cwiseAbs().maxCoeff() < 1.0, "the change stays inside the cap");
+    previous_spring = spring;
     const Vector7d tau = impedance_torque(Kp, Kd, q_d, q, dq, coriolis, limiter, 1e-3);
     const Vector7d uncapped = Kp * (q_d - q) - Kd * dq + coriolis;
     check(tau == uncapped, "tick " + std::to_string(tick) + " equals the uncapped law exactly");
@@ -115,18 +116,14 @@ void no_cap_matches_the_uncapped_law_bit_for_bit() {
   }
 }
 
-void a_cap_set_mid_session_ramps_from_the_last_spring_torque() {
+void a_cap_change_mid_session_ramps_from_the_last_spring_torque() {
   const Matrix7d Kp = stiffness();
-  const Vector7d q = Vector7d::Zero();
-  SpringTorqueRateLimiter limiter;
-  const Vector7d before = limiter.limit(Kp * Vector7d::Constant(0.1), 1e-3);  // no cap yet
+  SpringTorqueRateLimiter limiter(uniform(1000.0));
+  const Vector7d before = limiter.limit(Kp * Vector7d::Constant(0.1), 1e-3);
   limiter.set_max_rate(uniform(50.0));
   const Vector7d after = limiter.limit(Kp * Vector7d::Constant(0.5), 1e-3);
   check(((after - before).array().abs() - 50.0 * 1e-3).abs().maxCoeff() < 1e-9,
-        "the first capped tick moves one step from the torque the arm already had");
-  limiter.set_max_rate(std::nullopt);
-  const Vector7d released = limiter.limit(Kp * (Vector7d::Constant(0.5) - q), 1e-3);
-  check(released == Kp * (Vector7d::Constant(0.5) - q), "clearing the cap passes the spring torque through");
+        "the first tick at the new cap moves one new step from the torque the arm already had");
 }
 
 }  // namespace
@@ -135,9 +132,10 @@ int main() {
   const std::vector<std::pair<const char*, std::function<void()>>> tests = {
       {"a_target_step_ramps_the_spring_torque_at_the_cap_rate", a_target_step_ramps_the_spring_torque_at_the_cap_rate},
       {"damping_and_coriolis_pass_through_uncapped", damping_and_coriolis_pass_through_uncapped},
-      {"no_cap_matches_the_uncapped_law_bit_for_bit", no_cap_matches_the_uncapped_law_bit_for_bit},
-      {"a_cap_set_mid_session_ramps_from_the_last_spring_torque",
-       a_cap_set_mid_session_ramps_from_the_last_spring_torque},
+      {"a_cap_above_the_spring_torque_change_leaves_the_law_unchanged",
+       a_cap_above_the_spring_torque_change_leaves_the_law_unchanged},
+      {"a_cap_change_mid_session_ramps_from_the_last_spring_torque",
+       a_cap_change_mid_session_ramps_from_the_last_spring_torque},
   };
   int failed = 0;
   for (const auto& [name, test] : tests) {

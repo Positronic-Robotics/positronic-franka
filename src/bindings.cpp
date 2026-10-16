@@ -33,14 +33,15 @@ PYBIND11_MODULE(_franka, m) {
       "zero — disabled — or strictly positive, with at least one half active. "
       "max_spring_torque_rate (7,), Nm/s, caps how fast the spring term (J^T Kx J + Kq)(q_d - q) may "
       "change per joint, so a target step ramps the spring torque in rather than stepping it; damping "
-      "and coriolis are not capped. Finite and strictly positive; None, the default, means no cap.")
-      .def(py::init<const std::optional<std::array<double, 7>>&>(), py::kw_only(),
-           py::arg("max_spring_torque_rate") = py::none())
+      "and coriolis are not capped. Finite and strictly positive. The default is tuned for the default "
+      "gains; values at or above libfranka's own 1000 Nm/s torque rate limit have no practical effect.")
+      .def(py::init<const std::array<double, 7>&>(), py::kw_only(),
+           py::arg("max_spring_torque_rate") = positronic_franka::DEFAULT_MAX_SPRING_TORQUE_RATE)
       .def(py::init<const std::array<double, 7>&, const std::array<double, 7>&,
                     const std::array<double, 6>&, const std::array<double, 6>&,
-                    const std::optional<std::array<double, 7>>&>(),
+                    const std::array<double, 7>&>(),
            py::arg("kq"), py::arg("kqd"), py::arg("kx"), py::arg("kxd"), py::kw_only(),
-           py::arg("max_spring_torque_rate") = py::none())
+           py::arg("max_spring_torque_rate") = positronic_franka::DEFAULT_MAX_SPRING_TORQUE_RATE)
       .def_readonly("kq", &positronic_franka::SoftwareImpedance::kq)
       .def_readonly("kqd", &positronic_franka::SoftwareImpedance::kqd)
       .def_readonly("kx", &positronic_franka::SoftwareImpedance::kx)

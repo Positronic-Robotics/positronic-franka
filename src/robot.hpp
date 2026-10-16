@@ -99,6 +99,9 @@ struct InternalImpedance {
   }
 };
 
+// Per-joint spring torque rate cap, Nm/s, tuned for the default SoftwareImpedance gains.
+constexpr std::array<double, 7> DEFAULT_MAX_SPRING_TORQUE_RATE = {130.0, 130.0, 130.0, 130.0, 85.0, 60.0, 35.0};
+
 // Gain defaults are copied from fairo polymetis/conf/robot_client/franka_hardware.yaml, the
 // configuration HybridJointImpedanceControl runs with in the DROID data-collection stack.
 struct SoftwareImpedance {
@@ -106,17 +109,17 @@ struct SoftwareImpedance {
   std::array<double, 7> kqd{4.0, 6.0, 5.0, 5.0, 3.0, 2.0, 1.0};
   std::array<double, 6> kx{750.0, 750.0, 750.0, 15.0, 15.0, 15.0};
   std::array<double, 6> kxd{37.0, 37.0, 37.0, 2.0, 2.0, 2.0};
-  // Per-joint cap on the rate of change of the spring torque, Nm/s. Empty means no cap.
-  std::optional<std::array<double, 7>> max_spring_torque_rate;
+  // Per-joint cap on the rate of change of the spring torque, Nm/s.
+  std::array<double, 7> max_spring_torque_rate = DEFAULT_MAX_SPRING_TORQUE_RATE;
 
   SoftwareImpedance() = default;
-  explicit SoftwareImpedance(const std::optional<std::array<double, 7>>& max_spring_torque_rate_in)
+  explicit SoftwareImpedance(const std::array<double, 7>& max_spring_torque_rate_in)
       : max_spring_torque_rate(max_spring_torque_rate_in) {
     validate_max_spring_torque_rate_();
   }
   SoftwareImpedance(const std::array<double, 7>& kq_in, const std::array<double, 7>& kqd_in,
                     const std::array<double, 6>& kx_in, const std::array<double, 6>& kxd_in,
-                    const std::optional<std::array<double, 7>>& max_spring_torque_rate_in = std::nullopt)
+                    const std::array<double, 7>& max_spring_torque_rate_in = DEFAULT_MAX_SPRING_TORQUE_RATE)
       : kq(kq_in), kqd(kqd_in), kx(kx_in), kxd(kxd_in), max_spring_torque_rate(max_spring_torque_rate_in) {
     validate_half(kq, kqd, "joint (kq/kqd)");
     validate_half(kx, kxd, "Cartesian (kx/kxd)");
@@ -128,7 +131,7 @@ struct SoftwareImpedance {
 
  private:
   void validate_max_spring_torque_rate_() const {
-    if (max_spring_torque_rate && !all_positive(*max_spring_torque_rate)) {
+    if (!all_positive(max_spring_torque_rate)) {
       throw std::invalid_argument("max_spring_torque_rate must be finite and strictly positive");
     }
   }
@@ -920,7 +923,7 @@ private:
 
   // Torque-interface control loop running the polymetis hybrid impedance law:
   //   tau = (J^T Kx J + Kq)(q_d - q) - (J^T Kxd J + Kqd) dq + coriolis
-  // with the spring term optionally rate-capped (impedance_law.hpp). Gravity is compensated by
+  // with the spring term rate-capped (impedance_law.hpp). Gravity is compensated by
   // libfranka underneath the torque command. Shares the target/stop/goal machinery with the position
   // loop; only the reference differs — every target steps q_d instantly and the law pulls the arm in,
   // where the position loop shapes a Ruckig trajectory.
@@ -929,8 +932,7 @@ private:
     Vector7d Kqd = Eigen::Map<const Vector7d>(imp.kqd.data());
     Vector6d Kx = Eigen::Map<const Vector6d>(imp.kx.data());
     Vector6d Kxd = Eigen::Map<const Vector6d>(imp.kxd.data());
-    SpringTorqueRateLimiter spring_limiter;
-    spring_limiter.set_max_rate(imp.max_spring_torque_rate);
+    SpringTorqueRateLimiter spring_limiter(imp.max_spring_torque_rate);
     std::string thread_error;
     try {
       robot_->control(
