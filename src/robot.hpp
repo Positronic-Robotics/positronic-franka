@@ -36,10 +36,11 @@ namespace positronic_franka {
 constexpr std::array<double, 7> PANDA_BASE_VELOCITY_LIMITS = {2.62, 2.62, 2.62, 2.62, 5.26, 4.18, 5.26};
 constexpr std::array<double, 7> PANDA_BASE_ACCELERATION_LIMITS = {10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0};
 constexpr std::array<double, 7> PANDA_BASE_JERK_LIMITS = {5000.0, 5000.0, 5000.0, 5000.0, 5000.0, 5000.0, 5000.0};
-constexpr std::array<double, 7> PANDA_JOINT_LOWER_LIMITS = {
-    -2.8973, -1.7628, -2.8973, -3.0718, -2.8973, -0.0175, -2.8973};
-constexpr std::array<double, 7> PANDA_JOINT_UPPER_LIMITS = {
-    2.8973, 1.7628, 2.8973, 3.0718, 2.8973, 3.7525, 2.8973};
+// FR3 joint position limits (rad), as in the FR3 URDF that the robot reports.
+constexpr std::array<double, 7> FR3_JOINT_LOWER_LIMITS = {
+    -2.7437, -1.7837, -2.9007, -3.0421, -2.8065, 0.5445, -3.0159};
+constexpr std::array<double, 7> FR3_JOINT_UPPER_LIMITS = {
+    2.7437, 1.7837, 2.9007, -0.1518, 2.8065, 4.5169, 3.0159};
 
 // Arrival: joints within tolerance of the reference and no longer moving, judged on one reading.
 //
@@ -730,9 +731,9 @@ class Robot {
       std::vector<c_float> lower(m, 0.0);
       std::vector<c_float> upper(m, 0.0);
       for (c_int i = 0; i < m; ++i) {
-        const double min_bound = PANDA_JOINT_LOWER_LIMITS[static_cast<size_t>(i)] -
+        const double min_bound = FR3_JOINT_LOWER_LIMITS[static_cast<size_t>(i)] -
                                  q(static_cast<Eigen::Index>(i));
-        const double max_bound = PANDA_JOINT_UPPER_LIMITS[static_cast<size_t>(i)] -
+        const double max_bound = FR3_JOINT_UPPER_LIMITS[static_cast<size_t>(i)] -
                                  q(static_cast<Eigen::Index>(i));
         lower[static_cast<size_t>(i)] = static_cast<c_float>(min_bound);
         upper[static_cast<size_t>(i)] = static_cast<c_float>(max_bound);
@@ -811,8 +812,8 @@ class Robot {
 
       Vector7d q_next = q + step_scale * dq;
       for (size_t i = 0; i < 7; ++i) {
-        const double lower_limit = PANDA_JOINT_LOWER_LIMITS[i];
-        const double upper_limit = PANDA_JOINT_UPPER_LIMITS[i];
+        const double lower_limit = FR3_JOINT_LOWER_LIMITS[i];
+        const double upper_limit = FR3_JOINT_UPPER_LIMITS[i];
         q_next(static_cast<Eigen::Index>(i)) =
             std::clamp(q_next(static_cast<Eigen::Index>(i)), lower_limit, upper_limit);
       }

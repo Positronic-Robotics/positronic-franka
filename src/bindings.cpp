@@ -185,7 +185,7 @@ PYBIND11_MODULE(_franka, m) {
             return r.inverse_kinematics_with_limits(target_pose_wxyz);
           },
           py::arg("target_pose_wxyz"),
-          "IK to EndEffector pose with Panda joint limits enforced via OSQP; returns q (7,)")
+          "IK to EndEffector pose with FR3 joint limits enforced via OSQP; returns q (7,)")
       .def(
           "inverse_kinematics_with_limits",
           [](positronic_franka::Robot& r, const positronic_franka::Vector7d& target_pose_wxyz,
@@ -193,7 +193,7 @@ PYBIND11_MODULE(_franka, m) {
             return r.inverse_kinematics_with_limits(target_pose_wxyz, q0);
           },
           py::arg("target_pose_wxyz"), py::arg("q0"),
-          "IK with initial guess and Panda joint limits enforced via OSQP; returns q (7,)")
+          "IK with initial guess and FR3 joint limits enforced via OSQP; returns q (7,)")
       .def("set_target_joints", &positronic_franka::Robot::set_target_joints,
            py::arg("q_target"), py::arg("deadline_s") = positronic_franka::DEFAULT_MOVE_DEADLINE_S,
            "Command a joint move to target (7,) and return immediately; poll goal() for the outcome. "
