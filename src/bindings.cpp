@@ -34,19 +34,30 @@ PYBIND11_MODULE(_franka, m) {
       "max_spring_torque_rate (7,), Nm/s, caps how fast the spring term (J^T Kx J + Kq)(q_d - q) may "
       "change per joint, so a target step ramps the spring torque in rather than stepping it; damping "
       "and coriolis are not capped. Finite and strictly positive. The default is tuned for the default "
-      "gains; values at or above libfranka's own 1000 Nm/s torque rate limit have no practical effect.")
-      .def(py::init<const std::array<double, 7>&>(), py::kw_only(),
-           py::arg("max_spring_torque_rate") = positronic_franka::DEFAULT_MAX_SPRING_TORQUE_RATE)
+      "gains; values at or above libfranka's own 1000 Nm/s torque rate limit have no practical effect. "
+      "overspeed_threshold (7,), rad/s, finite and strictly positive, and overspeed_brake_gain (7,), "
+      "Nm*s/rad, finite and not negative, set a brake on a joint that moves faster than its threshold: "
+      "-gain * (|dq| - threshold) * sign(dq). It adds nothing below the threshold, and the spring "
+      "torque rate cap does not apply to it.")
+      .def(py::init<const std::array<double, 7>&, const std::array<double, 7>&, const std::array<double, 7>&>(),
+           py::kw_only(),
+           py::arg("max_spring_torque_rate") = positronic_franka::DEFAULT_MAX_SPRING_TORQUE_RATE,
+           py::arg("overspeed_threshold") = positronic_franka::DEFAULT_OVERSPEED_THRESHOLD,
+           py::arg("overspeed_brake_gain") = positronic_franka::DEFAULT_OVERSPEED_BRAKE_GAIN)
       .def(py::init<const std::array<double, 7>&, const std::array<double, 7>&,
                     const std::array<double, 6>&, const std::array<double, 6>&,
-                    const std::array<double, 7>&>(),
+                    const std::array<double, 7>&, const std::array<double, 7>&, const std::array<double, 7>&>(),
            py::arg("kq"), py::arg("kqd"), py::arg("kx"), py::arg("kxd"), py::kw_only(),
-           py::arg("max_spring_torque_rate") = positronic_franka::DEFAULT_MAX_SPRING_TORQUE_RATE)
+           py::arg("max_spring_torque_rate") = positronic_franka::DEFAULT_MAX_SPRING_TORQUE_RATE,
+           py::arg("overspeed_threshold") = positronic_franka::DEFAULT_OVERSPEED_THRESHOLD,
+           py::arg("overspeed_brake_gain") = positronic_franka::DEFAULT_OVERSPEED_BRAKE_GAIN)
       .def_readonly("kq", &positronic_franka::SoftwareImpedance::kq)
       .def_readonly("kqd", &positronic_franka::SoftwareImpedance::kqd)
       .def_readonly("kx", &positronic_franka::SoftwareImpedance::kx)
       .def_readonly("kxd", &positronic_franka::SoftwareImpedance::kxd)
       .def_readonly("max_spring_torque_rate", &positronic_franka::SoftwareImpedance::max_spring_torque_rate)
+      .def_readonly("overspeed_threshold", &positronic_franka::SoftwareImpedance::overspeed_threshold)
+      .def_readonly("overspeed_brake_gain", &positronic_franka::SoftwareImpedance::overspeed_brake_gain)
       .def(py::self == py::self);
 
   py::enum_<positronic_franka::GoalStatus>(m, "GoalStatus",
@@ -174,7 +185,7 @@ PYBIND11_MODULE(_franka, m) {
             return r.inverse_kinematics_with_limits(target_pose_wxyz);
           },
           py::arg("target_pose_wxyz"),
-          "IK to EndEffector pose with Panda joint limits enforced via OSQP; returns q (7,)")
+          "IK to EndEffector pose with FR3 joint limits enforced via OSQP; returns q (7,)")
       .def(
           "inverse_kinematics_with_limits",
           [](positronic_franka::Robot& r, const positronic_franka::Vector7d& target_pose_wxyz,
@@ -182,7 +193,7 @@ PYBIND11_MODULE(_franka, m) {
             return r.inverse_kinematics_with_limits(target_pose_wxyz, q0);
           },
           py::arg("target_pose_wxyz"), py::arg("q0"),
-          "IK with initial guess and Panda joint limits enforced via OSQP; returns q (7,)")
+          "IK with initial guess and FR3 joint limits enforced via OSQP; returns q (7,)")
       .def("set_target_joints", &positronic_franka::Robot::set_target_joints,
            py::arg("q_target"), py::arg("deadline_s") = positronic_franka::DEFAULT_MOVE_DEADLINE_S,
            "Command a joint move to target (7,) and return immediately; poll goal() for the outcome. "

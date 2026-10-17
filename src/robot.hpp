@@ -36,10 +36,11 @@ namespace positronic_franka {
 constexpr std::array<double, 7> PANDA_BASE_VELOCITY_LIMITS = {2.62, 2.62, 2.62, 2.62, 5.26, 4.18, 5.26};
 constexpr std::array<double, 7> PANDA_BASE_ACCELERATION_LIMITS = {10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0};
 constexpr std::array<double, 7> PANDA_BASE_JERK_LIMITS = {5000.0, 5000.0, 5000.0, 5000.0, 5000.0, 5000.0, 5000.0};
-constexpr std::array<double, 7> PANDA_JOINT_LOWER_LIMITS = {
-    -2.8973, -1.7628, -2.8973, -3.0718, -2.8973, -0.0175, -2.8973};
-constexpr std::array<double, 7> PANDA_JOINT_UPPER_LIMITS = {
-    2.8973, 1.7628, 2.8973, 3.0718, 2.8973, 3.7525, 2.8973};
+// FR3 joint position limits (rad), as in the FR3 URDF that the robot reports.
+constexpr std::array<double, 7> FR3_JOINT_LOWER_LIMITS = {
+    -2.7437, -1.7837, -2.9007, -3.0421, -2.8065, 0.5445, -3.0159};
+constexpr std::array<double, 7> FR3_JOINT_UPPER_LIMITS = {
+    2.7437, 1.7837, 2.9007, -0.1518, 2.8065, 4.5169, 3.0159};
 
 // Arrival: joints within tolerance of the reference and no longer moving, judged on one reading.
 //
@@ -101,6 +102,10 @@ struct InternalImpedance {
 
 // Per-joint spring torque rate cap, Nm/s, tuned for the default SoftwareImpedance gains.
 constexpr std::array<double, 7> DEFAULT_MAX_SPRING_TORQUE_RATE = {130.0, 130.0, 130.0, 130.0, 85.0, 60.0, 35.0};
+// Joint speed, rad/s, above which the overspeed brake acts; below the Panda/FR3 joint velocity limits.
+constexpr std::array<double, 7> DEFAULT_OVERSPEED_THRESHOLD = {2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0};
+// Overspeed brake gain, Nm*s/rad.
+constexpr std::array<double, 7> DEFAULT_OVERSPEED_BRAKE_GAIN = {50.0, 50.0, 50.0, 20.0, 20.0, 20.0, 10.0};
 
 // Gain defaults are copied from fairo polymetis/conf/robot_client/franka_hardware.yaml, the
 // configuration HybridJointImpedanceControl runs with in the DROID data-collection stack.
@@ -111,28 +116,51 @@ struct SoftwareImpedance {
   std::array<double, 6> kxd{37.0, 37.0, 37.0, 2.0, 2.0, 2.0};
   // Per-joint cap on the rate of change of the spring torque, Nm/s.
   std::array<double, 7> max_spring_torque_rate = DEFAULT_MAX_SPRING_TORQUE_RATE;
+  // Per-joint overspeed brake: joint speed, rad/s, above which it acts, and its gain, Nm*s/rad.
+  std::array<double, 7> overspeed_threshold = DEFAULT_OVERSPEED_THRESHOLD;
+  std::array<double, 7> overspeed_brake_gain = DEFAULT_OVERSPEED_BRAKE_GAIN;
 
   SoftwareImpedance() = default;
-  explicit SoftwareImpedance(const std::array<double, 7>& max_spring_torque_rate_in)
-      : max_spring_torque_rate(max_spring_torque_rate_in) {
-    validate_max_spring_torque_rate_();
+  explicit SoftwareImpedance(const std::array<double, 7>& max_spring_torque_rate_in,
+                             const std::array<double, 7>& overspeed_threshold_in = DEFAULT_OVERSPEED_THRESHOLD,
+                             const std::array<double, 7>& overspeed_brake_gain_in = DEFAULT_OVERSPEED_BRAKE_GAIN)
+      : max_spring_torque_rate(max_spring_torque_rate_in),
+        overspeed_threshold(overspeed_threshold_in),
+        overspeed_brake_gain(overspeed_brake_gain_in) {
+    validate_guards_();
   }
   SoftwareImpedance(const std::array<double, 7>& kq_in, const std::array<double, 7>& kqd_in,
                     const std::array<double, 6>& kx_in, const std::array<double, 6>& kxd_in,
-                    const std::array<double, 7>& max_spring_torque_rate_in = DEFAULT_MAX_SPRING_TORQUE_RATE)
-      : kq(kq_in), kqd(kqd_in), kx(kx_in), kxd(kxd_in), max_spring_torque_rate(max_spring_torque_rate_in) {
+                    const std::array<double, 7>& max_spring_torque_rate_in = DEFAULT_MAX_SPRING_TORQUE_RATE,
+                    const std::array<double, 7>& overspeed_threshold_in = DEFAULT_OVERSPEED_THRESHOLD,
+                    const std::array<double, 7>& overspeed_brake_gain_in = DEFAULT_OVERSPEED_BRAKE_GAIN)
+      : kq(kq_in),
+        kqd(kqd_in),
+        kx(kx_in),
+        kxd(kxd_in),
+        max_spring_torque_rate(max_spring_torque_rate_in),
+        overspeed_threshold(overspeed_threshold_in),
+        overspeed_brake_gain(overspeed_brake_gain_in) {
     validate_half(kq, kqd, "joint (kq/kqd)");
     validate_half(kx, kxd, "Cartesian (kx/kxd)");
     if (all_zero(kq) && all_zero(kx)) {
       throw std::invalid_argument("at least one of the joint or Cartesian halves must be active");
     }
-    validate_max_spring_torque_rate_();
+    validate_guards_();
   }
 
  private:
-  void validate_max_spring_torque_rate_() const {
+  void validate_guards_() const {
     if (!all_positive(max_spring_torque_rate)) {
       throw std::invalid_argument("max_spring_torque_rate must be finite and strictly positive");
+    }
+    if (!all_positive(overspeed_threshold)) {
+      throw std::invalid_argument("overspeed_threshold must be finite and strictly positive");
+    }
+    // NaN fails the comparison, inf fails isfinite.
+    if (!std::all_of(overspeed_brake_gain.begin(), overspeed_brake_gain.end(),
+                     [](double x) { return x >= 0.0 && std::isfinite(x); })) {
+      throw std::invalid_argument("overspeed_brake_gain must be finite and not negative");
     }
   }
 };
@@ -143,7 +171,8 @@ inline bool operator==(const InternalImpedance& a, const InternalImpedance& b) {
 
 inline bool operator==(const SoftwareImpedance& a, const SoftwareImpedance& b) {
   return a.kq == b.kq && a.kqd == b.kqd && a.kx == b.kx && a.kxd == b.kxd &&
-         a.max_spring_torque_rate == b.max_spring_torque_rate;
+         a.max_spring_torque_rate == b.max_spring_torque_rate && a.overspeed_threshold == b.overspeed_threshold &&
+         a.overspeed_brake_gain == b.overspeed_brake_gain;
 }
 
 using ControlMode = std::variant<InternalImpedance, SoftwareImpedance>;
@@ -702,9 +731,9 @@ class Robot {
       std::vector<c_float> lower(m, 0.0);
       std::vector<c_float> upper(m, 0.0);
       for (c_int i = 0; i < m; ++i) {
-        const double min_bound = PANDA_JOINT_LOWER_LIMITS[static_cast<size_t>(i)] -
+        const double min_bound = FR3_JOINT_LOWER_LIMITS[static_cast<size_t>(i)] -
                                  q(static_cast<Eigen::Index>(i));
-        const double max_bound = PANDA_JOINT_UPPER_LIMITS[static_cast<size_t>(i)] -
+        const double max_bound = FR3_JOINT_UPPER_LIMITS[static_cast<size_t>(i)] -
                                  q(static_cast<Eigen::Index>(i));
         lower[static_cast<size_t>(i)] = static_cast<c_float>(min_bound);
         upper[static_cast<size_t>(i)] = static_cast<c_float>(max_bound);
@@ -783,8 +812,8 @@ class Robot {
 
       Vector7d q_next = q + step_scale * dq;
       for (size_t i = 0; i < 7; ++i) {
-        const double lower_limit = PANDA_JOINT_LOWER_LIMITS[i];
-        const double upper_limit = PANDA_JOINT_UPPER_LIMITS[i];
+        const double lower_limit = FR3_JOINT_LOWER_LIMITS[i];
+        const double upper_limit = FR3_JOINT_UPPER_LIMITS[i];
         q_next(static_cast<Eigen::Index>(i)) =
             std::clamp(q_next(static_cast<Eigen::Index>(i)), lower_limit, upper_limit);
       }
@@ -923,7 +952,7 @@ private:
 
   // Torque-interface control loop running the polymetis hybrid impedance law:
   //   tau = (J^T Kx J + Kq)(q_d - q) - (J^T Kxd J + Kqd) dq + coriolis
-  // with the spring term rate-capped (impedance_law.hpp). Gravity is compensated by
+  // with the spring term rate-capped and an overspeed brake added (impedance_law.hpp). Gravity is compensated by
   // libfranka underneath the torque command. Shares the target/stop/goal machinery with the position
   // loop; only the reference differs — every target steps q_d instantly and the law pulls the arm in,
   // where the position loop shapes a Ruckig trajectory.
@@ -933,6 +962,7 @@ private:
     Vector6d Kx = Eigen::Map<const Vector6d>(imp.kx.data());
     Vector6d Kxd = Eigen::Map<const Vector6d>(imp.kxd.data());
     SpringTorqueRateLimiter spring_limiter(imp.max_spring_torque_rate);
+    OverspeedBrake overspeed_brake(imp.overspeed_threshold, imp.overspeed_brake_gain);
     std::string thread_error;
     try {
       robot_->control(
@@ -975,6 +1005,7 @@ private:
             Kx = Eigen::Map<const Vector6d>(new_gains_.kx.data());
             Kxd = Eigen::Map<const Vector6d>(new_gains_.kxd.data());
             spring_limiter.set_max_rate(new_gains_.max_spring_torque_rate);
+            overspeed_brake.set(new_gains_.overspeed_threshold, new_gains_.overspeed_brake_gain);
             has_new_gains_.store(false);
           }
 
@@ -1006,7 +1037,7 @@ private:
           const Matrix7d Kp = J.transpose() * Kx.asDiagonal() * J + Matrix7d(Kq.asDiagonal());
           const Matrix7d Kd = J.transpose() * Kxd.asDiagonal() * J + Matrix7d(Kqd.asDiagonal());
           const Vector7d tau = impedance_torque(Kp, Kd, ref, q, dq, Eigen::Map<const Vector7d>(cor.data()),
-                                                spring_limiter, period.toSec());
+                                                spring_limiter, overspeed_brake, period.toSec());
 
           std::array<double, 7> tau_arr;
           Eigen::Map<Vector7d>(tau_arr.data()) = tau;

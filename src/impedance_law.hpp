@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 
 #include <Eigen/Core>
 
@@ -43,12 +44,38 @@ inline bool stop_has_settled(const SpringTorqueRateLimiter& spring_limiter, cons
   return !spring_limiter.ramping() && dq.cwiseAbs().maxCoeff() < velocity_tolerance;
 }
 
-// The software impedance law: tau = Kp (q_d - q) - Kd dq + coriolis. Only the spring term goes
-// through the limiter; damping and Coriolis pass through as computed.
+// Brakes a joint that moves faster than its threshold, with torque -gain * (|dq| - threshold) * sign(dq).
+// It adds nothing below the threshold and grows from zero above it, so it never steps the torque.
+class OverspeedBrake {
+ public:
+  OverspeedBrake(const std::array<double, 7>& threshold, const std::array<double, 7>& gain) { set(threshold, gain); }
+
+  void set(const std::array<double, 7>& threshold, const std::array<double, 7>& gain) {
+    threshold_ = Eigen::Map<const Vector7d>(threshold.data());
+    gain_ = Eigen::Map<const Vector7d>(gain.data());
+  }
+
+  // Adds the brake torque to `tau` on the joints above their threshold only, so the others keep their bits.
+  void add_to(Vector7d& tau, const Vector7d& dq) const {
+    for (int i = 0; i < 7; ++i) {
+      const double excess = std::abs(dq(i)) - threshold_(i);
+      if (excess > 0.0) tau(i) -= std::copysign(gain_(i) * excess, dq(i));
+    }
+  }
+
+ private:
+  Vector7d threshold_;
+  Vector7d gain_;
+};
+
+// The software impedance law: tau = Kp (q_d - q) - Kd dq + coriolis, plus the overspeed brake. Only the
+// spring term goes through the limiter; damping, the brake and Coriolis pass through as computed.
 inline Vector7d impedance_torque(const Matrix7d& Kp, const Matrix7d& Kd, const Vector7d& q_d, const Vector7d& q,
                                  const Vector7d& dq, const Vector7d& coriolis, SpringTorqueRateLimiter& spring_limiter,
-                                 double dt) {
-  return spring_limiter.limit(Kp * (q_d - q), dt) - Kd * dq + coriolis;
+                                 const OverspeedBrake& brake, double dt) {
+  Vector7d tau = spring_limiter.limit(Kp * (q_d - q), dt) - Kd * dq + coriolis;
+  brake.add_to(tau, dq);
+  return tau;
 }
 
 }  // namespace positronic_franka

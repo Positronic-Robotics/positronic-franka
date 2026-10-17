@@ -19,8 +19,8 @@ using positronic_franka::Vector7d;
 Vector7d clamp_to_limits(const Vector7d& q) {
   Vector7d clamped = q;
   for (int i = 0; i < 7; ++i) {
-    clamped(i) = std::min(positronic_franka::PANDA_JOINT_UPPER_LIMITS[static_cast<size_t>(i)],
-                          std::max(positronic_franka::PANDA_JOINT_LOWER_LIMITS[static_cast<size_t>(i)],
+    clamped(i) = std::min(positronic_franka::FR3_JOINT_UPPER_LIMITS[static_cast<size_t>(i)],
+                          std::max(positronic_franka::FR3_JOINT_LOWER_LIMITS[static_cast<size_t>(i)],
                                    q(i)));
   }
   return clamped;
