@@ -143,8 +143,6 @@ inline Vector7d minimize_on_box(const Matrix7d& H, const Vector7d& g, const Vect
 template <typename Kinematics>
 Vector7d solve_pose_ik(const Kinematics& kinematics, const Eigen::Ref<const Vector7d>& target_pose_wxyz,
                        const Eigen::Ref<const Vector7d>& q0, double max_step) {
-  // A negative or NaN step makes an empty box, which minimize_on_box does not handle. Infinity leaves only the limits.
-  if (!(max_step >= 0.0)) throw std::invalid_argument("max_step must not be negative or NaN");
   constexpr int kMaxIterations = 60;
   constexpr double kStepTolerance = 1e-9;  // rad
   // Keeps each Gauss-Newton step finite at an exact singularity; it vanishes at the fixed point.
@@ -172,9 +170,13 @@ Vector7d solve_pose_ik(const Kinematics& kinematics, const Eigen::Ref<const Vect
 
   Vector7d lower, upper;
   for (int i = 0; i < 7; ++i) {
-    lower(i) = std::max(FR3_JOINT_LOWER_LIMITS[i], q0(i) - max_step);
-    upper(i) = std::min(FR3_JOINT_UPPER_LIMITS[i], q0(i) + max_step);
+    // The step term goes first: std::max and std::min return their first argument when the other is NaN.
+    lower(i) = std::max(q0(i) - max_step, FR3_JOINT_LOWER_LIMITS[i]);
+    upper(i) = std::min(q0(i) + max_step, FR3_JOINT_UPPER_LIMITS[i]);
   }
+  // minimize_on_box needs a box that holds a point. NaN fails the comparison too.
+  if (!(lower.array() <= upper.array()).all())
+    throw std::invalid_argument("no joints are within max_step of q0 and inside the FR3 limits");
   Vector7d q = q0.cwiseMax(lower).cwiseMin(upper);
 
   for (int it = 0; it < kMaxIterations; ++it) {

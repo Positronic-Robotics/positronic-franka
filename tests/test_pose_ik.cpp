@@ -150,18 +150,30 @@ void every_joint_stays_within_the_step_bound_and_the_fr3_limits() {
   }
 }
 
-bool refuses_step(double step) {
+bool refuses(const Vector7d& q0, double step) {
   try {
-    solve_pose_ik(fr3_tool, pose_wxyz(fr3_tool(posture()).pose), posture(), step);
+    solve_pose_ik(fr3_tool, pose_wxyz(fr3_tool(posture()).pose), q0, step);
   } catch (const std::invalid_argument&) {
     return true;
   }
   return false;
 }
 
+bool refuses_step(double step) { return refuses(posture(), step); }
+
 void a_negative_or_nan_step_bound_is_refused() {
   check(refuses_step(-0.1), "a negative step was accepted");
   check(refuses_step(std::nan("")), "a NaN step was accepted");
+}
+
+void a_start_farther_than_the_step_outside_a_limit_is_refused() {
+  Vector7d q0 = posture();
+  q0(0) = FR3_JOINT_UPPER_LIMITS[0] + IK_MAX_JOINT_STEP + 0.1;
+  check(refuses(q0, IK_MAX_JOINT_STEP), "a start with no joints in reach was accepted");
+  q0(0) = FR3_JOINT_UPPER_LIMITS[0] + IK_MAX_JOINT_STEP - 0.1;
+  check(!refuses(q0, IK_MAX_JOINT_STEP), "a start with joints in reach was refused");
+  q0(0) = std::nan("");
+  check(refuses(q0, IK_MAX_JOINT_STEP), "a NaN start was accepted");
 }
 
 void an_infinite_step_bound_leaves_only_the_fr3_limits() {
@@ -269,6 +281,8 @@ int main() {
        every_joint_stays_within_the_step_bound_and_the_fr3_limits},
       {"a_negative_or_nan_step_bound_is_refused", a_negative_or_nan_step_bound_is_refused},
       {"a_zero_step_bound_holds_every_joint", a_zero_step_bound_holds_every_joint},
+      {"a_start_farther_than_the_step_outside_a_limit_is_refused",
+       a_start_farther_than_the_step_outside_a_limit_is_refused},
       {"an_infinite_step_bound_leaves_only_the_fr3_limits", an_infinite_step_bound_leaves_only_the_fr3_limits},
       {"near_a_singularity_the_weak_direction_gain_is_at_most_one_over_the_threshold",
        near_a_singularity_the_weak_direction_gain_is_at_most_one_over_the_threshold},
