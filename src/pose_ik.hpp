@@ -29,9 +29,8 @@ constexpr double IK_DAMPING_SINGULAR_VALUE = 0.1;
 constexpr double IK_MAX_JOINT_STEP = 0.5;
 // Joints that the move pulls towards along the null space of the tool Jacobian.
 constexpr std::array<double, 7> IK_POSTURE_JOINTS = {0.0, -0.31, 0.0, -1.65, 0.0, 1.522, 0.0};
-// Part of the null-space offset from IK_POSTURE_JOINTS that one command removes, and its weight.
+// Part of the null-space offset from IK_POSTURE_JOINTS that one command removes.
 constexpr double IK_POSTURE_PULL_PER_COMMAND = 0.02;
-constexpr double IK_POSTURE_WEIGHT = 0.1;
 
 // The tool pose (4x4, base frame) and its zero Jacobian (6x7, linear rows first) at one q.
 struct ToolKinematics {
@@ -165,7 +164,8 @@ Vector7d solve_pose_ik(const Kinematics& kinematics, const Eigen::Ref<const Vect
 
   const Vector7d posture = Eigen::Map<const Vector7d>(IK_POSTURE_JOINTS.data());
   const double posture_target = -IK_POSTURE_PULL_PER_COMMAND * null_direction.dot(q0 - posture);
-  const double w_sq = IK_POSTURE_WEIGHT * IK_POSTURE_WEIGHT;
+  constexpr double kPostureWeight = 0.1;
+  const double w_sq = kPostureWeight * kPostureWeight;
 
   Vector7d lower, upper;
   for (int i = 0; i < 7; ++i) {
