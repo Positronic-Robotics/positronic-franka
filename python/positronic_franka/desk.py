@@ -377,6 +377,9 @@ class Desk:
         # moot and its status calls would only raise connection errors.
         if self._rebooted:
             return
+        # A session that `ensure_control()` refused holds no token: FCI and the brakes are the holder's.
+        if self._control_token is None:
+            return
         # Each teardown step is attempted even if the previous one fails: leaving the brakes open or the control
         # token held is worse than any single failed request.
         try:

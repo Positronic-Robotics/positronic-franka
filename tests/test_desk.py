@@ -71,6 +71,7 @@ class FakeDesk:
         self.tests_run = 0
         # The control token Desk holds active, as `activeToken` reports it, and the id of each token it issued.
         self.active_token: dict | None = None
+        self.brakes = 'Locked'
         self.token_ids: dict[str, int] = {}
 
     def take_control_as(self, login: str) -> None:
@@ -135,6 +136,7 @@ class FakeDesk:
         status = {
             'safetyControllerStatus': 'Work',
             'timeToTd2': self.time_to_td2,
+            'brakeState': [self.brakes] * JOINTS,
             'recoverableErrors': dict(self.recoverable_errors),
             'demandedRecoveries': {'jointPositionError': [j in self.recovery_joints for j in range(JOINTS)]},
         }
@@ -315,6 +317,21 @@ def test_ensure_control_refuses_while_another_login_holds_control_and_takes_noth
     assert raised.value.holder == 'safe'
     assert box.requests[sent:] == []
     assert box.active_token == held_by_safe
+
+
+def test_a_session_ensure_control_refused_leaves_the_holders_fci_and_brakes_alone_at_exit():
+    box = FakeDesk(time_to_td2=TD2_PERIOD_SEC)
+    client = _desk_on(box)
+    client._take_control()
+    box.take_control_as('safe')
+    box.brakes = 'Unlocked'  # the holder opened them
+    with pytest.raises(desk.ControlHeldElsewhere) as raised:
+        client.ensure_control()
+    sent = len(box.requests)
+
+    client.__exit__(type(raised.value), raised.value, None)
+
+    assert box.requests[sent:] == []
 
 
 def test_ensure_control_takes_nothing_while_this_session_holds_control():
