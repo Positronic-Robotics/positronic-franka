@@ -1,6 +1,6 @@
 # Changelog
 
-## [0.8.1] - Unreleased
+## [0.8.1] - 2026-10-18
 
 ### Added
 - `Desk.ensure_control()`. It takes robot control again where Desk no longer knows the session's control token, for example after a Desk tab took control and released it. Desk does not revive a token that it dropped: a later FCI call with that token answers `404 ControlTokenUnknown`, also after the other login releases control. The method never forces control.
