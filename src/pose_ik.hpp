@@ -143,10 +143,8 @@ inline Vector7d minimize_on_box(const Matrix7d& H, const Vector7d& g, const Vect
 template <typename Kinematics>
 Vector7d solve_pose_ik(const Kinematics& kinematics, const Eigen::Ref<const Vector7d>& target_pose_wxyz,
                        const Eigen::Ref<const Vector7d>& q0, double max_step) {
-  // A negative or NaN step makes an empty box, which minimize_on_box does not handle.
-  if (!(max_step >= 0.0) || !std::isfinite(max_step)) {
-    throw std::invalid_argument("max_step must be finite and not negative");
-  }
+  // A negative or NaN step makes an empty box, which minimize_on_box does not handle. Infinity leaves only the limits.
+  if (!(max_step >= 0.0)) throw std::invalid_argument("max_step must not be negative or NaN");
   constexpr int kMaxIterations = 60;
   constexpr double kStepTolerance = 1e-9;  // rad
   // Keeps each Gauss-Newton step finite at an exact singularity; it vanishes at the fixed point.

@@ -162,7 +162,17 @@ bool refuses_step(double step) {
 void a_negative_or_nan_step_bound_is_refused() {
   check(refuses_step(-0.1), "a negative step was accepted");
   check(refuses_step(std::nan("")), "a NaN step was accepted");
-  check(refuses_step(INFINITY), "an infinite step was accepted");
+}
+
+void an_infinite_step_bound_leaves_only_the_fr3_limits() {
+  check(!refuses_step(INFINITY), "an infinite step was refused");
+  const Vector7d q0 = posture();
+  const Vector7d q_target = q0 + Vector7d::Constant(0.8);
+  const Vector7d q = solve_pose_ik(fr3_tool, pose_wxyz(fr3_tool(q_target).pose), q0, INFINITY);
+  check((q - q0).cwiseAbs().maxCoeff() > IK_MAX_JOINT_STEP, "a joint was held to the default step");
+  check((q.array() >= limit(FR3_JOINT_LOWER_LIMITS).array()).all() &&
+            (q.array() <= limit(FR3_JOINT_UPPER_LIMITS).array()).all(),
+        "a joint left its limits");
 }
 
 void a_zero_step_bound_holds_every_joint() {
@@ -259,6 +269,7 @@ int main() {
        every_joint_stays_within_the_step_bound_and_the_fr3_limits},
       {"a_negative_or_nan_step_bound_is_refused", a_negative_or_nan_step_bound_is_refused},
       {"a_zero_step_bound_holds_every_joint", a_zero_step_bound_holds_every_joint},
+      {"an_infinite_step_bound_leaves_only_the_fr3_limits", an_infinite_step_bound_leaves_only_the_fr3_limits},
       {"near_a_singularity_the_weak_direction_gain_is_at_most_one_over_the_threshold",
        near_a_singularity_the_weak_direction_gain_is_at_most_one_over_the_threshold},
       {"near_a_singularity_the_damping_keeps_a_wrist_command_inside_the_step_bound",
