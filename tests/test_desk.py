@@ -69,6 +69,26 @@ class FakeDesk:
         self.reads = 0
         self.test_polls_left = 0
         self.tests_run = 0
+        # The control token Desk holds active, as `activeToken` reports it, and the id of each token it issued.
+        self.active_token: dict | None = None
+        self.brakes = 'Locked'
+        self.token_ids: dict[str, int] = {}
+
+    def take_control_as(self, login: str) -> None:
+        """Another login takes control, as a Desk tab does. Desk forgets the token it held."""
+        self.active_token = {'id': self._issue(), 'ownedBy': login}
+
+    def release_control(self) -> None:
+        self.active_token = None
+
+    def _issue(self) -> int:
+        token_id = len(self.token_ids) + 1
+        self.token_ids[f'token-{token_id}'] = token_id
+        return token_id
+
+    def _known(self, headers: dict) -> bool:
+        token_id = self.token_ids.get(headers.get('X-Control-Token'))
+        return self.active_token is not None and token_id == self.active_token['id']
 
     @property
     def test_running(self) -> bool:
@@ -83,7 +103,18 @@ class FakeDesk:
         path = url.split('://', 1)[1].split('/', 1)[1]
         if method == 'GET' and path == 'admin/api/safety/status':
             return FakeResponse(self._status())
+        if method == 'GET' and path == 'admin/api/control-token':
+            return FakeResponse({'activeToken': self.active_token, 'fciActive': False, 'tokenRequest': None})
         self.requests.append(f'{method} {path}')
+        if method == 'POST' and path == 'admin/api/control-token/request':
+            token_id = self._issue()
+            if self.active_token is None:
+                self.active_token = {'id': token_id, 'ownedBy': kwargs['json']['requestedBy']}
+            return FakeResponse({'id': token_id, 'token': f'token-{token_id}'})
+        if method == 'DELETE' and path == 'admin/api/control-token/fci':
+            if not self._known(kwargs['headers']):
+                return FakeResponse(status_code=404, text='{"error":"ControlTokenUnknown"}')
+            return FakeResponse()
         if method == 'POST' and path == 'admin/api/login':
             return FakeResponse(status_code=401, text='{"error": "WrongCredentials"}')
         if method == 'POST' and path == 'desk/api/joints/unlock':
@@ -105,6 +136,7 @@ class FakeDesk:
         status = {
             'safetyControllerStatus': 'Work',
             'timeToTd2': self.time_to_td2,
+            'brakeState': [self.brakes] * JOINTS,
             'recoverableErrors': dict(self.recoverable_errors),
             'demandedRecoveries': {'jointPositionError': [j in self.recovery_joints for j in range(JOINTS)]},
         }
@@ -253,4 +285,71 @@ def test_joint_recovery_required_keeps_its_joints_across_a_process_boundary():
     copy = pickle.loads(pickle.dumps(error))
 
     assert copy.joints == error.joints
+    assert str(copy) == str(error)
+
+
+def test_ensure_control_takes_control_again_once_the_login_that_held_it_released_it():
+    box = FakeDesk(time_to_td2=TD2_PERIOD_SEC)
+    client = _desk_on(box)
+    client._take_control()
+    box.take_control_as('safe')
+    box.release_control()
+    with pytest.raises(requests.HTTPError):
+        client.deactivate_fci()  # Desk does not revive the token it dropped
+
+    client.ensure_control()
+
+    assert box.active_token['ownedBy'] == 'login'
+    client.deactivate_fci()
+
+
+def test_ensure_control_refuses_while_another_login_holds_control_and_takes_nothing():
+    box = FakeDesk(time_to_td2=TD2_PERIOD_SEC)
+    client = _desk_on(box)
+    client._take_control()
+    box.take_control_as('safe')
+    held_by_safe = dict(box.active_token)
+    sent = len(box.requests)
+
+    with pytest.raises(desk.ControlHeldElsewhere, match="Desk login 'safe'.*release control there") as raised:
+        client.ensure_control()
+
+    assert raised.value.holder == 'safe'
+    assert box.requests[sent:] == []
+    assert box.active_token == held_by_safe
+
+
+def test_a_session_ensure_control_refused_leaves_the_holders_fci_and_brakes_alone_at_exit():
+    box = FakeDesk(time_to_td2=TD2_PERIOD_SEC)
+    client = _desk_on(box)
+    client._take_control()
+    box.take_control_as('safe')
+    box.brakes = 'Unlocked'  # the holder opened them
+    with pytest.raises(desk.ControlHeldElsewhere) as raised:
+        client.ensure_control()
+    sent = len(box.requests)
+
+    client.__exit__(type(raised.value), raised.value, None)
+
+    assert box.requests[sent:] == []
+
+
+def test_ensure_control_takes_nothing_while_this_session_holds_control():
+    box = FakeDesk(time_to_td2=TD2_PERIOD_SEC)
+    client = _desk_on(box)
+    client._take_control()
+    sent = len(box.requests)
+
+    client.ensure_control()
+
+    assert box.requests[sent:] == []
+    client.deactivate_fci()
+
+
+def test_control_held_elsewhere_keeps_its_holder_across_a_process_boundary():
+    error = desk.ControlHeldElsewhere('desk.invalid', 'safe')
+
+    copy = pickle.loads(pickle.dumps(error))
+
+    assert copy.holder == 'safe'
     assert str(copy) == str(error)
