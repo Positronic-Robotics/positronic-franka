@@ -1,6 +1,7 @@
 #include <cstdlib>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <random>
 #include <sstream>
 #include <string>
@@ -71,7 +72,8 @@ Metrics verify_method(positronic_franka::Robot& robot,
     Vector7d q_solution;
     try {
       if (use_limits_solver) {
-        q_solution = robot.inverse_kinematics_with_limits(pose_vec, q_seed);
+        q_solution = robot.inverse_kinematics_with_limits(pose_vec, q_seed,
+                                                          std::numeric_limits<double>::infinity());
       } else {
         q_solution = robot.inverse_kinematics_q0(pose_vec, q_seed);
       }

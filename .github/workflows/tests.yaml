@@ -34,3 +34,18 @@ jobs:
           g++ -std=c++17 -Wall -Wextra -Werror -I src $(pkg-config --cflags eigen3) \
             tests/test_impedance_law.cpp -o test_impedance_law
           ./test_impedance_law
+
+  pose-ik:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Eigen
+        run: sudo apt-get update && sudo apt-get install -y libeigen3-dev
+
+      # The pose IK takes the kinematics as an argument, so this test runs on FR3 kinematics without libfranka.
+      - name: Run the pose IK tests
+        run: |
+          g++ -std=c++17 -Wall -Wextra -Werror -I src $(pkg-config --cflags eigen3) \
+            tests/test_pose_ik.cpp -o test_pose_ik
+          ./test_pose_ik

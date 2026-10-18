@@ -14,6 +14,7 @@
 #include <string>
 #include <thread>
 #include <atomic>
+#include <chrono>
 #include <mutex>
 #include <cstdint>
 #include <cstring>
@@ -26,9 +27,9 @@
 #include <Eigen/Geometry>
 #include <ruckig/ruckig.hpp>
 #include <ruckig/input_parameter.hpp>
-#include <osqp.h>
 
 #include "impedance_law.hpp"
+#include "pose_ik.hpp"
 
 namespace positronic_franka {
 
@@ -36,11 +37,6 @@ namespace positronic_franka {
 constexpr std::array<double, 7> PANDA_BASE_VELOCITY_LIMITS = {2.62, 2.62, 2.62, 2.62, 5.26, 4.18, 5.26};
 constexpr std::array<double, 7> PANDA_BASE_ACCELERATION_LIMITS = {10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0};
 constexpr std::array<double, 7> PANDA_BASE_JERK_LIMITS = {5000.0, 5000.0, 5000.0, 5000.0, 5000.0, 5000.0, 5000.0};
-// FR3 joint position limits (rad), as in the FR3 URDF that the robot reports.
-constexpr std::array<double, 7> FR3_JOINT_LOWER_LIMITS = {
-    -2.7437, -1.7837, -2.9007, -3.0421, -2.8065, 0.5445, -3.0159};
-constexpr std::array<double, 7> FR3_JOINT_UPPER_LIMITS = {
-    2.7437, 1.7837, 2.9007, -0.1518, 2.8065, 4.5169, 3.0159};
 
 // Arrival: joints within tolerance of the reference and no longer moving, judged on one reading.
 //
@@ -58,9 +54,6 @@ constexpr int SETTLE_TICKS_CAP = 1000;
 // Deadline used when the caller names none. Generous for a joint move on this arm.
 constexpr double DEFAULT_MOVE_DEADLINE_S = 15.0;
 
-// Common Eigen aliases; Vector7d and Matrix7d come from impedance_law.hpp
-using Vector6d = Eigen::Matrix<double, 6, 1>;
-using SpatialJacobian = Eigen::Matrix<double, 6, 7>;
 
 // Control modes. InternalImpedance drives the robot's built-in joint impedance controller through the
 // joint position motion generator with Ruckig-shaped references. SoftwareImpedance runs the impedance
@@ -559,7 +552,7 @@ class Robot {
 
       // Pose and error
       const Eigen::Matrix4d T_cur = ee_pose_matrix_(st);
-      const Eigen::Matrix<double, 6, 1> e = cartesian_error_(T_cur, t_tgt, R_tgt);
+      const Eigen::Matrix<double, 6, 1> e = pose_error(T_cur, t_tgt, R_tgt);
       const double err_norm = e.norm();
       if (err_norm < tol) break;
 
@@ -578,7 +571,7 @@ class Robot {
         const Vector7d q_trial = q + step * dq;
         st.q = to_std_array7_(q_trial);
         const Eigen::Matrix4d T_trial = ee_pose_matrix_(st);
-        const double err_trial = cartesian_error_(T_trial, t_tgt, R_tgt).norm();
+        const double err_trial = pose_error(T_trial, t_tgt, R_tgt).norm();
         if (err_trial < best_err) {
           best_err = err_trial;
           q = q_trial;
@@ -591,238 +584,26 @@ class Robot {
     return q;
   }
 
-  Vector7d inverse_kinematics_with_limits(
-      const Eigen::Ref<const Vector7d>& target_pose_wxyz,
-      double tol = 1e-4, int max_iters = 150, double min_step = 1e-8, double pinv_reg = 0.03,
-      double nullspace_gain = 0.002, double line_search_alpha = 1.0, double line_search_beta = 0.5,
-      int line_search_max_steps = 20) {
-    auto base = read_robot_state_();
-    Vector7d q0 = Eigen::Map<const Vector7d>(base.q.data());
-    return inverse_kinematics_with_limits(target_pose_wxyz, q0, tol, max_iters, min_step, pinv_reg,
-                                          nullspace_gain, line_search_alpha, line_search_beta,
-                                          line_search_max_steps);
+  // The IK for a live command: the joints that bring the tool as close as the bounds allow to
+  // target_pose_wxyz, from the measured joints. The step bound counts the time since the last call.
+  Vector7d inverse_kinematics_with_limits(const Eigen::Ref<const Vector7d>& target_pose_wxyz) {
+    const auto now = std::chrono::steady_clock::now();
+    std::optional<double> since_last;
+    if (last_pose_command_) since_last = std::chrono::duration<double>(now - *last_pose_command_).count();
+    last_pose_command_ = now;
+    const franka::RobotState base = read_robot_state_();
+    return inverse_kinematics_with_limits(target_pose_wxyz, Eigen::Map<const Vector7d>(base.q.data()),
+                                          max_joint_step(since_last));
   }
 
-  Vector7d inverse_kinematics_with_limits(
-      const Eigen::Ref<const Vector7d>& target_pose_wxyz,
-      const Eigen::Ref<const Vector7d>& q0,
-      double tol = 1e-4, int max_iters = 150, double min_step = 1e-8, double pinv_reg = 0.03,
-      double nullspace_gain = 0.002, double line_search_alpha = 1.0, double line_search_beta = 0.5,
-      int line_search_max_steps = 20) {
-    static_cast<void>(line_search_beta);
-    static_cast<void>(line_search_max_steps);
-
-    const Eigen::Vector3d t_tgt = target_pose_wxyz.head<3>();
-    Eigen::Quaterniond q_tgt(target_pose_wxyz(3), target_pose_wxyz(4), target_pose_wxyz(5),
-                             target_pose_wxyz(6));
-    q_tgt.normalize();
-    const Eigen::Matrix3d R_tgt = q_tgt.toRotationMatrix();
-
-    franka::RobotState base = read_robot_state_();
-    franka::RobotState st = base;
-    Vector7d q = q0;
-
-    const double regularization = std::max(pinv_reg, 1e-6);
-
-    const c_int n = 7;
-    const c_int m = 7;
-    std::vector<c_int> A_indptr(n + 1, 0);
-    std::vector<c_int> A_indices;
-    std::vector<c_float> A_data;
-    A_indices.reserve(n);
-    A_data.reserve(n);
-    for (c_int col = 0; col < n; ++col) {
-      A_indptr[col] = static_cast<c_int>(A_data.size());
-      A_indices.push_back(col);
-      A_data.push_back(1.0);
-    }
-    A_indptr[n] = static_cast<c_int>(A_data.size());
-
-    OSQPSettings settings;
-    osqp_set_default_settings(&settings);
-    settings.verbose = 0;
-    settings.polish = 0;
-    settings.max_iter = 400;
-    settings.eps_abs = std::min(1e-6, tol * 0.1);
-    settings.eps_rel = std::min(1e-6, tol * 0.1);
-    settings.warm_start = 0;
-
-    for (int it = 0; it < max_iters; ++it) {
+  Vector7d inverse_kinematics_with_limits(const Eigen::Ref<const Vector7d>& target_pose_wxyz,
+                                          const Eigen::Ref<const Vector7d>& q0, double max_step) {
+    franka::RobotState st = read_robot_state_();
+    const auto kinematics = [&](const Vector7d& q) {
       st.q = to_std_array7_(q);
-      const Eigen::Matrix4d T_cur = ee_pose_matrix_(st);
-      const Eigen::Matrix<double, 6, 1> e = cartesian_error_(T_cur, t_tgt, R_tgt);
-      const double err_norm = e.norm();
-      if (err_norm < tol)
-        break;
-
-      const SpatialJacobian J = ee_jacobian_(st);
-      const Eigen::Matrix<double, 7, 7> P = J.transpose() * J +
-                                            regularization * Eigen::Matrix<double, 7, 7>::Identity();
-
-      std::vector<c_int> P_indptr(n + 1, 0);
-      std::vector<c_int> P_indices;
-      std::vector<c_float> P_data;
-      P_indices.reserve(n * (n + 1) / 2);
-      P_data.reserve(n * (n + 1) / 2);
-      for (c_int col = 0; col < n; ++col) {
-        P_indptr[col] = static_cast<c_int>(P_data.size());
-        for (c_int row = 0; row <= col; ++row) {
-          const double value = P(row, col);
-          if (std::abs(value) < 1e-12)
-            continue;
-          P_indices.push_back(row);
-          P_data.push_back(static_cast<c_float>(value));
-        }
-      }
-      P_indptr[n] = static_cast<c_int>(P_data.size());
-
-      c_float* A_data_raw = static_cast<c_float*>(c_malloc(A_data.size() * sizeof(c_float)));
-      c_int* A_indices_raw = static_cast<c_int*>(c_malloc(A_indices.size() * sizeof(c_int)));
-      c_int* A_indptr_raw = static_cast<c_int*>(c_malloc(A_indptr.size() * sizeof(c_int)));
-      if (!A_data_raw || !A_indices_raw || !A_indptr_raw) {
-        if (A_data_raw) c_free(A_data_raw);
-        if (A_indices_raw) c_free(A_indices_raw);
-        if (A_indptr_raw) c_free(A_indptr_raw);
-        throw std::runtime_error("Failed to allocate OSQP constraint buffers.");
-      }
-      std::memcpy(A_data_raw, A_data.data(), A_data.size() * sizeof(c_float));
-      std::memcpy(A_indices_raw, A_indices.data(), A_indices.size() * sizeof(c_int));
-      std::memcpy(A_indptr_raw, A_indptr.data(), A_indptr.size() * sizeof(c_int));
-      csc* A_csc = csc_matrix(m, n, static_cast<c_int>(A_data.size()), A_data_raw, A_indices_raw,
-                              A_indptr_raw);
-      if (!A_csc) {
-        c_free(A_data_raw);
-        c_free(A_indices_raw);
-        c_free(A_indptr_raw);
-        throw std::runtime_error("Failed to construct OSQP constraint matrix.");
-      }
-
-      c_float* P_data_raw = static_cast<c_float*>(c_malloc(P_data.size() * sizeof(c_float)));
-      c_int* P_indices_raw = static_cast<c_int*>(c_malloc(P_indices.size() * sizeof(c_int)));
-      c_int* P_indptr_raw = static_cast<c_int*>(c_malloc(P_indptr.size() * sizeof(c_int)));
-      if (!P_data_raw || !P_indices_raw || !P_indptr_raw) {
-        if (P_data_raw) c_free(P_data_raw);
-        if (P_indices_raw) c_free(P_indices_raw);
-        if (P_indptr_raw) c_free(P_indptr_raw);
-        csc_spfree(A_csc);
-        throw std::runtime_error("Failed to allocate OSQP Hessian buffers.");
-      }
-      std::memcpy(P_data_raw, P_data.data(), P_data.size() * sizeof(c_float));
-      std::memcpy(P_indices_raw, P_indices.data(), P_indices.size() * sizeof(c_int));
-      std::memcpy(P_indptr_raw, P_indptr.data(), P_indptr.size() * sizeof(c_int));
-
-      csc* P_csc = csc_matrix(n, n, static_cast<c_int>(P_data.size()), P_data_raw, P_indices_raw,
-                              P_indptr_raw);
-      if (!P_csc) {
-        c_free(P_data_raw);
-        c_free(P_indices_raw);
-        c_free(P_indptr_raw);
-        csc_spfree(A_csc);
-        throw std::runtime_error("Failed to construct OSQP Hessian matrix.");
-      }
-
-      std::vector<c_float> q_vec(n, 0.0);
-      Vector7d grad = J.transpose() * e;
-      for (c_int i = 0; i < n; ++i) {
-        q_vec[static_cast<size_t>(i)] =
-            static_cast<c_float>(grad(static_cast<Eigen::Index>(i)));
-      }
-
-      std::vector<c_float> lower(m, 0.0);
-      std::vector<c_float> upper(m, 0.0);
-      for (c_int i = 0; i < m; ++i) {
-        const double min_bound = FR3_JOINT_LOWER_LIMITS[static_cast<size_t>(i)] -
-                                 q(static_cast<Eigen::Index>(i));
-        const double max_bound = FR3_JOINT_UPPER_LIMITS[static_cast<size_t>(i)] -
-                                 q(static_cast<Eigen::Index>(i));
-        lower[static_cast<size_t>(i)] = static_cast<c_float>(min_bound);
-        upper[static_cast<size_t>(i)] = static_cast<c_float>(max_bound);
-      }
-
-      c_float* q_raw = static_cast<c_float*>(c_malloc(n * sizeof(c_float)));
-      c_float* l_raw = static_cast<c_float*>(c_malloc(m * sizeof(c_float)));
-      c_float* u_raw = static_cast<c_float*>(c_malloc(m * sizeof(c_float)));
-      if (!q_raw || !l_raw || !u_raw) {
-        if (q_raw) c_free(q_raw);
-        if (l_raw) c_free(l_raw);
-        if (u_raw) c_free(u_raw);
-        csc_spfree(P_csc);
-        csc_spfree(A_csc);
-        throw std::runtime_error("Failed to allocate OSQP vector buffers.");
-      }
-      for (c_int i = 0; i < n; ++i)
-        q_raw[i] = q_vec[static_cast<size_t>(i)];
-      for (c_int i = 0; i < m; ++i) {
-        l_raw[i] = lower[static_cast<size_t>(i)];
-        u_raw[i] = upper[static_cast<size_t>(i)];
-      }
-
-      OSQPData data;
-      data.n = n;
-      data.m = m;
-      data.P = P_csc;
-      data.A = A_csc;
-      data.q = q_raw;
-      data.l = l_raw;
-      data.u = u_raw;
-
-      OSQPWorkspace* workspace = nullptr;
-      const c_int setup_status = osqp_setup(&workspace, &data, &settings);
-      if (setup_status != 0 || workspace == nullptr) {
-        if (workspace) osqp_cleanup(workspace);
-        c_free(q_raw);
-        c_free(l_raw);
-        c_free(u_raw);
-        csc_spfree(P_csc);
-        csc_spfree(A_csc);
-        throw std::runtime_error("Failed to set up OSQP solver.");
-      }
-
-      const c_int solve_status = osqp_solve(workspace);
-      if (solve_status != 0 || workspace->info == nullptr ||
-          (workspace->info->status_val != OSQP_SOLVED &&
-           workspace->info->status_val != OSQP_SOLVED_INACCURATE)) {
-        osqp_cleanup(workspace);
-        c_free(q_raw);
-        c_free(l_raw);
-        c_free(u_raw);
-        csc_spfree(P_csc);
-        csc_spfree(A_csc);
-        break;
-      }
-
-      Vector7d dq = Vector7d::Zero();
-      for (c_int i = 0; i < n; ++i)
-        dq(static_cast<Eigen::Index>(i)) =
-            static_cast<double>(workspace->solution->x[static_cast<size_t>(i)]);
-
-      osqp_cleanup(workspace);
-      c_free(q_raw);
-      c_free(l_raw);
-      c_free(u_raw);
-      csc_spfree(P_csc);
-      csc_spfree(A_csc);
-
-      if (dq.norm() < min_step)
-        break;
-
-      double step_scale = 1.0;
-      if (line_search_alpha > 0.0 && dq.norm() > line_search_alpha)
-        step_scale = line_search_alpha / dq.norm();
-
-      Vector7d q_next = q + step_scale * dq;
-      for (size_t i = 0; i < 7; ++i) {
-        const double lower_limit = FR3_JOINT_LOWER_LIMITS[i];
-        const double upper_limit = FR3_JOINT_UPPER_LIMITS[i];
-        q_next(static_cast<Eigen::Index>(i)) =
-            std::clamp(q_next(static_cast<Eigen::Index>(i)), lower_limit, upper_limit);
-      }
-
-      if ((q_next - q).norm() < min_step)
-        break;
-      q = q_next;
-    }
-    return q;
+      return ToolKinematics{ee_pose_matrix_(st), ee_jacobian_(st)};
+    };
+    return solve_pose_ik(kinematics, target_pose_wxyz, q0, max_step);
   }
 
 private:
@@ -842,21 +623,6 @@ private:
   SpatialJacobian ee_jacobian_(const franka::RobotState& st) const {
     const auto J_data = model_->zeroJacobian(franka::Frame::kEndEffector, st);
     return Eigen::Map<const SpatialJacobian>(J_data.data());
-  }
-
-  static Eigen::Matrix<double, 6, 1> cartesian_error_(const Eigen::Matrix4d& T_cur,
-                                                      const Eigen::Vector3d& t_tgt,
-                                                      const Eigen::Matrix3d& R_tgt) {
-    const Eigen::Vector3d t_cur = T_cur.block<3, 1>(0, 3);
-    const Eigen::Matrix3d R_cur = T_cur.block<3, 3>(0, 0);
-    const Eigen::Vector3d e_pos = t_cur - t_tgt;
-    const Eigen::Matrix3d R_rel = R_cur.transpose() * R_tgt;
-    const Eigen::AngleAxisd aa(R_rel);
-    const Eigen::Vector3d w = aa.angle() * aa.axis();
-    const Eigen::Vector3d e_rot = -R_cur * w;
-    Eigen::Matrix<double, 6, 1> e;
-    e << e_pos, e_rot;
-    return e;
   }
 
   static Eigen::Matrix<double, 7, 6> damped_pinv_(const SpatialJacobian& J, double lambda) {
@@ -1274,6 +1040,8 @@ private:
   // The software-impedance loop's reference, published so state() can report the tracked q_d; empty
   // whenever the torque loop is not running.
   std::optional<Vector7d> last_software_ref_;
+  // When the live IK last ran; its step bound counts from here. Callers are serialized by the Python GIL.
+  std::optional<std::chrono::steady_clock::time_point> last_pose_command_;
 
   const double relative_dynamics_factor_{1.0};
   // Read when a motion command starts the loop; the running loop never reads it — a software gains
