@@ -8,6 +8,7 @@
 #include <functional>
 #include <iostream>
 #include <random>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -149,6 +150,28 @@ void every_joint_stays_within_the_step_bound_and_the_fr3_limits() {
   }
 }
 
+bool refuses_step(double step) {
+  try {
+    solve_pose_ik(fr3_tool, pose_wxyz(fr3_tool(posture()).pose), posture(), step);
+  } catch (const std::invalid_argument&) {
+    return true;
+  }
+  return false;
+}
+
+void a_negative_or_nan_step_bound_is_refused() {
+  check(refuses_step(-0.1), "a negative step was accepted");
+  check(refuses_step(std::nan("")), "a NaN step was accepted");
+  check(refuses_step(INFINITY), "an infinite step was accepted");
+}
+
+void a_zero_step_bound_holds_every_joint() {
+  check(!refuses_step(0.0), "a zero step was refused");
+  const Vector7d q0 = posture();
+  const Vector7d target = pose_wxyz(fr3_tool(q0 + Vector7d::Constant(0.1)).pose);
+  check((solve_pose_ik(fr3_tool, target, q0, 0.0) - q0).norm() == 0.0, "a joint moved with a zero step");
+}
+
 // A measured FR3 pose just before a wrist-singularity spin: joint 6 near pi, s_min 0.041.
 Vector7d near_wrist_singularity() {
   Vector7d q;
@@ -234,6 +257,8 @@ int main() {
        a_nearby_pose_away_from_a_singularity_is_reached_within_0_1_mm_and_0_1_deg},
       {"every_joint_stays_within_the_step_bound_and_the_fr3_limits",
        every_joint_stays_within_the_step_bound_and_the_fr3_limits},
+      {"a_negative_or_nan_step_bound_is_refused", a_negative_or_nan_step_bound_is_refused},
+      {"a_zero_step_bound_holds_every_joint", a_zero_step_bound_holds_every_joint},
       {"near_a_singularity_the_weak_direction_gain_is_at_most_one_over_the_threshold",
        near_a_singularity_the_weak_direction_gain_is_at_most_one_over_the_threshold},
       {"near_a_singularity_the_damping_keeps_a_wrist_command_inside_the_step_bound",
