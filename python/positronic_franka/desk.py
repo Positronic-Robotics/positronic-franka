@@ -40,10 +40,6 @@ _REBOOT_POLL_INTERVAL_SEC = 2.0
 # Consecutive settled reads required before the rebooted controller is treated as ready.
 _REBOOT_READY_STABLE_READS = 3
 
-_CONTROL_HELD_MSG = (
-    'Another session holds robot control. Open Franka Desk at https://{host}, release control there, then start again.'
-)
-
 # An active recoverable safety error puts the safety controller into Recovery, where Desk refuses every action
 # (424 ActionUnavailable/RecoverableErrorActive) — including unlocking the brakes and running the self-test — until
 # the error is acknowledged. Maps the flags Desk reports to the error ids its acknowledge endpoint expects.
@@ -110,6 +106,24 @@ class JointRecoveryRequired(RuntimeError):
         )
 
 
+class ControlHeldElsewhere(RuntimeError):
+    """Another Desk login holds robot control, so this session cannot take it. ``holder`` is that login, or None
+    where Desk names no holder."""
+
+    def __init__(self, host: str, holder: str | None):
+        # The arguments are the whole state, so the error pickles across a process boundary.
+        super().__init__(host, holder)
+        self.host = host
+        self.holder = holder
+
+    def __str__(self) -> str:
+        holder = f': Desk login {self.holder!r}' if self.holder else ''
+        return (
+            f'Another session holds robot control{holder}. Open Franka Desk at https://{self.host}, release control '
+            'there, then try again.'
+        )
+
+
 class Desk:
     def __init__(self, host: str, login: str, password: str, timeout: float = 10.0):
         self.host = host
@@ -119,6 +133,7 @@ class Desk:
         self._session = requests.Session()
         self._session.verify = False
         self._control_token: str | None = None
+        self._control_id: int | None = None
         self._rebooted = False
         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -154,10 +169,10 @@ class Desk:
         # A request made while control is held becomes a pending token that Desk promotes to active once the holder
         # releases, silently transferring control here. Refuse up front if control is held; and if control is taken
         # in the race between that check and our request, drop the pending token rather than keep it.
-        if self._token_state()['activeToken'] is not None:
-            raise RuntimeError(_CONTROL_HELD_MSG.format(host=self.host))
+        if (active := self._token_state()['activeToken']) is not None:
+            raise ControlHeldElsewhere(self.host, active['ownedBy'])
         request = self._request('POST', '/admin/api/control-token/request', json={'requestedBy': self._login}).json()
-        self._control_token = request['token']
+        self._control_token, self._control_id = request['token'], request['id']
         try:
             active = self._token_state()['activeToken']
         except Exception:
@@ -167,20 +182,33 @@ class Desk:
                 self._release_control()
             raise
         if active is None or active['id'] != request['id']:
-            self._control_token = None
+            self._control_token = self._control_id = None
             self._request(
                 'DELETE',
                 f'/admin/api/control-token/request/{request["id"]}',
                 json={'token': request['token']},
                 headers={'X-Control-Token': request['token']},
             )
-            raise RuntimeError(_CONTROL_HELD_MSG.format(host=self.host))
+            raise ControlHeldElsewhere(self.host, None if active is None else active['ownedBy'])
+
+    def ensure_control(self) -> None:
+        """Take robot control again where Desk no longer knows this session's token, as after another login held it.
+
+        Raises `ControlHeldElsewhere` while another login holds control. It never forces control.
+        """
+        active = self._token_state()['activeToken']
+        if active is not None and active['id'] == self._control_id:
+            return
+        logger.warning("Desk no longer knows this session's control token; taking control again")
+        # Desk does not revive a token it dropped, and a request that carries one can answer 404 ControlTokenUnknown.
+        self._control_token = self._control_id = None
+        self._take_control()
 
     def _release_control(self) -> None:
         if self._control_token is None:
             return
         self._request('DELETE', '/admin/api/control-token', json={'token': self._control_token})
-        self._control_token = None
+        self._control_token = self._control_id = None
 
     def _token_state(self) -> dict:
         return self._request('GET', '/admin/api/control-token').json()
@@ -231,7 +259,7 @@ class Desk:
         self._request('POST', '/admin/api/reboot')
         if wait:
             self._await_downtime()
-        self._control_token = None
+        self._control_token = self._control_id = None
         self._rebooted = True
         if wait:
             self._await_settle()
