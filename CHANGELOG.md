@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.8.1] - 2026-10-18
+
+### Added
+- `Desk.ensure_control()`. It takes robot control again where Desk no longer knows the session's control token, for example after a Desk tab took control and released it. Desk does not revive a token that it dropped: a later FCI call with that token answers `404 ControlTokenUnknown`, also after the other login releases control. The method never forces control.
+- `ControlHeldElsewhere`, a `RuntimeError`. The context manager raises it in place of a plain `RuntimeError` while another login holds control, and `ensure_control()` raises it too. `holder` is that login. The message names it, keeps its first words, and tells the reader to release control in Desk.
+
 ## [0.8.0] - 2026-10-16
 
 ### Added
