@@ -61,73 +61,91 @@ inline double max_joint_step(std::optional<double> seconds_since_last_command) {
   return IK_MAX_JOINT_SPEED * std::max(0.0, *seconds_since_last_command);
 }
 
+// Where minimize_on_box holds each joint: free, at its lower or upper bound, or fixed by a zero-width box.
+enum class BoxHold { kFree, kLower, kUpper, kFixed };
+using BoxHolds = std::array<BoxHold, 7>;
+
+// argmin 0.5 d^T H d + g^T d over the free joints, with every other joint held at its value in d.
+inline Vector7d newton_point_on_free_joints(const Matrix7d& H, const Vector7d& g, const Vector7d& d,
+                                            const BoxHolds& hold) {
+  std::array<int, 7> free_index{};
+  int n_free = 0;
+  for (int i = 0; i < 7; ++i)
+    if (hold[i] == BoxHold::kFree) free_index[n_free++] = i;
+  Vector7d p = d;
+  if (n_free == 0) return p;
+  Eigen::MatrixXd H_ff(n_free, n_free);
+  Eigen::VectorXd rhs(n_free);
+  for (int a = 0; a < n_free; ++a) {
+    const int i = free_index[a];
+    rhs(a) = -g(i);
+    for (int j = 0; j < 7; ++j)
+      if (hold[j] != BoxHold::kFree) rhs(a) -= H(i, j) * d(j);
+    for (int b = 0; b < n_free; ++b) H_ff(a, b) = H(i, free_index[b]);
+  }
+  const Eigen::VectorXd x = H_ff.llt().solve(rhs);
+  for (int a = 0; a < n_free; ++a) p(free_index[a]) = x(a);
+  return p;
+}
+
+// The free joint whose bound the move from d to p meets first, and the part of the move that reaches it.
+struct FirstBound {
+  int joint = -1;  // -1: the move stays inside the box
+  double fraction = 1.0;
+};
+
+inline FirstBound first_bound_on_the_move(const Vector7d& d, const Vector7d& p, const Vector7d& lo,
+                                          const Vector7d& hi, const BoxHolds& hold) {
+  FirstBound first;
+  for (int i = 0; i < 7; ++i) {
+    if (hold[i] != BoxHold::kFree) continue;
+    const double edge = p(i) < lo(i) ? lo(i) : p(i) > hi(i) ? hi(i) : p(i);
+    if (edge == p(i)) continue;
+    const double fraction = (edge - d(i)) / (p(i) - d(i));
+    if (fraction < first.fraction) first = {i, fraction};
+  }
+  return first;
+}
+
+// The held joint whose move into the box lowers the cost most, or -1 when no move does.
+inline int joint_to_release(const Vector7d& grad, const BoxHolds& hold) {
+  int release = -1;
+  double strongest = 1e-12;
+  for (int i = 0; i < 7; ++i) {
+    const double pull = hold[i] == BoxHold::kLower ? -grad(i) : hold[i] == BoxHold::kUpper ? grad(i) : 0.0;
+    if (pull > strongest) {
+      strongest = pull;
+      release = i;
+    }
+  }
+  return release;
+}
+
 // argmin 0.5 d^T H d + g^T d subject to lo <= d <= hi, by a primal active set.
 // H must be positive definite, and lo <= 0 <= hi, so that d = 0 is a feasible start.
 inline Vector7d minimize_on_box(const Matrix7d& H, const Vector7d& g, const Vector7d& lo, const Vector7d& hi) {
-  enum Bound { kFree, kLower, kUpper, kFixed };
-  std::array<Bound, 7> bound{};
+  BoxHolds hold{};
   Vector7d d = Vector7d::Zero();
   for (int i = 0; i < 7; ++i)
     if (lo(i) >= hi(i)) {
-      bound[i] = kFixed;
+      hold[i] = BoxHold::kFixed;
       d(i) = lo(i);
     }
-  // Each pass either fixes a joint at a bound or frees one, so a few passes per joint are enough.
+  // Each pass either holds a joint at a bound or frees one, so a few passes per joint are enough.
   for (int pass = 0; pass < 64; ++pass) {
-    std::array<int, 7> free_index{};
-    int n_free = 0;
-    for (int i = 0; i < 7; ++i)
-      if (bound[i] == kFree) free_index[n_free++] = i;
-
-    Vector7d p = d;
-    if (n_free > 0) {
-      Eigen::MatrixXd H_ff(n_free, n_free);
-      Eigen::VectorXd rhs(n_free);
-      for (int a = 0; a < n_free; ++a) {
-        const int i = free_index[a];
-        rhs(a) = -g(i);
-        for (int j = 0; j < 7; ++j)
-          if (bound[j] != kFree) rhs(a) -= H(i, j) * d(j);
-        for (int b = 0; b < n_free; ++b) H_ff(a, b) = H(i, free_index[b]);
-      }
-      const Eigen::VectorXd x = H_ff.llt().solve(rhs);
-      for (int a = 0; a < n_free; ++a) p(free_index[a]) = x(a);
-    }
-
-    double alpha = 1.0;
-    int blocking = -1;
-    for (int a = 0; a < n_free; ++a) {
-      const int i = free_index[a];
-      if (p(i) < lo(i) && (lo(i) - d(i)) / (p(i) - d(i)) < alpha) {
-        alpha = (lo(i) - d(i)) / (p(i) - d(i));
-        blocking = i;
-      } else if (p(i) > hi(i) && (hi(i) - d(i)) / (p(i) - d(i)) < alpha) {
-        alpha = (hi(i) - d(i)) / (p(i) - d(i));
-        blocking = i;
-      }
-    }
-    if (blocking >= 0) {
-      d += alpha * (p - d);
-      const bool at_lower = p(blocking) < lo(blocking);
-      d(blocking) = at_lower ? lo(blocking) : hi(blocking);
-      bound[blocking] = at_lower ? kLower : kUpper;
+    const Vector7d p = newton_point_on_free_joints(H, g, d, hold);
+    const FirstBound first = first_bound_on_the_move(d, p, lo, hi, hold);
+    if (first.joint >= 0) {
+      d += first.fraction * (p - d);
+      const bool at_lower = p(first.joint) < lo(first.joint);
+      d(first.joint) = at_lower ? lo(first.joint) : hi(first.joint);
+      hold[first.joint] = at_lower ? BoxHold::kLower : BoxHold::kUpper;
       continue;
     }
     d = p;
-
-    // A joint held at a bound is released when the cost falls by moving it into the box.
-    const Vector7d grad = H * d + g;
-    int release = -1;
-    double worst = 1e-12;
-    for (int i = 0; i < 7; ++i) {
-      const double pull = bound[i] == kLower ? -grad(i) : bound[i] == kUpper ? grad(i) : 0.0;
-      if (pull > worst) {
-        worst = pull;
-        release = i;
-      }
-    }
+    const int release = joint_to_release(H * d + g, hold);
     if (release < 0) return d;
-    bound[release] = kFree;
+    hold[release] = BoxHold::kFree;
   }
   return d;
 }

@@ -84,20 +84,6 @@ std::pair<double, double> miss(const Vector7d& q, const Vector7d& target) {
 
 Vector7d posture() { return Eigen::Map<const Vector7d>(IK_POSTURE_JOINTS.data()); }
 
-// Recording 14 of internal#2110 one moment before the link dropped: joint 6 near pi, s_min 0.041.
-Vector7d near_wrist_singularity() {
-  Vector7d q;
-  q << 0.810, 0.0319, 0.060, -2.5503, 1.0741, 3.1396, -0.9533;
-  return q;
-}
-
-Vector7d null_direction(const Vector7d& q) {
-  const SpatialJacobian J = fr3_tool(q).jacobian;
-  return Eigen::SelfAdjointEigenSolver<Matrix7d>(J.transpose() * J).eigenvectors().col(0);
-}
-
-Vector7d limit(const std::array<double, 7>& limits) { return Eigen::Map<const Vector7d>(limits.data()); }
-
 void minimize_on_box_meets_the_optimality_conditions() {
   std::mt19937 rng(7);
   std::uniform_real_distribution<double> u(-1.0, 1.0);
@@ -156,6 +142,8 @@ void a_nearby_pose_away_from_a_singularity_is_reached_within_0_1_mm_and_0_1_deg(
   }
 }
 
+Vector7d limit(const std::array<double, 7>& limits) { return Eigen::Map<const Vector7d>(limits.data()); }
+
 void every_joint_stays_within_the_step_bound_and_the_fr3_limits() {
   std::mt19937 rng(13);
   std::uniform_real_distribution<double> u(-1.0, 1.0);
@@ -173,6 +161,13 @@ void every_joint_stays_within_the_step_bound_and_the_fr3_limits() {
     check(((q - q0).cwiseAbs().array() <= step + 1e-12).all(), "a joint stepped past the bound");
     check((q.array() >= lower.array()).all() && (q.array() <= upper.array()).all(), "a joint left its limits");
   }
+}
+
+// A measured FR3 pose just before a wrist-singularity spin: joint 6 near pi, s_min 0.041.
+Vector7d near_wrist_singularity() {
+  Vector7d q;
+  q << 0.810, 0.0319, 0.060, -2.5503, 1.0741, 3.1396, -0.9533;
+  return q;
 }
 
 void near_a_singularity_the_weak_direction_gain_is_at_most_one_over_the_threshold() {
@@ -200,6 +195,11 @@ void near_a_singularity_the_weak_direction_gain_is_at_most_one_over_the_threshol
   check(weak_move <= eps / S0, "the weak-direction move exceeds the change over the threshold");
   check(std::abs(weak_move - eps * s / (s * s + mu_sq)) < 0.1 * weak_move, "the move follows the damping law");
   check(weak_move < 0.5 * eps / s, "the move is less than half the undamped move");
+}
+
+Vector7d null_direction(const Vector7d& q) {
+  const SpatialJacobian J = fr3_tool(q).jacobian;
+  return Eigen::SelfAdjointEigenSolver<Matrix7d>(J.transpose() * J).eigenvectors().col(0);
 }
 
 void the_move_pulls_the_posture_along_the_null_space_and_keeps_the_tool() {
