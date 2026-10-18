@@ -5,7 +5,6 @@
 #include <array>
 #include <cmath>
 #include <cstdlib>
-#include <cstring>
 #include <functional>
 #include <iostream>
 #include <string>
@@ -17,9 +16,9 @@
 namespace {
 
 using positronic_franka::impedance_torque;
+using positronic_franka::move_reference_toward;
 using positronic_franka::stop_has_settled;
 using positronic_franka::Matrix7d;
-using positronic_franka::OverspeedBrake;
 using positronic_franka::SpringTorqueRateLimiter;
 using positronic_franka::Vector7d;
 
@@ -52,15 +51,6 @@ std::array<double, 7> uniform(double v) {
   std::array<double, 7> a;
   a.fill(v);
   return a;
-}
-
-const std::array<double, 7> BRAKE_THRESHOLD = {2.0, 2.0, 2.0, 2.0, 2.5, 3.0, 2.0};
-const std::array<double, 7> BRAKE_GAIN = {50.0, 50.0, 50.0, 20.0, 20.0, 20.0, 10.0};
-
-OverspeedBrake brake() { return OverspeedBrake(BRAKE_THRESHOLD, BRAKE_GAIN); }
-
-bool same_bits(const Vector7d& a, const Vector7d& b) {
-  return std::memcmp(a.data(), b.data(), sizeof(double) * 7) == 0;
 }
 
 void a_target_step_ramps_the_spring_torque_at_the_cap_rate() {
@@ -108,11 +98,11 @@ void damping_and_coriolis_pass_through_uncapped() {
   const Vector7d q_d = q;  // no spring torque, so the cap has nothing to hold back
   const Vector7d coriolis = Vector7d::LinSpaced(-2.0, 3.0);
   SpringTorqueRateLimiter limiter(uniform(1.0));
-  impedance_torque(Kp, Kd, q_d, q, Vector7d::Zero(), Vector7d::Zero(), limiter, brake(), 0.0);
+  impedance_torque(Kp, Kd, q_d, q, Vector7d::Zero(), Vector7d::Zero(), limiter, 0.0);
 
   // A velocity step makes a damping step far past the 1 Nm/s cap.
   const Vector7d dq = Vector7d::Constant(1.5);
-  const Vector7d tau = impedance_torque(Kp, Kd, q_d, q, dq, coriolis, limiter, brake(), 1e-3);
+  const Vector7d tau = impedance_torque(Kp, Kd, q_d, q, dq, coriolis, limiter, 1e-3);
   check(tau == -(Kd * dq) + coriolis, "damping and coriolis arrive in full on the first tick");
 }
 
@@ -129,7 +119,7 @@ void a_cap_above_the_spring_torque_change_leaves_the_law_unchanged() {
     const Vector7d spring = Kp * (q_d - q);
     if (tick > 0) check((spring - previous_spring).cwiseAbs().maxCoeff() < 1.0, "the change stays inside the cap");
     previous_spring = spring;
-    const Vector7d tau = impedance_torque(Kp, Kd, q_d, q, dq, coriolis, limiter, brake(), 1e-3);
+    const Vector7d tau = impedance_torque(Kp, Kd, q_d, q, dq, coriolis, limiter, 1e-3);
     const Vector7d uncapped = Kp * (q_d - q) - Kd * dq + coriolis;
     check(tau == uncapped, "tick " + std::to_string(tick) + " equals the uncapped law exactly");
     q += 1e-3 * dq;
@@ -167,89 +157,66 @@ void a_stop_with_a_still_arm_settles_only_once_the_spring_torque_ramps_to_zero()
   check(!stop_has_settled(limiter, Vector7d::Constant(0.2), tolerance), "a moving arm has not settled");
 }
 
-// Every joint just below its threshold, with both signs.
-Vector7d below_threshold() {
-  Vector7d dq;
-  for (int i = 0; i < 7; ++i) dq(i) = (i % 2 == 0 ? 1.0 : -1.0) * (BRAKE_THRESHOLD[i] - 1e-9);
-  return dq;
+const Vector7d REFERENCE_SPEED = (Vector7d() << 1.5, 1.5, 1.5, 1.5, 1.2, 1.0, 2.0).finished();
+
+// A jump of 2.4 rad on joint 5 against 0.3 rad or less elsewhere: joint 5 at 1.2 rad/s sets the pace.
+Vector7d far_target(const Vector7d& start) {
+  Vector7d jump;
+  jump << 0.3, -0.2, 0.1, 0.0, -2.4, 0.05, 0.25;
+  return start + jump;
 }
 
-void the_overspeed_brake_leaves_the_torque_unchanged_below_the_threshold() {
-  const Matrix7d Kp = stiffness();
-  const Matrix7d Kd = damping();
-  const Vector7d q = Vector7d::LinSpaced(-1.1, 1.3);
-  const Vector7d q_d = q + Vector7d::Constant(0.0004);
-  const Vector7d coriolis = Vector7d::LinSpaced(0.01, 0.09);
-  const Vector7d dq = below_threshold();
-  SpringTorqueRateLimiter limiter(uniform(1000.0));
-  const Vector7d tau = impedance_torque(Kp, Kd, q_d, q, dq, coriolis, limiter, brake(), 1e-3);
-  const Vector7d unbraked = Kp * (q_d - q) - Kd * dq + coriolis;
-  check(same_bits(tau, unbraked), "the torque keeps every bit");
-}
-
-void the_overspeed_brake_opposes_the_excess_speed_on_each_joint() {
-  Vector7d dq = below_threshold();
-  dq(1) = -(BRAKE_THRESHOLD[1] + 0.4);  // joint 2 too fast backwards
-  dq(5) = BRAKE_THRESHOLD[5] + 0.25;    // joint 6 too fast forwards
-  const Matrix7d Kp = stiffness();
-  const Matrix7d Kd = damping();
-  const Vector7d q = Vector7d::LinSpaced(-1.1, 1.3);
-  const Vector7d q_d = q + Vector7d::Constant(0.0004);
-  const Vector7d coriolis = Vector7d::LinSpaced(0.01, 0.09);
-  SpringTorqueRateLimiter limiter(uniform(1000.0));
-  const Vector7d tau = impedance_torque(Kp, Kd, q_d, q, dq, coriolis, limiter, brake(), 1e-3);
-  const Vector7d brake_torque = tau - (Kp * (q_d - q) - Kd * dq + coriolis);
-  for (int i = 0; i < 7; ++i) {
-    double expected = 0.0;
-    if (i == 1) expected = BRAKE_GAIN[1] * 0.4;
-    if (i == 5) expected = -BRAKE_GAIN[5] * 0.25;
-    check(near(brake_torque(i), expected),
-          "joint " + std::to_string(i) + " gets -gain * (|dq| - threshold) * sign(dq)");
+void the_reference_moves_to_a_far_target_at_the_capped_speed_on_a_straight_line() {
+  const Vector7d start = Vector7d::LinSpaced(-1.1, 1.3);
+  const Vector7d target = far_target(start);
+  const double dt = 1e-3;
+  Vector7d ref = start;
+  for (int tick = 1; tick <= 1000; ++tick) {
+    const Vector7d next = move_reference_toward(ref, target, REFERENCE_SPEED, dt);
+    check(((next - ref).cwiseAbs().array() <= REFERENCE_SPEED.array() * dt + 1e-12).all(),
+          "tick " + std::to_string(tick) + ": a joint moved faster than its cap");
+    ref = next;
   }
+  // After 1 s joint 5 has moved 1.2 rad, half of its 2.4 rad, and every other joint half of its jump.
+  check(((ref - (start + 0.5 * (target - start))).cwiseAbs().array() < 1e-9).all(),
+        "after 1 s every joint is halfway along the line");
 }
 
-void the_overspeed_brake_starts_from_zero_at_the_threshold() {
-  for (const double sign : {1.0, -1.0}) {
-    Vector7d at = Vector7d::Zero();
-    Vector7d just_above = Vector7d::Zero();
-    for (int i = 0; i < 7; ++i) {
-      Vector7d dq = Vector7d::Zero();
-      dq(i) = sign * BRAKE_THRESHOLD[i];
-      Vector7d tau = Vector7d::Zero();
-      brake().add_to(tau, dq);
-      at(i) = tau(i);
-      dq(i) = sign * (BRAKE_THRESHOLD[i] + 1e-6);
-      tau.setZero();
-      brake().add_to(tau, dq);
-      just_above(i) = tau(i);
-    }
-    check(at.isZero(), "no brake torque at the threshold");
-    check(just_above.cwiseAbs().maxCoeff() < 1e-4, "a tiny excess gives a tiny brake torque");
+void a_far_target_is_reached_exactly_when_the_slowest_joint_arrives() {
+  const Vector7d start = Vector7d::LinSpaced(-1.1, 1.3);
+  const Vector7d target = far_target(start);
+  const double dt = 1e-3;
+  Vector7d ref = start;
+  int ticks = 0;
+  while (ref != target && ticks < 10000) {
+    ref = move_reference_toward(ref, target, REFERENCE_SPEED, dt);
+    ++ticks;
   }
+  check(ref == target, "the reference reaches the target bit for bit");
+  // 2.4 rad at 1.2 rad/s is 2 s, so 2000 ticks; one more at most for rounding.
+  check(ticks >= 2000 && ticks <= 2001, "it took " + std::to_string(ticks) + " ticks, not 2000");
 }
 
-void an_overspeed_brake_change_mid_session_applies_on_the_next_tick() {
-  OverspeedBrake b = brake();
-  const Vector7d dq = Vector7d::Constant(2.5);
-  Vector7d tau = Vector7d::Zero();
-  b.set(uniform(3.0), BRAKE_GAIN);
-  b.add_to(tau, dq);
-  check(tau.isZero(), "a raised threshold stops the brake");
-  b.set(uniform(2.0), uniform(4.0));
-  b.add_to(tau, dq);
-  check((tau - Vector7d::Constant(-2.0)).cwiseAbs().maxCoeff() < 1e-12, "a new gain and threshold take effect");
+void a_target_within_one_step_is_reached_on_that_tick() {
+  const Vector7d start = Vector7d::LinSpaced(-1.1, 1.3);
+  const Vector7d target = start + Vector7d::Constant(0.0009);  // below 1.0 rad/s * 1 ms on every joint
+  check(move_reference_toward(start, target, REFERENCE_SPEED, 1e-3) == target, "a small step lands on the target");
 }
 
-void a_stop_settles_with_the_overspeed_brake_in_the_law() {
-  // At the settle tolerance the arm is far below any threshold, so the brake adds nothing there.
-  const Vector7d settling = Vector7d::Constant(0.049);
-  Vector7d tau = Vector7d::LinSpaced(-3.0, 3.0);
-  const Vector7d before = tau;
-  brake().add_to(tau, settling);
-  check(same_bits(tau, before), "no brake torque while the stop settles");
-  SpringTorqueRateLimiter limiter(uniform(35.0));
-  limiter.limit(Vector7d::Zero(), 1e-3);
-  check(stop_has_settled(limiter, settling, 0.05), "a quiet arm with no spring ramp settles");
+void a_new_target_mid_move_turns_the_reference_from_where_it_is() {
+  const Vector7d start = Vector7d::Zero();
+  Vector7d ref = start;
+  for (int tick = 0; tick < 100; ++tick) ref = move_reference_toward(ref, far_target(start), REFERENCE_SPEED, 1e-3);
+  const Vector7d turned_at = ref;
+  const Vector7d next = move_reference_toward(ref, start, REFERENCE_SPEED, 1e-3);
+  check(((next - turned_at).cwiseAbs().array() <= REFERENCE_SPEED.array() * 1e-3 + 1e-12).all(),
+        "the turn does not jump the reference");
+  check((next - start).norm() < (turned_at - start).norm(), "the reference heads back to the new target");
+}
+
+void a_zero_period_leaves_the_reference_where_it_is() {
+  const Vector7d start = Vector7d::LinSpaced(-1.1, 1.3);
+  check(move_reference_toward(start, far_target(start), REFERENCE_SPEED, 0.0) == start, "no time, no move");
 }
 
 }  // namespace
@@ -266,14 +233,14 @@ int main() {
        a_cap_change_mid_session_ramps_from_the_last_spring_torque},
       {"a_stop_with_a_still_arm_settles_only_once_the_spring_torque_ramps_to_zero",
        a_stop_with_a_still_arm_settles_only_once_the_spring_torque_ramps_to_zero},
-      {"the_overspeed_brake_leaves_the_torque_unchanged_below_the_threshold",
-       the_overspeed_brake_leaves_the_torque_unchanged_below_the_threshold},
-      {"the_overspeed_brake_opposes_the_excess_speed_on_each_joint",
-       the_overspeed_brake_opposes_the_excess_speed_on_each_joint},
-      {"the_overspeed_brake_starts_from_zero_at_the_threshold", the_overspeed_brake_starts_from_zero_at_the_threshold},
-      {"an_overspeed_brake_change_mid_session_applies_on_the_next_tick",
-       an_overspeed_brake_change_mid_session_applies_on_the_next_tick},
-      {"a_stop_settles_with_the_overspeed_brake_in_the_law", a_stop_settles_with_the_overspeed_brake_in_the_law},
+      {"the_reference_moves_to_a_far_target_at_the_capped_speed_on_a_straight_line",
+       the_reference_moves_to_a_far_target_at_the_capped_speed_on_a_straight_line},
+      {"a_far_target_is_reached_exactly_when_the_slowest_joint_arrives",
+       a_far_target_is_reached_exactly_when_the_slowest_joint_arrives},
+      {"a_target_within_one_step_is_reached_on_that_tick", a_target_within_one_step_is_reached_on_that_tick},
+      {"a_new_target_mid_move_turns_the_reference_from_where_it_is",
+       a_new_target_mid_move_turns_the_reference_from_where_it_is},
+      {"a_zero_period_leaves_the_reference_where_it_is", a_zero_period_leaves_the_reference_where_it_is},
   };
   int failed = 0;
   for (const auto& [name, test] : tests) {

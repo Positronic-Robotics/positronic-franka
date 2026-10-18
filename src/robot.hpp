@@ -14,7 +14,6 @@
 #include <string>
 #include <thread>
 #include <atomic>
-#include <chrono>
 #include <mutex>
 #include <cstdint>
 #include <cstring>
@@ -57,7 +56,7 @@ constexpr double DEFAULT_MOVE_DEADLINE_S = 15.0;
 
 // Control modes. InternalImpedance drives the robot's built-in joint impedance controller through the
 // joint position motion generator with Ruckig-shaped references. SoftwareImpedance runs the impedance
-// law here instead, over the torque interface, stepping the reference straight to each target.
+// law here instead, over the torque interface, moving the reference to each target at a capped joint speed.
 template <size_t N>
 bool all_zero(const std::array<double, N>& v) {
   for (double x : v) {
@@ -95,10 +94,9 @@ struct InternalImpedance {
 
 // Per-joint spring torque rate cap, Nm/s, tuned for the default SoftwareImpedance gains.
 constexpr std::array<double, 7> DEFAULT_MAX_SPRING_TORQUE_RATE = {130.0, 130.0, 130.0, 130.0, 85.0, 60.0, 35.0};
-// Joint speed, rad/s, above which the overspeed brake acts; below the Panda/FR3 joint velocity limits.
-constexpr std::array<double, 7> DEFAULT_OVERSPEED_THRESHOLD = {2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0};
-// Overspeed brake gain, Nm*s/rad.
-constexpr std::array<double, 7> DEFAULT_OVERSPEED_BRAKE_GAIN = {50.0, 50.0, 50.0, 20.0, 20.0, 20.0, 10.0};
+// Per-joint speed, rad/s, at which the spring reference q_d moves to a new target. Recorded policy motion stays
+// below 1.3 rad/s on every joint over any 0.2 s. The FR3 limit on joints 1 to 4 is 2.62 rad/s.
+constexpr std::array<double, 7> DEFAULT_MAX_REFERENCE_SPEED = {1.5, 1.5, 1.5, 1.5, 1.5, 1.5, 1.5};
 
 // Gain defaults are copied from fairo polymetis/conf/robot_client/franka_hardware.yaml, the
 // configuration HybridJointImpedanceControl runs with in the DROID data-collection stack.
@@ -109,31 +107,25 @@ struct SoftwareImpedance {
   std::array<double, 6> kxd{37.0, 37.0, 37.0, 2.0, 2.0, 2.0};
   // Per-joint cap on the rate of change of the spring torque, Nm/s.
   std::array<double, 7> max_spring_torque_rate = DEFAULT_MAX_SPRING_TORQUE_RATE;
-  // Per-joint overspeed brake: joint speed, rad/s, above which it acts, and its gain, Nm*s/rad.
-  std::array<double, 7> overspeed_threshold = DEFAULT_OVERSPEED_THRESHOLD;
-  std::array<double, 7> overspeed_brake_gain = DEFAULT_OVERSPEED_BRAKE_GAIN;
+  // Per-joint speed at which the spring reference q_d moves to a new target, rad/s.
+  std::array<double, 7> max_reference_speed = DEFAULT_MAX_REFERENCE_SPEED;
 
   SoftwareImpedance() = default;
   explicit SoftwareImpedance(const std::array<double, 7>& max_spring_torque_rate_in,
-                             const std::array<double, 7>& overspeed_threshold_in = DEFAULT_OVERSPEED_THRESHOLD,
-                             const std::array<double, 7>& overspeed_brake_gain_in = DEFAULT_OVERSPEED_BRAKE_GAIN)
-      : max_spring_torque_rate(max_spring_torque_rate_in),
-        overspeed_threshold(overspeed_threshold_in),
-        overspeed_brake_gain(overspeed_brake_gain_in) {
+                             const std::array<double, 7>& max_reference_speed_in = DEFAULT_MAX_REFERENCE_SPEED)
+      : max_spring_torque_rate(max_spring_torque_rate_in), max_reference_speed(max_reference_speed_in) {
     validate_guards_();
   }
   SoftwareImpedance(const std::array<double, 7>& kq_in, const std::array<double, 7>& kqd_in,
                     const std::array<double, 6>& kx_in, const std::array<double, 6>& kxd_in,
                     const std::array<double, 7>& max_spring_torque_rate_in = DEFAULT_MAX_SPRING_TORQUE_RATE,
-                    const std::array<double, 7>& overspeed_threshold_in = DEFAULT_OVERSPEED_THRESHOLD,
-                    const std::array<double, 7>& overspeed_brake_gain_in = DEFAULT_OVERSPEED_BRAKE_GAIN)
+                    const std::array<double, 7>& max_reference_speed_in = DEFAULT_MAX_REFERENCE_SPEED)
       : kq(kq_in),
         kqd(kqd_in),
         kx(kx_in),
         kxd(kxd_in),
         max_spring_torque_rate(max_spring_torque_rate_in),
-        overspeed_threshold(overspeed_threshold_in),
-        overspeed_brake_gain(overspeed_brake_gain_in) {
+        max_reference_speed(max_reference_speed_in) {
     validate_half(kq, kqd, "joint (kq/kqd)");
     validate_half(kx, kxd, "Cartesian (kx/kxd)");
     if (all_zero(kq) && all_zero(kx)) {
@@ -147,13 +139,8 @@ struct SoftwareImpedance {
     if (!all_positive(max_spring_torque_rate)) {
       throw std::invalid_argument("max_spring_torque_rate must be finite and strictly positive");
     }
-    if (!all_positive(overspeed_threshold)) {
-      throw std::invalid_argument("overspeed_threshold must be finite and strictly positive");
-    }
-    // NaN fails the comparison, inf fails isfinite.
-    if (!std::all_of(overspeed_brake_gain.begin(), overspeed_brake_gain.end(),
-                     [](double x) { return x >= 0.0 && std::isfinite(x); })) {
-      throw std::invalid_argument("overspeed_brake_gain must be finite and not negative");
+    if (!all_positive(max_reference_speed)) {
+      throw std::invalid_argument("max_reference_speed must be finite and strictly positive");
     }
   }
 };
@@ -164,8 +151,7 @@ inline bool operator==(const InternalImpedance& a, const InternalImpedance& b) {
 
 inline bool operator==(const SoftwareImpedance& a, const SoftwareImpedance& b) {
   return a.kq == b.kq && a.kqd == b.kqd && a.kx == b.kx && a.kxd == b.kxd &&
-         a.max_spring_torque_rate == b.max_spring_torque_rate && a.overspeed_threshold == b.overspeed_threshold &&
-         a.overspeed_brake_gain == b.overspeed_brake_gain;
+         a.max_spring_torque_rate == b.max_spring_torque_rate && a.max_reference_speed == b.max_reference_speed;
 }
 
 using ControlMode = std::variant<InternalImpedance, SoftwareImpedance>;
@@ -585,15 +571,11 @@ class Robot {
   }
 
   // The IK for a live command: the joints that bring the tool as close as the bounds allow to
-  // target_pose_wxyz, from the measured joints. The step bound counts the time since the last call.
+  // target_pose_wxyz, from the measured joints.
   Vector7d inverse_kinematics_with_limits(const Eigen::Ref<const Vector7d>& target_pose_wxyz) {
-    const auto now = std::chrono::steady_clock::now();
-    std::optional<double> since_last;
-    if (last_pose_command_) since_last = std::chrono::duration<double>(now - *last_pose_command_).count();
-    last_pose_command_ = now;
     const franka::RobotState base = read_robot_state_();
     return inverse_kinematics_with_limits(target_pose_wxyz, Eigen::Map<const Vector7d>(base.q.data()),
-                                          max_joint_step(since_last));
+                                          IK_MAX_JOINT_STEP);
   }
 
   Vector7d inverse_kinematics_with_limits(const Eigen::Ref<const Vector7d>& target_pose_wxyz,
@@ -718,17 +700,17 @@ private:
 
   // Torque-interface control loop running the polymetis hybrid impedance law:
   //   tau = (J^T Kx J + Kq)(q_d - q) - (J^T Kxd J + Kqd) dq + coriolis
-  // with the spring term rate-capped and an overspeed brake added (impedance_law.hpp). Gravity is compensated by
-  // libfranka underneath the torque command. Shares the target/stop/goal machinery with the position
-  // loop; only the reference differs — every target steps q_d instantly and the law pulls the arm in,
-  // where the position loop shapes a Ruckig trajectory.
+  // with the spring term rate-capped (impedance_law.hpp). Gravity is compensated by libfranka underneath the
+  // torque command. Shares the target/stop/goal machinery with the position loop; only the reference differs:
+  // q_d moves to each target in a straight line at max_reference_speed, where the position loop shapes a Ruckig
+  // trajectory.
   void run_joint_torque_control_(SoftwareImpedance imp) {
     Vector7d Kq = Eigen::Map<const Vector7d>(imp.kq.data());
     Vector7d Kqd = Eigen::Map<const Vector7d>(imp.kqd.data());
     Vector6d Kx = Eigen::Map<const Vector6d>(imp.kx.data());
     Vector6d Kxd = Eigen::Map<const Vector6d>(imp.kxd.data());
     SpringTorqueRateLimiter spring_limiter(imp.max_spring_torque_rate);
-    OverspeedBrake overspeed_brake(imp.overspeed_threshold, imp.overspeed_brake_gain);
+    Vector7d max_reference_speed = Eigen::Map<const Vector7d>(imp.max_reference_speed.data());
     std::string thread_error;
     try {
       robot_->control(
@@ -739,25 +721,24 @@ private:
          deadline_s = 0.0,
          stopping = false,
          stop_ticks = 0,
-         ref = Vector7d(Vector7d::Zero())](const franka::RobotState& st,
-                                           franka::Duration period) mutable -> franka::Torques {
+         ref = Vector7d(Vector7d::Zero()),
+         target = Vector7d(Vector7d::Zero())](const franka::RobotState& st,
+                                              franka::Duration period) mutable -> franka::Torques {
           const Vector7d q = Eigen::Map<const Vector7d>(st.q.data());
           const Vector7d dq = Eigen::Map<const Vector7d>(st.dq.data());
 
           if (first) {
-            ref = q;
+            ref = target = q;
             first = false;
           } else if (!stopping && stop_requested_.load()) {
             stopping = true;
             has_target_.store(false);
-            ref = q;
+            ref = target = q;
           }
 
-          // No trajectory here, by design: the reference steps to the target and the impedance law
-          // is what moves the arm. That is what this mode is for.
           if (!stopping && has_target_.load()) {
             std::lock_guard<std::mutex> lk(target_mutex_);
-            ref = target_q_;
+            target = target_q_;
             goal_in_flight = std::exchange(target_goal_id_, 0);
             elapsed_s = 0.0;
             deadline_s = std::exchange(target_deadline_s_, 0.0);
@@ -771,20 +752,23 @@ private:
             Kx = Eigen::Map<const Vector6d>(new_gains_.kx.data());
             Kxd = Eigen::Map<const Vector6d>(new_gains_.kxd.data());
             spring_limiter.set_max_rate(new_gains_.max_spring_torque_rate);
-            overspeed_brake.set(new_gains_.overspeed_threshold, new_gains_.overspeed_brake_gain);
+            max_reference_speed = Eigen::Map<const Vector7d>(new_gains_.max_reference_speed.data());
             has_new_gains_.store(false);
           }
 
-          // The position loop's arrival rule with nothing shaping the reference: it stepped away
-          // from the arm on arrival, so this cannot pass until the spring has pulled the joints in.
+          // No trajectory here: the impedance law moves the arm. The speed cap on q_d keeps a large jump in the
+          // target from becoming a large spring pull, at any command rate.
+          ref = move_reference_toward(ref, target, max_reference_speed, period.toSec());
+
+          // The position loop's arrival rule: there is no arrival to test while the reference still moves.
           if (goal_in_flight != 0) {
             const Arrival outcome =
-                arrival_(ref, q, dq, /*travelling=*/false, period.toSec(), deadline_s, elapsed_s);
+                arrival_(ref, q, dq, /*travelling=*/ref != target, period.toSec(), deadline_s, elapsed_s);
             if (settle_on_arrival_(goal_in_flight, outcome)) {
               goal_in_flight = 0;
               // As above: hold position rather than keep pulling toward a target already reported
               // as not reached.
-              if (outcome == Arrival::Stalled) ref = q;
+              if (outcome == Arrival::Stalled) ref = target = q;
             }
           }
 
@@ -803,7 +787,7 @@ private:
           const Matrix7d Kp = J.transpose() * Kx.asDiagonal() * J + Matrix7d(Kq.asDiagonal());
           const Matrix7d Kd = J.transpose() * Kxd.asDiagonal() * J + Matrix7d(Kqd.asDiagonal());
           const Vector7d tau = impedance_torque(Kp, Kd, ref, q, dq, Eigen::Map<const Vector7d>(cor.data()),
-                                                spring_limiter, overspeed_brake, period.toSec());
+                                                spring_limiter, period.toSec());
 
           std::array<double, 7> tau_arr;
           Eigen::Map<Vector7d>(tau_arr.data()) = tau;
@@ -1040,8 +1024,6 @@ private:
   // The software-impedance loop's reference, published so state() can report the tracked q_d; empty
   // whenever the torque loop is not running.
   std::optional<Vector7d> last_software_ref_;
-  // When the live IK last ran; its step bound counts from here. Callers are serialized by the Python GIL.
-  std::optional<std::chrono::steady_clock::time_point> last_pose_command_;
 
   const double relative_dynamics_factor_{1.0};
   // Read when a motion command starts the loop; the running loop never reads it — a software gains

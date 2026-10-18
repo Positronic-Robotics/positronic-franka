@@ -44,38 +44,25 @@ inline bool stop_has_settled(const SpringTorqueRateLimiter& spring_limiter, cons
   return !spring_limiter.ramping() && dq.cwiseAbs().maxCoeff() < velocity_tolerance;
 }
 
-// Brakes a joint that moves faster than its threshold, with torque -gain * (|dq| - threshold) * sign(dq).
-// It adds nothing below the threshold and grows from zero above it, so it never steps the torque.
-class OverspeedBrake {
- public:
-  OverspeedBrake(const std::array<double, 7>& threshold, const std::array<double, 7>& gain) { set(threshold, gain); }
-
-  void set(const std::array<double, 7>& threshold, const std::array<double, 7>& gain) {
-    threshold_ = Eigen::Map<const Vector7d>(threshold.data());
-    gain_ = Eigen::Map<const Vector7d>(gain.data());
+// Moves the spring reference q_d toward `target` in a straight line in joint space, as far as `max_speed`
+// (rad/s, per joint) allows in `dt`. All joints arrive together. The result is `target` once it is within one step.
+inline Vector7d move_reference_toward(const Vector7d& ref, const Vector7d& target, const Vector7d& max_speed,
+                                      double dt) {
+  const Vector7d remaining = target - ref;
+  double fraction = 1.0;
+  for (int i = 0; i < 7; ++i) {
+    const double step = max_speed(i) * dt;
+    if (std::abs(remaining(i)) > step) fraction = std::min(fraction, step / std::abs(remaining(i)));
   }
+  return fraction == 1.0 ? target : Vector7d(ref + fraction * remaining);
+}
 
-  // Adds the brake torque to `tau` on the joints above their threshold only, so the others keep their bits.
-  void add_to(Vector7d& tau, const Vector7d& dq) const {
-    for (int i = 0; i < 7; ++i) {
-      const double excess = std::abs(dq(i)) - threshold_(i);
-      if (excess > 0.0) tau(i) -= std::copysign(gain_(i) * excess, dq(i));
-    }
-  }
-
- private:
-  Vector7d threshold_;
-  Vector7d gain_;
-};
-
-// The software impedance law: tau = Kp (q_d - q) - Kd dq + coriolis, plus the overspeed brake. Only the
-// spring term goes through the limiter; damping, the brake and Coriolis pass through as computed.
+// The software impedance law: tau = Kp (q_d - q) - Kd dq + coriolis. Only the spring term goes
+// through the limiter; damping and Coriolis pass through as computed.
 inline Vector7d impedance_torque(const Matrix7d& Kp, const Matrix7d& Kd, const Vector7d& q_d, const Vector7d& q,
                                  const Vector7d& dq, const Vector7d& coriolis, SpringTorqueRateLimiter& spring_limiter,
-                                 const OverspeedBrake& brake, double dt) {
-  Vector7d tau = spring_limiter.limit(Kp * (q_d - q), dt) - Kd * dq + coriolis;
-  brake.add_to(tau, dq);
-  return tau;
+                                 double dt) {
+  return spring_limiter.limit(Kp * (q_d - q), dt) - Kd * dq + coriolis;
 }
 
 }  // namespace positronic_franka

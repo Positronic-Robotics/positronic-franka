@@ -3,7 +3,6 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
-#include <optional>
 
 #include <Eigen/Core>
 #include <Eigen/Geometry>
@@ -25,12 +24,9 @@ constexpr std::array<double, 7> FR3_JOINT_UPPER_LIMITS = {
 // The IK damps the move when the smallest singular value of the tool Jacobian is below this value.
 // The rotation rows count 1 m per rad.
 constexpr double IK_DAMPING_SINGULAR_VALUE = 0.1;
-// Each joint moves at most this speed times the time since the last command: 0.2 rad at 15 Hz.
-constexpr double IK_MAX_JOINT_SPEED = 3.0;  // rad/s
-// A command that comes more than IK_PAUSE after the last one, or with no last one, moves each
-// joint at most IK_MAX_JOINT_STEP_AFTER_PAUSE.
-constexpr double IK_PAUSE = 0.25;                       // s
-constexpr double IK_MAX_JOINT_STEP_AFTER_PAUSE = 0.2;   // rad
+// Each joint moves at most this far from the measured joints per command, rad, so the answer stays on the
+// current IK branch.
+constexpr double IK_MAX_JOINT_STEP = 0.5;
 // Joints that the move pulls towards along the null space of the tool Jacobian.
 constexpr std::array<double, 7> IK_POSTURE_JOINTS = {0.0, -0.31, 0.0, -1.65, 0.0, 1.522, 0.0};
 // Part of the null-space offset from IK_POSTURE_JOINTS that one command removes, and its weight.
@@ -51,14 +47,6 @@ inline Vector6d pose_error(const Eigen::Matrix4d& T_cur, const Eigen::Vector3d& 
   Vector6d e;
   e << T_cur.block<3, 1>(0, 3) - t_tgt, -R_cur * (aa.angle() * aa.axis());
   return e;
-}
-
-// The largest step each joint may take for a command that comes `seconds_since_last_command`
-// after the last one; no value means that there was no last command.
-inline double max_joint_step(std::optional<double> seconds_since_last_command) {
-  if (!seconds_since_last_command || *seconds_since_last_command > IK_PAUSE)
-    return IK_MAX_JOINT_STEP_AFTER_PAUSE;
-  return IK_MAX_JOINT_SPEED * std::max(0.0, *seconds_since_last_command);
 }
 
 // Where minimize_on_box holds each joint: free, at its lower or upper bound, or fixed by a zero-width box.

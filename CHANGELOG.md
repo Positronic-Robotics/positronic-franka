@@ -1,30 +1,23 @@
 # Changelog
 
-## [0.10.0] - 2026-10-18
-
-### Changed
-- **Behaviour.** `inverse_kinematics_with_limits` is a new IK. It solves one bounded least-squares problem per command, from the measured joints q0: the tool as close as the bounds allow to the command, within the FR3 joint limits, and each joint within a step bound of q0. The old IK followed the exact solution nearest q0 at any joint cost. Near the wrist singularity it turned 1-5 deg commands into opposite joint 5 and 7 steps of up to 0.66 rad.
-- The step bound is 3 rad/s (`IK_MAX_JOINT_SPEED`) times the time since the last call: 0.2 rad at 15 Hz. On the first call, and after a pause longer than `IK_PAUSE` (0.25 s), it is `IK_MAX_JOINT_STEP_AFTER_PAUSE` (0.2 rad). When the bound acts, the tool stops short of the command.
-- When the smallest singular value of the tool Jacobian at q0 is below `IK_DAMPING_SINGULAR_VALUE` (0.1, rotation rows 1 m per rad), the IK damps the whole move q - q0 by Chiaverini's law with mu_max = 0.1 / sqrt(2). Along the weak direction a tool change then moves the joints by at most the change over 0.1. The tool misses the command near the singularity.
-- A posture row pulls the joints towards `IK_POSTURE_JOINTS` along the null space of the tool Jacobian: each command removes 2 % of the offset. It does not move the tool to first order.
-- The overload with `q0` takes `max_step` (rad, default 0.2) in place of the time since the last call. `ik_verifier` passes an unbounded step.
+## [0.9.0] - 2026-10-18
 
 ### Added
+- `max_reference_speed` on `SoftwareImpedance`, a keyword argument: a per-joint speed (7,), in rad/s, at which the reference `q_d` moves to a new target. The default is `DEFAULT_MAX_REFERENCE_SPEED`, 1.5 rad/s on every joint. `q_d` moves in a straight line in joint space, and all joints arrive together. A target near `q_d` is reached at once. A large jump is executed, slowly. This holds at any command rate, for a joint target and for an IK answer. `state().q_d` reports the moving reference. A move reports `REACHED` only after `q_d` arrives at the target. A change of the speed reaches the running torque loop like a gain change.
 - `tests/test_pose_ik.cpp`, which checks the IK on FR3 kinematics with Eigen only. CI builds and runs it.
 
-### Removed
-- The OSQP dependency. The IK solves its 7-joint box-constrained problem with its own active-set solver.
-
-## [0.9.0] - 2026-10-16
-
-### Added
-- An overspeed brake in `SoftwareImpedance`, set by two keyword arguments: `overspeed_threshold` (7,), in rad/s, and `overspeed_brake_gain` (7,), in Nm*s/rad. When a joint moves faster than its threshold, the law adds `-gain * (|dq| - threshold) * sign(dq)` on that joint. Below the threshold it adds nothing, so the torque is unchanged. At the threshold the brake starts from zero, so it does not step the torque. The brake reads only the measured joint speed. It is on the damping side of the law, so the spring torque rate cap does not apply to it; libfranka's own torque rate limit applies to the total. A change of either argument reaches the running torque loop like a gain change.
+### Changed
+- **Behaviour.** In `SoftwareImpedance`, a target does not step `q_d` in one tick. `q_d` moves to it at `max_reference_speed`. The spring torque rate cap from 0.8.0 is unchanged.
+- **Behaviour.** `inverse_kinematics_with_limits` is a new IK. It solves one bounded least-squares problem per command, from the measured joints q0: the tool as close as the bounds allow to the command, within the FR3 joint limits, and each joint at most `IK_MAX_JOINT_STEP` (0.5 rad) from q0. The bound keeps the answer on the current IK branch. It does not depend on the time since the last command. When the bound acts, the tool stops short of the command. The old IK followed the exact solution nearest q0 at any joint cost. Near the wrist singularity it turned 1-5 deg commands into opposite joint 5 and 7 steps of up to 0.66 rad.
+- When the smallest singular value of the tool Jacobian at q0 is below `IK_DAMPING_SINGULAR_VALUE` (0.1, rotation rows 1 m per rad), the IK damps the whole move q - q0 by Chiaverini's law with mu_max = 0.1 / sqrt(2). Along the weak direction a tool change then moves the joints by at most the change over 0.1. Near the singularity the tool misses the command, and the joints do not jump.
+- A posture row pulls the joints towards `IK_POSTURE_JOINTS` along the null space of the tool Jacobian: each command removes 2 % of the offset. It does not move the tool to first order.
+- The overload with `q0` takes `max_step` (rad, default 0.5). `ik_verifier` passes an unbounded step.
 
 ### Fixed
 - The IK bounds each joint to the FR3 joint position limits, `FR3_JOINT_LOWER_LIMITS` and `FR3_JOINT_UPPER_LIMITS`. It used the Panda limits, which differ on every joint. Joint 6 stopped at 3.7525 rad, and the FR3 allows 4.5169 rad. Joint 4 could go up to +3.0718 rad, and the FR3 allows only -0.1518 rad. `ik_verifier` uses the same limits.
 
-### Changed
-- **Behaviour.** The brake is always on. The defaults are `DEFAULT_OVERSPEED_THRESHOLD`, 2.0 rad/s on every joint, and `DEFAULT_OVERSPEED_BRAKE_GAIN`, `[50, 50, 50, 20, 20, 20, 10]` Nm*s/rad for joints 1 to 7. A gain of zero turns the brake off on that joint.
+### Removed
+- The OSQP dependency. The IK solves its 7-joint box-constrained problem with its own active-set solver.
 
 ## [0.8.0] - 2026-10-16
 

@@ -19,12 +19,10 @@ namespace {
 using positronic_franka::FR3_JOINT_LOWER_LIMITS;
 using positronic_franka::FR3_JOINT_UPPER_LIMITS;
 using positronic_franka::IK_DAMPING_SINGULAR_VALUE;
-using positronic_franka::IK_MAX_JOINT_STEP_AFTER_PAUSE;
-using positronic_franka::IK_PAUSE;
+using positronic_franka::IK_MAX_JOINT_STEP;
 using positronic_franka::IK_POSTURE_JOINTS;
 using positronic_franka::IK_POSTURE_PULL_PER_COMMAND;
 using positronic_franka::Matrix7d;
-using positronic_franka::max_joint_step;
 using positronic_franka::minimize_on_box;
 using positronic_franka::pose_error;
 using positronic_franka::solve_pose_ik;
@@ -117,18 +115,6 @@ void minimize_on_box_without_an_active_bound_is_the_newton_step() {
   check((d + H.llt().solve(g)).norm() < 1e-12, "a wide box returns -H^-1 g");
 }
 
-void max_joint_step_is_the_speed_bound_times_the_command_interval() {
-  check(std::abs(max_joint_step(1.0 / 15.0) - 0.2) < 1e-12, "15 Hz gives 0.2 rad");
-  check(std::abs(max_joint_step(0.2) - 0.6) < 1e-12, "5 Hz gives 0.6 rad");
-  check(std::abs(max_joint_step(IK_PAUSE) - 3.0 * IK_PAUSE) < 1e-12, "the bound holds up to the pause");
-}
-
-void max_joint_step_after_a_pause_or_on_the_first_command_is_the_pause_step() {
-  check(max_joint_step(IK_PAUSE + 1e-6) == IK_MAX_JOINT_STEP_AFTER_PAUSE, "a pause gives the pause step");
-  check(max_joint_step(3.0) == IK_MAX_JOINT_STEP_AFTER_PAUSE, "recording 14's 3 s gap gives the pause step");
-  check(max_joint_step(std::nullopt) == IK_MAX_JOINT_STEP_AFTER_PAUSE, "the first command gives the pause step");
-}
-
 void a_nearby_pose_away_from_a_singularity_is_reached_within_0_1_mm_and_0_1_deg() {
   std::mt19937 rng(11);
   std::uniform_real_distribution<double> u(-0.15, 0.15);
@@ -137,7 +123,7 @@ void a_nearby_pose_away_from_a_singularity_is_reached_within_0_1_mm_and_0_1_deg(
     Vector7d q_target = q0;
     for (int i = 0; i < 7; ++i) q_target(i) += u(rng);
     const Vector7d target = pose_wxyz(fr3_tool(q_target).pose);
-    const auto [mm, deg] = miss(solve_pose_ik(fr3_tool, target, q0, 0.2), target);
+    const auto [mm, deg] = miss(solve_pose_ik(fr3_tool, target, q0, IK_MAX_JOINT_STEP), target);
     check(mm < 0.1 && deg < 0.1, "miss " + std::to_string(mm) + " mm, " + std::to_string(deg) + " deg");
   }
 }
@@ -156,7 +142,7 @@ void every_joint_stays_within_the_step_bound_and_the_fr3_limits() {
       q0(i) = lower(i) + t * (upper(i) - lower(i));
       q_target(i) = q0(i) + u(rng);
     }
-    const double step = trial % 2 == 0 ? 0.2 : 0.05;
+    const double step = trial % 2 == 0 ? IK_MAX_JOINT_STEP : 0.05;
     const Vector7d q = solve_pose_ik(fr3_tool, pose_wxyz(fr3_tool(q_target).pose), q0, step);
     check(((q - q0).cwiseAbs().array() <= step + 1e-12).all(), "a joint stepped past the bound");
     check((q.array() >= lower.array()).all() && (q.array() <= upper.array()).all(), "a joint left its limits");
@@ -170,6 +156,15 @@ Vector7d near_wrist_singularity() {
   return q;
 }
 
+// The tool pose moved by `twist` (linear, then angular), both in the base frame.
+Eigen::Matrix4d twisted(const Eigen::Matrix4d& pose, const Vector6d& twist) {
+  Eigen::Matrix4d T = pose;
+  T.block<3, 1>(0, 3) += twist.head<3>();
+  T.block<3, 3>(0, 0) = Eigen::AngleAxisd(twist.tail<3>().norm(), twist.tail<3>().normalized()).toRotationMatrix() *
+                        pose.block<3, 3>(0, 0);
+  return T;
+}
+
 void near_a_singularity_the_weak_direction_gain_is_at_most_one_over_the_threshold() {
   const Vector7d q0 = near_wrist_singularity();
   const ToolKinematics k = fr3_tool(q0);
@@ -180,14 +175,9 @@ void near_a_singularity_the_weak_direction_gain_is_at_most_one_over_the_threshol
   const Vector7d weak_joints = J.transpose() * weak_twist / s;
   check(s < 0.5 * IK_DAMPING_SINGULAR_VALUE, "the start is deep inside the damped region");
 
-  // A small tool twist along the weak left singular vector, applied to the tool pose.
+  // A small tool twist along the weak left singular vector.
   const double eps = 0.002;
-  const Vector6d twist = eps * weak_twist;
-  Eigen::Matrix4d T = k.pose;
-  T.block<3, 1>(0, 3) += twist.head<3>();
-  T.block<3, 3>(0, 0) = Eigen::AngleAxisd(twist.tail<3>().norm(), twist.tail<3>().normalized()).toRotationMatrix() *
-                        k.pose.block<3, 3>(0, 0);
-  const Vector7d q = solve_pose_ik(fr3_tool, pose_wxyz(T), q0, 0.2);
+  const Vector7d q = solve_pose_ik(fr3_tool, pose_wxyz(twisted(k.pose, eps * weak_twist)), q0, IK_MAX_JOINT_STEP);
 
   const double weak_move = std::abs(weak_joints.dot(q - q0));
   const double S0 = IK_DAMPING_SINGULAR_VALUE;
@@ -195,6 +185,24 @@ void near_a_singularity_the_weak_direction_gain_is_at_most_one_over_the_threshol
   check(weak_move <= eps / S0, "the weak-direction move exceeds the change over the threshold");
   check(std::abs(weak_move - eps * s / (s * s + mu_sq)) < 0.1 * weak_move, "the move follows the damping law");
   check(weak_move < 0.5 * eps / s, "the move is less than half the undamped move");
+}
+
+void near_a_singularity_the_damping_keeps_a_wrist_command_inside_the_step_bound() {
+  const Vector7d q0 = near_wrist_singularity();
+  const ToolKinematics k = fr3_tool(q0);
+  const SpatialJacobian& J = k.jacobian;
+  const Eigen::SelfAdjointEigenSolver<Eigen::Matrix<double, 6, 6>> left(J * J.transpose());
+  const double s = std::sqrt(left.eigenvalues()(0));
+  const Vector6d weak_twist = left.eigenvectors().col(0);
+  const Vector7d weak_joints = J.transpose() * weak_twist / s;
+
+  // A 1.7 deg command along the weak direction: the exact answer moves the wrist eps / s, 0.73 rad.
+  const double eps = 0.03;
+  check(eps / s > IK_MAX_JOINT_STEP, "the exact answer needs more than the step bound");
+  const Vector7d q = solve_pose_ik(fr3_tool, pose_wxyz(twisted(k.pose, eps * weak_twist)), q0, IK_MAX_JOINT_STEP);
+  check((q - q0).cwiseAbs().maxCoeff() < IK_MAX_JOINT_STEP - 0.05, "the step bound is not what holds the move");
+  check(std::abs(weak_joints.dot(q - q0)) <= eps / IK_DAMPING_SINGULAR_VALUE,
+        "the weak-direction move exceeds the change over the threshold");
 }
 
 Vector7d null_direction(const Vector7d& q) {
@@ -208,7 +216,7 @@ void the_move_pulls_the_posture_along_the_null_space_and_keeps_the_tool() {
   const Vector7d n0 = null_direction(q0);
   const Vector7d target = pose_wxyz(fr3_tool(q0).pose);
 
-  const Vector7d q = solve_pose_ik(fr3_tool, target, q0, 0.2);
+  const Vector7d q = solve_pose_ik(fr3_tool, target, q0, IK_MAX_JOINT_STEP);
   const double expected = -IK_POSTURE_PULL_PER_COMMAND * n0.dot(q0 - home);
   check(std::abs(n0.dot(q - q0) - expected) < 0.05 * std::abs(expected), "the null-space pull is 2 % of the offset");
   const auto [mm, deg] = miss(q, target);
@@ -222,16 +230,14 @@ int main() {
       {"minimize_on_box_meets_the_optimality_conditions", minimize_on_box_meets_the_optimality_conditions},
       {"minimize_on_box_without_an_active_bound_is_the_newton_step",
        minimize_on_box_without_an_active_bound_is_the_newton_step},
-      {"max_joint_step_is_the_speed_bound_times_the_command_interval",
-       max_joint_step_is_the_speed_bound_times_the_command_interval},
-      {"max_joint_step_after_a_pause_or_on_the_first_command_is_the_pause_step",
-       max_joint_step_after_a_pause_or_on_the_first_command_is_the_pause_step},
       {"a_nearby_pose_away_from_a_singularity_is_reached_within_0_1_mm_and_0_1_deg",
        a_nearby_pose_away_from_a_singularity_is_reached_within_0_1_mm_and_0_1_deg},
       {"every_joint_stays_within_the_step_bound_and_the_fr3_limits",
        every_joint_stays_within_the_step_bound_and_the_fr3_limits},
       {"near_a_singularity_the_weak_direction_gain_is_at_most_one_over_the_threshold",
        near_a_singularity_the_weak_direction_gain_is_at_most_one_over_the_threshold},
+      {"near_a_singularity_the_damping_keeps_a_wrist_command_inside_the_step_bound",
+       near_a_singularity_the_damping_keeps_a_wrist_command_inside_the_step_bound},
       {"the_move_pulls_the_posture_along_the_null_space_and_keeps_the_tool",
        the_move_pulls_the_posture_along_the_null_space_and_keeps_the_tool},
   };
