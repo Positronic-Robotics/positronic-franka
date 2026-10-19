@@ -24,18 +24,12 @@
 #include <variant>
 #include <Eigen/Core>
 #include <Eigen/Geometry>
-#include <ruckig/ruckig.hpp>
-#include <ruckig/input_parameter.hpp>
 
 #include "impedance_law.hpp"
 #include "pose_ik.hpp"
+#include "trajectory_generator.hpp"
 
 namespace positronic_franka {
-
-// Panda joint limits (rad/s, rad/s^2, rad/s^3)
-constexpr std::array<double, 7> PANDA_BASE_VELOCITY_LIMITS = {2.62, 2.62, 2.62, 2.62, 5.26, 4.18, 5.26};
-constexpr std::array<double, 7> PANDA_BASE_ACCELERATION_LIMITS = {10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0};
-constexpr std::array<double, 7> PANDA_BASE_JERK_LIMITS = {5000.0, 5000.0, 5000.0, 5000.0, 5000.0, 5000.0, 5000.0};
 
 // Arrival: joints within tolerance of the reference and no longer moving, judged on one reading.
 //
@@ -196,112 +190,6 @@ struct State {
   std::string error_message;
   // External wrench (force, torque) on end-effector frame expressed in K frame.
   Vector6d end_effector_wrench = Vector6d::Zero();
-};
-
-// Ruckig trajectory generator evaluated at libfranka's actual period rather than fixed 1 ms steps,
-// which would produce velocity/acceleration discontinuities under non-RT scheduling.
-class TrajectoryGenerator {
- public:
-  static constexpr double NOMINAL_DT = 1.0 / 1000.0;
-
-  explicit TrajectoryGenerator(double dynamics_factor) {
-    input_.synchronization = ruckig::Synchronization::Time;
-    input_.target_velocity.fill(0.0);
-    input_.target_acceleration.fill(0.0);
-    for (size_t i = 0; i < 7; ++i) {
-      input_.max_velocity[i] = PANDA_BASE_VELOCITY_LIMITS[i] * dynamics_factor;
-      input_.max_acceleration[i] = PANDA_BASE_ACCELERATION_LIMITS[i] * dynamics_factor;
-      input_.max_jerk[i] = PANDA_BASE_JERK_LIMITS[i] * dynamics_factor;
-    }
-  }
-
-  void initialize(const franka::RobotState& st) {
-    for (size_t i = 0; i < 7; ++i) {
-      input_.current_position[i] = st.q[i];
-      input_.current_velocity[i] = st.dq[i];
-      input_.current_acceleration[i] = 0.0;
-      input_.target_position[i] = st.q[i];
-    }
-    replan_();
-  }
-
-  // Restart the generator from a reference position at rest (torque mode shapes segments from the
-  // stepped reference, not from measured robot state).
-  void reset(const Vector7d& pos) {
-    for (size_t i = 0; i < 7; ++i) {
-      input_.current_position[i] = pos[i];
-      input_.current_velocity[i] = 0.0;
-      input_.current_acceleration[i] = 0.0;
-      input_.target_position[i] = pos[i];
-    }
-    replan_();
-  }
-
-  // Returns whether the plan to the new target was accepted; on failure the previous plan keeps playing.
-  bool set_target(const Vector7d& target) {
-    for (size_t i = 0; i < 7; ++i) input_.target_position[i] = target[i];
-    return replan_();
-  }
-
-  // TODO: a refused replan leaves the previous plan playing, so the arm goes on to the old target
-  // after the caller has been told the move ended. Braking is a short plan, so only a solver failure
-  // could do it and none has been seen; not handled.
-  void stop_at_current() {
-    input_.target_position = input_.current_position;
-    replan_();
-  }
-
-  // Advance trajectory by actual elapsed time and return the position.
-  std::array<double, 7> step(franka::Duration period) {
-    if (!planned_) return input_.current_position;
-
-    double dt = period.toSec();
-    if (dt <= 0.0) dt = NOMINAL_DT;
-    cumulative_time_ += dt;
-
-    double t = std::min(cumulative_time_, duration_);
-    std::array<double, 7> pos, vel, acc;
-    trajectory_.at_time(t, pos, vel, acc);
-
-    input_.current_position = pos;
-    input_.current_velocity = vel;
-    input_.current_acceleration = acc;
-
-    if (cumulative_time_ >= duration_) active_ = false;
-    return pos;
-  }
-
-  bool active() const { return active_; }
-
-  // How long the planned trajectory runs, in seconds. The move deadline adds it to the settle
-  // budget, so a slow `relative_dynamics_factor` (down to 0.0001) is not cut off by a flat constant.
-  double duration() const { return duration_; }
-
- private:
-  bool replan_() {
-    // Swap only on success: evaluating a default-constructed trajectory feeds NaN into libfranka and
-    // kills the control thread. On failure the previous plan keeps playing.
-    ruckig::Trajectory<7> next;
-    auto result = otg_.calculate(input_, next);
-    if (result < 0) {
-      std::cerr << "Ruckig trajectory planning failed (error " << static_cast<int>(result) << ")" << std::endl;
-      return false;
-    }
-    trajectory_ = next;
-    planned_ = true;
-    cumulative_time_ = 0.0;
-    duration_ = trajectory_.get_duration();
-    active_ = true;
-    return true;
-  }
-
-  ruckig::Ruckig<7> otg_{NOMINAL_DT};
-  ruckig::InputParameter<7> input_;
-  ruckig::Trajectory<7> trajectory_;
-  double cumulative_time_ = 0.0;
-  double duration_ = 0.0;
-  bool active_ = false;
-  bool planned_ = false;
 };
 
 class Robot {
@@ -635,12 +523,12 @@ private:
           }
 
           if (first) {
-            traj.initialize(st);
+            traj.start_at_rest(st.q_d);
             first = false;
           } else if (!stopping && stop_requested_.load()) {
             stopping = true;
             has_target_.store(false);
-            traj.stop_at_current();
+            traj.brake_to_rest();
           }
 
           if (!stopping && has_target_.load()) {
@@ -658,11 +546,11 @@ private:
             if (!planned) {
               fail_goal_(goal_in_flight, "joint target rejected by the trajectory planner");
               goal_in_flight = 0;
-              traj.stop_at_current();
+              traj.brake_to_rest();
             }
           }
 
-          auto pos = traj.step(period);
+          auto pos = traj.step(period.toSec());
 
           // Arrival is physical — at the reference and not moving — not an exhausted trajectory,
           // which the internal controller only tracks approximately. `traj.active()` is passed
@@ -678,7 +566,7 @@ private:
               goal_in_flight = 0;
               // ABORTED says the move stopped short, so the arm has to actually stop rather than
               // keep being driven at the expired target.
-              if (outcome == Arrival::Stalled) traj.stop_at_current();
+              if (outcome == Arrival::Stalled) traj.brake_to_rest();
             }
           }
 

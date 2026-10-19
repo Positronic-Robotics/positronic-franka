@@ -5,6 +5,7 @@
 ### Added
 - `max_reference_speed` on `SoftwareImpedance`, a keyword argument: a per-joint speed (7,), in rad/s, at which the reference `q_d` moves to a new target. The default is `DEFAULT_MAX_REFERENCE_SPEED`, 1.5 rad/s on every joint. `q_d` moves in a straight line in joint space, and all joints arrive together. A target near `q_d` is reached at once. A large jump is executed, slowly. This holds at any command rate, for a joint target and for an IK answer. `state().q_d` reports the moving reference. A move reports `REACHED` only after `q_d` arrives at the target. A change of the speed reaches the running torque loop like a gain change.
 - `tests/test_pose_ik.cpp`, which checks the IK on FR3 kinematics with Eigen only. CI builds and runs it.
+- `tests/test_trajectory_generator.cpp`, which checks the start of an `InternalImpedance` move with Eigen and the vendored Ruckig. CI builds and runs it.
 
 ### Changed
 - **Behaviour.** In `SoftwareImpedance`, a target does not step `q_d` in one tick. `q_d` moves to it at `max_reference_speed`. The spring torque rate cap from 0.8.0 is unchanged.
@@ -14,6 +15,8 @@
 - The overload with `q0` takes `max_step` (rad, default 0.5). It refuses a request where no joints are within `max_step` of `q0` and inside the FR3 limits: a negative or NaN step, or a `q0` farther than `max_step` outside a limit. `ik_verifier` passes an unbounded step.
 
 ### Fixed
+- An `InternalImpedance` move starts its trajectory at rest at the robot's `q_d`, and the first tick (zero period) commands that position. The trajectory started from the measured joint speed and advanced 1 ms on the first tick, so a move that started while the arm still moved slightly could stop with `joint_motion_generator_acceleration_discontinuity`. A switch from `SoftwareImpedance` to `InternalImpedance` was the usual case.
+- A stop of an `InternalImpedance` move (`stop()`, a refused target, a stall) brakes every joint to zero speed, and the arm rests where the brake ends. The stop planned a return to the position at the stop call, and Ruckig refused that plan often (`error -111`): in a simulation, 110 of 500 stops in the middle of a move. A refused stop kept the old plan, so the arm went on to the old target.
 - The IK bounds each joint to the FR3 joint position limits, `FR3_JOINT_LOWER_LIMITS` and `FR3_JOINT_UPPER_LIMITS`. It used the Panda limits, which differ on every joint. Joint 6 stopped at 3.7525 rad, and the FR3 allows 4.5169 rad. Joint 4 could go up to +3.0718 rad, and the FR3 allows only -0.1518 rad. `ik_verifier` uses the same limits.
 
 ### Removed
