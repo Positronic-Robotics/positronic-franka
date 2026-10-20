@@ -16,6 +16,7 @@
 namespace {
 
 using positronic_franka::impedance_torque;
+using positronic_franka::move_reference_toward;
 using positronic_franka::stop_has_settled;
 using positronic_franka::Matrix7d;
 using positronic_franka::SpringTorqueRateLimiter;
@@ -156,6 +157,68 @@ void a_stop_with_a_still_arm_settles_only_once_the_spring_torque_ramps_to_zero()
   check(!stop_has_settled(limiter, Vector7d::Constant(0.2), tolerance), "a moving arm has not settled");
 }
 
+const Vector7d REFERENCE_SPEED = (Vector7d() << 1.5, 1.5, 1.5, 1.5, 1.2, 1.0, 2.0).finished();
+
+// A jump of 2.4 rad on joint 5 against 0.3 rad or less elsewhere: joint 5 at 1.2 rad/s sets the pace.
+Vector7d far_target(const Vector7d& start) {
+  Vector7d jump;
+  jump << 0.3, -0.2, 0.1, 0.0, -2.4, 0.05, 0.25;
+  return start + jump;
+}
+
+void the_reference_moves_to_a_far_target_at_the_capped_speed_on_a_straight_line() {
+  const Vector7d start = Vector7d::LinSpaced(-1.1, 1.3);
+  const Vector7d target = far_target(start);
+  const double dt = 1e-3;
+  Vector7d ref = start;
+  for (int tick = 1; tick <= 1000; ++tick) {
+    const Vector7d next = move_reference_toward(ref, target, REFERENCE_SPEED, dt);
+    check(((next - ref).cwiseAbs().array() <= REFERENCE_SPEED.array() * dt + 1e-12).all(),
+          "tick " + std::to_string(tick) + ": a joint moved faster than its cap");
+    ref = next;
+  }
+  // After 1 s joint 5 has moved 1.2 rad, half of its 2.4 rad, and every other joint half of its jump.
+  check(((ref - (start + 0.5 * (target - start))).cwiseAbs().array() < 1e-9).all(),
+        "after 1 s every joint is halfway along the line");
+}
+
+void a_far_target_is_reached_exactly_when_the_slowest_joint_arrives() {
+  const Vector7d start = Vector7d::LinSpaced(-1.1, 1.3);
+  const Vector7d target = far_target(start);
+  const double dt = 1e-3;
+  Vector7d ref = start;
+  int ticks = 0;
+  while (ref != target && ticks < 10000) {
+    ref = move_reference_toward(ref, target, REFERENCE_SPEED, dt);
+    ++ticks;
+  }
+  check(ref == target, "the reference reaches the target bit for bit");
+  // 2.4 rad at 1.2 rad/s is 2 s, so 2000 ticks; one more at most for rounding.
+  check(ticks >= 2000 && ticks <= 2001, "it took " + std::to_string(ticks) + " ticks, not 2000");
+}
+
+void a_target_within_one_step_is_reached_on_that_tick() {
+  const Vector7d start = Vector7d::LinSpaced(-1.1, 1.3);
+  const Vector7d target = start + Vector7d::Constant(0.0009);  // below 1.0 rad/s * 1 ms on every joint
+  check(move_reference_toward(start, target, REFERENCE_SPEED, 1e-3) == target, "a small step lands on the target");
+}
+
+void a_new_target_mid_move_turns_the_reference_from_where_it_is() {
+  const Vector7d start = Vector7d::Zero();
+  Vector7d ref = start;
+  for (int tick = 0; tick < 100; ++tick) ref = move_reference_toward(ref, far_target(start), REFERENCE_SPEED, 1e-3);
+  const Vector7d turned_at = ref;
+  const Vector7d next = move_reference_toward(ref, start, REFERENCE_SPEED, 1e-3);
+  check(((next - turned_at).cwiseAbs().array() <= REFERENCE_SPEED.array() * 1e-3 + 1e-12).all(),
+        "the turn does not jump the reference");
+  check((next - start).norm() < (turned_at - start).norm(), "the reference heads back to the new target");
+}
+
+void a_zero_period_leaves_the_reference_where_it_is() {
+  const Vector7d start = Vector7d::LinSpaced(-1.1, 1.3);
+  check(move_reference_toward(start, far_target(start), REFERENCE_SPEED, 0.0) == start, "no time, no move");
+}
+
 }  // namespace
 
 int main() {
@@ -170,6 +233,14 @@ int main() {
        a_cap_change_mid_session_ramps_from_the_last_spring_torque},
       {"a_stop_with_a_still_arm_settles_only_once_the_spring_torque_ramps_to_zero",
        a_stop_with_a_still_arm_settles_only_once_the_spring_torque_ramps_to_zero},
+      {"the_reference_moves_to_a_far_target_at_the_capped_speed_on_a_straight_line",
+       the_reference_moves_to_a_far_target_at_the_capped_speed_on_a_straight_line},
+      {"a_far_target_is_reached_exactly_when_the_slowest_joint_arrives",
+       a_far_target_is_reached_exactly_when_the_slowest_joint_arrives},
+      {"a_target_within_one_step_is_reached_on_that_tick", a_target_within_one_step_is_reached_on_that_tick},
+      {"a_new_target_mid_move_turns_the_reference_from_where_it_is",
+       a_new_target_mid_move_turns_the_reference_from_where_it_is},
+      {"a_zero_period_leaves_the_reference_where_it_is", a_zero_period_leaves_the_reference_where_it_is},
   };
   int failed = 0;
   for (const auto& [name, test] : tests) {

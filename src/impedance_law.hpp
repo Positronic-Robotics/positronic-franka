@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 
 #include <Eigen/Core>
 
@@ -41,6 +42,19 @@ class SpringTorqueRateLimiter {
 inline bool stop_has_settled(const SpringTorqueRateLimiter& spring_limiter, const Vector7d& dq,
                              double velocity_tolerance) {
   return !spring_limiter.ramping() && dq.cwiseAbs().maxCoeff() < velocity_tolerance;
+}
+
+// Moves the spring reference q_d toward `target` in a straight line in joint space, as far as `max_speed`
+// (rad/s, per joint) allows in `dt`. All joints arrive together. The result is `target` once it is within one step.
+inline Vector7d move_reference_toward(const Vector7d& ref, const Vector7d& target, const Vector7d& max_speed,
+                                      double dt) {
+  const Vector7d remaining = target - ref;
+  double fraction = 1.0;
+  for (int i = 0; i < 7; ++i) {
+    const double step = max_speed(i) * dt;
+    if (std::abs(remaining(i)) > step) fraction = std::min(fraction, step / std::abs(remaining(i)));
+  }
+  return fraction == 1.0 ? target : Vector7d(ref + fraction * remaining);
 }
 
 // The software impedance law: tau = Kp (q_d - q) - Kd dq + coriolis. Only the spring term goes

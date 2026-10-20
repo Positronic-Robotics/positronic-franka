@@ -24,22 +24,12 @@
 #include <variant>
 #include <Eigen/Core>
 #include <Eigen/Geometry>
-#include <ruckig/ruckig.hpp>
-#include <ruckig/input_parameter.hpp>
-#include <osqp.h>
 
 #include "impedance_law.hpp"
+#include "pose_ik.hpp"
+#include "trajectory_generator.hpp"
 
 namespace positronic_franka {
-
-// Panda joint limits (rad/s, rad/s^2, rad/s^3)
-constexpr std::array<double, 7> PANDA_BASE_VELOCITY_LIMITS = {2.62, 2.62, 2.62, 2.62, 5.26, 4.18, 5.26};
-constexpr std::array<double, 7> PANDA_BASE_ACCELERATION_LIMITS = {10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0};
-constexpr std::array<double, 7> PANDA_BASE_JERK_LIMITS = {5000.0, 5000.0, 5000.0, 5000.0, 5000.0, 5000.0, 5000.0};
-constexpr std::array<double, 7> PANDA_JOINT_LOWER_LIMITS = {
-    -2.8973, -1.7628, -2.8973, -3.0718, -2.8973, -0.0175, -2.8973};
-constexpr std::array<double, 7> PANDA_JOINT_UPPER_LIMITS = {
-    2.8973, 1.7628, 2.8973, 3.0718, 2.8973, 3.7525, 2.8973};
 
 // Arrival: joints within tolerance of the reference and no longer moving, judged on one reading.
 //
@@ -57,13 +47,10 @@ constexpr int SETTLE_TICKS_CAP = 1000;
 // Deadline used when the caller names none. Generous for a joint move on this arm.
 constexpr double DEFAULT_MOVE_DEADLINE_S = 15.0;
 
-// Common Eigen aliases; Vector7d and Matrix7d come from impedance_law.hpp
-using Vector6d = Eigen::Matrix<double, 6, 1>;
-using SpatialJacobian = Eigen::Matrix<double, 6, 7>;
 
 // Control modes. InternalImpedance drives the robot's built-in joint impedance controller through the
 // joint position motion generator with Ruckig-shaped references. SoftwareImpedance runs the impedance
-// law here instead, over the torque interface, stepping the reference straight to each target.
+// law here instead, over the torque interface, moving the reference to each target at a capped joint speed.
 template <size_t N>
 bool all_zero(const std::array<double, N>& v) {
   for (double x : v) {
@@ -101,6 +88,9 @@ struct InternalImpedance {
 
 // Per-joint spring torque rate cap, Nm/s, tuned for the default SoftwareImpedance gains.
 constexpr std::array<double, 7> DEFAULT_MAX_SPRING_TORQUE_RATE = {130.0, 130.0, 130.0, 130.0, 85.0, 60.0, 35.0};
+// Per-joint speed, rad/s, at which the spring reference q_d moves to a new target. Recorded policy motion stays
+// below 1.3 rad/s on every joint over any 0.2 s. The FR3 limit on joints 1 to 4 is 2.62 rad/s.
+constexpr std::array<double, 7> DEFAULT_MAX_REFERENCE_SPEED = {1.5, 1.5, 1.5, 1.5, 1.5, 1.5, 1.5};
 
 // Gain defaults are copied from fairo polymetis/conf/robot_client/franka_hardware.yaml, the
 // configuration HybridJointImpedanceControl runs with in the DROID data-collection stack.
@@ -111,28 +101,40 @@ struct SoftwareImpedance {
   std::array<double, 6> kxd{37.0, 37.0, 37.0, 2.0, 2.0, 2.0};
   // Per-joint cap on the rate of change of the spring torque, Nm/s.
   std::array<double, 7> max_spring_torque_rate = DEFAULT_MAX_SPRING_TORQUE_RATE;
+  // Per-joint speed at which the spring reference q_d moves to a new target, rad/s.
+  std::array<double, 7> max_reference_speed = DEFAULT_MAX_REFERENCE_SPEED;
 
   SoftwareImpedance() = default;
-  explicit SoftwareImpedance(const std::array<double, 7>& max_spring_torque_rate_in)
-      : max_spring_torque_rate(max_spring_torque_rate_in) {
-    validate_max_spring_torque_rate_();
+  explicit SoftwareImpedance(const std::array<double, 7>& max_spring_torque_rate_in,
+                             const std::array<double, 7>& max_reference_speed_in = DEFAULT_MAX_REFERENCE_SPEED)
+      : max_spring_torque_rate(max_spring_torque_rate_in), max_reference_speed(max_reference_speed_in) {
+    validate_guards_();
   }
   SoftwareImpedance(const std::array<double, 7>& kq_in, const std::array<double, 7>& kqd_in,
                     const std::array<double, 6>& kx_in, const std::array<double, 6>& kxd_in,
-                    const std::array<double, 7>& max_spring_torque_rate_in = DEFAULT_MAX_SPRING_TORQUE_RATE)
-      : kq(kq_in), kqd(kqd_in), kx(kx_in), kxd(kxd_in), max_spring_torque_rate(max_spring_torque_rate_in) {
+                    const std::array<double, 7>& max_spring_torque_rate_in = DEFAULT_MAX_SPRING_TORQUE_RATE,
+                    const std::array<double, 7>& max_reference_speed_in = DEFAULT_MAX_REFERENCE_SPEED)
+      : kq(kq_in),
+        kqd(kqd_in),
+        kx(kx_in),
+        kxd(kxd_in),
+        max_spring_torque_rate(max_spring_torque_rate_in),
+        max_reference_speed(max_reference_speed_in) {
     validate_half(kq, kqd, "joint (kq/kqd)");
     validate_half(kx, kxd, "Cartesian (kx/kxd)");
     if (all_zero(kq) && all_zero(kx)) {
       throw std::invalid_argument("at least one of the joint or Cartesian halves must be active");
     }
-    validate_max_spring_torque_rate_();
+    validate_guards_();
   }
 
  private:
-  void validate_max_spring_torque_rate_() const {
+  void validate_guards_() const {
     if (!all_positive(max_spring_torque_rate)) {
       throw std::invalid_argument("max_spring_torque_rate must be finite and strictly positive");
+    }
+    if (!all_positive(max_reference_speed)) {
+      throw std::invalid_argument("max_reference_speed must be finite and strictly positive");
     }
   }
 };
@@ -143,7 +145,7 @@ inline bool operator==(const InternalImpedance& a, const InternalImpedance& b) {
 
 inline bool operator==(const SoftwareImpedance& a, const SoftwareImpedance& b) {
   return a.kq == b.kq && a.kqd == b.kqd && a.kx == b.kx && a.kxd == b.kxd &&
-         a.max_spring_torque_rate == b.max_spring_torque_rate;
+         a.max_spring_torque_rate == b.max_spring_torque_rate && a.max_reference_speed == b.max_reference_speed;
 }
 
 using ControlMode = std::variant<InternalImpedance, SoftwareImpedance>;
@@ -188,112 +190,6 @@ struct State {
   std::string error_message;
   // External wrench (force, torque) on end-effector frame expressed in K frame.
   Vector6d end_effector_wrench = Vector6d::Zero();
-};
-
-// Ruckig trajectory generator evaluated at libfranka's actual period rather than fixed 1 ms steps,
-// which would produce velocity/acceleration discontinuities under non-RT scheduling.
-class TrajectoryGenerator {
- public:
-  static constexpr double NOMINAL_DT = 1.0 / 1000.0;
-
-  explicit TrajectoryGenerator(double dynamics_factor) {
-    input_.synchronization = ruckig::Synchronization::Time;
-    input_.target_velocity.fill(0.0);
-    input_.target_acceleration.fill(0.0);
-    for (size_t i = 0; i < 7; ++i) {
-      input_.max_velocity[i] = PANDA_BASE_VELOCITY_LIMITS[i] * dynamics_factor;
-      input_.max_acceleration[i] = PANDA_BASE_ACCELERATION_LIMITS[i] * dynamics_factor;
-      input_.max_jerk[i] = PANDA_BASE_JERK_LIMITS[i] * dynamics_factor;
-    }
-  }
-
-  void initialize(const franka::RobotState& st) {
-    for (size_t i = 0; i < 7; ++i) {
-      input_.current_position[i] = st.q[i];
-      input_.current_velocity[i] = st.dq[i];
-      input_.current_acceleration[i] = 0.0;
-      input_.target_position[i] = st.q[i];
-    }
-    replan_();
-  }
-
-  // Restart the generator from a reference position at rest (torque mode shapes segments from the
-  // stepped reference, not from measured robot state).
-  void reset(const Vector7d& pos) {
-    for (size_t i = 0; i < 7; ++i) {
-      input_.current_position[i] = pos[i];
-      input_.current_velocity[i] = 0.0;
-      input_.current_acceleration[i] = 0.0;
-      input_.target_position[i] = pos[i];
-    }
-    replan_();
-  }
-
-  // Returns whether the plan to the new target was accepted; on failure the previous plan keeps playing.
-  bool set_target(const Vector7d& target) {
-    for (size_t i = 0; i < 7; ++i) input_.target_position[i] = target[i];
-    return replan_();
-  }
-
-  // TODO: a refused replan leaves the previous plan playing, so the arm goes on to the old target
-  // after the caller has been told the move ended. Braking is a short plan, so only a solver failure
-  // could do it and none has been seen; not handled.
-  void stop_at_current() {
-    input_.target_position = input_.current_position;
-    replan_();
-  }
-
-  // Advance trajectory by actual elapsed time and return the position.
-  std::array<double, 7> step(franka::Duration period) {
-    if (!planned_) return input_.current_position;
-
-    double dt = period.toSec();
-    if (dt <= 0.0) dt = NOMINAL_DT;
-    cumulative_time_ += dt;
-
-    double t = std::min(cumulative_time_, duration_);
-    std::array<double, 7> pos, vel, acc;
-    trajectory_.at_time(t, pos, vel, acc);
-
-    input_.current_position = pos;
-    input_.current_velocity = vel;
-    input_.current_acceleration = acc;
-
-    if (cumulative_time_ >= duration_) active_ = false;
-    return pos;
-  }
-
-  bool active() const { return active_; }
-
-  // How long the planned trajectory runs, in seconds. The move deadline adds it to the settle
-  // budget, so a slow `relative_dynamics_factor` (down to 0.0001) is not cut off by a flat constant.
-  double duration() const { return duration_; }
-
- private:
-  bool replan_() {
-    // Swap only on success: evaluating a default-constructed trajectory feeds NaN into libfranka and
-    // kills the control thread. On failure the previous plan keeps playing.
-    ruckig::Trajectory<7> next;
-    auto result = otg_.calculate(input_, next);
-    if (result < 0) {
-      std::cerr << "Ruckig trajectory planning failed (error " << static_cast<int>(result) << ")" << std::endl;
-      return false;
-    }
-    trajectory_ = next;
-    planned_ = true;
-    cumulative_time_ = 0.0;
-    duration_ = trajectory_.get_duration();
-    active_ = true;
-    return true;
-  }
-
-  ruckig::Ruckig<7> otg_{NOMINAL_DT};
-  ruckig::InputParameter<7> input_;
-  ruckig::Trajectory<7> trajectory_;
-  double cumulative_time_ = 0.0;
-  double duration_ = 0.0;
-  bool active_ = false;
-  bool planned_ = false;
 };
 
 class Robot {
@@ -530,7 +426,7 @@ class Robot {
 
       // Pose and error
       const Eigen::Matrix4d T_cur = ee_pose_matrix_(st);
-      const Eigen::Matrix<double, 6, 1> e = cartesian_error_(T_cur, t_tgt, R_tgt);
+      const Eigen::Matrix<double, 6, 1> e = pose_error(T_cur, t_tgt, R_tgt);
       const double err_norm = e.norm();
       if (err_norm < tol) break;
 
@@ -549,7 +445,7 @@ class Robot {
         const Vector7d q_trial = q + step * dq;
         st.q = to_std_array7_(q_trial);
         const Eigen::Matrix4d T_trial = ee_pose_matrix_(st);
-        const double err_trial = cartesian_error_(T_trial, t_tgt, R_tgt).norm();
+        const double err_trial = pose_error(T_trial, t_tgt, R_tgt).norm();
         if (err_trial < best_err) {
           best_err = err_trial;
           q = q_trial;
@@ -562,238 +458,22 @@ class Robot {
     return q;
   }
 
-  Vector7d inverse_kinematics_with_limits(
-      const Eigen::Ref<const Vector7d>& target_pose_wxyz,
-      double tol = 1e-4, int max_iters = 150, double min_step = 1e-8, double pinv_reg = 0.03,
-      double nullspace_gain = 0.002, double line_search_alpha = 1.0, double line_search_beta = 0.5,
-      int line_search_max_steps = 20) {
-    auto base = read_robot_state_();
-    Vector7d q0 = Eigen::Map<const Vector7d>(base.q.data());
-    return inverse_kinematics_with_limits(target_pose_wxyz, q0, tol, max_iters, min_step, pinv_reg,
-                                          nullspace_gain, line_search_alpha, line_search_beta,
-                                          line_search_max_steps);
+  // The IK for a live command: the joints that bring the tool as close as the bounds allow to
+  // target_pose_wxyz, from the measured joints.
+  Vector7d inverse_kinematics_with_limits(const Eigen::Ref<const Vector7d>& target_pose_wxyz) {
+    const franka::RobotState base = read_robot_state_();
+    return inverse_kinematics_with_limits(target_pose_wxyz, Eigen::Map<const Vector7d>(base.q.data()),
+                                          IK_MAX_JOINT_STEP);
   }
 
-  Vector7d inverse_kinematics_with_limits(
-      const Eigen::Ref<const Vector7d>& target_pose_wxyz,
-      const Eigen::Ref<const Vector7d>& q0,
-      double tol = 1e-4, int max_iters = 150, double min_step = 1e-8, double pinv_reg = 0.03,
-      double nullspace_gain = 0.002, double line_search_alpha = 1.0, double line_search_beta = 0.5,
-      int line_search_max_steps = 20) {
-    static_cast<void>(line_search_beta);
-    static_cast<void>(line_search_max_steps);
-
-    const Eigen::Vector3d t_tgt = target_pose_wxyz.head<3>();
-    Eigen::Quaterniond q_tgt(target_pose_wxyz(3), target_pose_wxyz(4), target_pose_wxyz(5),
-                             target_pose_wxyz(6));
-    q_tgt.normalize();
-    const Eigen::Matrix3d R_tgt = q_tgt.toRotationMatrix();
-
-    franka::RobotState base = read_robot_state_();
-    franka::RobotState st = base;
-    Vector7d q = q0;
-
-    const double regularization = std::max(pinv_reg, 1e-6);
-
-    const c_int n = 7;
-    const c_int m = 7;
-    std::vector<c_int> A_indptr(n + 1, 0);
-    std::vector<c_int> A_indices;
-    std::vector<c_float> A_data;
-    A_indices.reserve(n);
-    A_data.reserve(n);
-    for (c_int col = 0; col < n; ++col) {
-      A_indptr[col] = static_cast<c_int>(A_data.size());
-      A_indices.push_back(col);
-      A_data.push_back(1.0);
-    }
-    A_indptr[n] = static_cast<c_int>(A_data.size());
-
-    OSQPSettings settings;
-    osqp_set_default_settings(&settings);
-    settings.verbose = 0;
-    settings.polish = 0;
-    settings.max_iter = 400;
-    settings.eps_abs = std::min(1e-6, tol * 0.1);
-    settings.eps_rel = std::min(1e-6, tol * 0.1);
-    settings.warm_start = 0;
-
-    for (int it = 0; it < max_iters; ++it) {
+  Vector7d inverse_kinematics_with_limits(const Eigen::Ref<const Vector7d>& target_pose_wxyz,
+                                          const Eigen::Ref<const Vector7d>& q0, double max_step) {
+    franka::RobotState st = read_robot_state_();
+    const auto kinematics = [&](const Vector7d& q) {
       st.q = to_std_array7_(q);
-      const Eigen::Matrix4d T_cur = ee_pose_matrix_(st);
-      const Eigen::Matrix<double, 6, 1> e = cartesian_error_(T_cur, t_tgt, R_tgt);
-      const double err_norm = e.norm();
-      if (err_norm < tol)
-        break;
-
-      const SpatialJacobian J = ee_jacobian_(st);
-      const Eigen::Matrix<double, 7, 7> P = J.transpose() * J +
-                                            regularization * Eigen::Matrix<double, 7, 7>::Identity();
-
-      std::vector<c_int> P_indptr(n + 1, 0);
-      std::vector<c_int> P_indices;
-      std::vector<c_float> P_data;
-      P_indices.reserve(n * (n + 1) / 2);
-      P_data.reserve(n * (n + 1) / 2);
-      for (c_int col = 0; col < n; ++col) {
-        P_indptr[col] = static_cast<c_int>(P_data.size());
-        for (c_int row = 0; row <= col; ++row) {
-          const double value = P(row, col);
-          if (std::abs(value) < 1e-12)
-            continue;
-          P_indices.push_back(row);
-          P_data.push_back(static_cast<c_float>(value));
-        }
-      }
-      P_indptr[n] = static_cast<c_int>(P_data.size());
-
-      c_float* A_data_raw = static_cast<c_float*>(c_malloc(A_data.size() * sizeof(c_float)));
-      c_int* A_indices_raw = static_cast<c_int*>(c_malloc(A_indices.size() * sizeof(c_int)));
-      c_int* A_indptr_raw = static_cast<c_int*>(c_malloc(A_indptr.size() * sizeof(c_int)));
-      if (!A_data_raw || !A_indices_raw || !A_indptr_raw) {
-        if (A_data_raw) c_free(A_data_raw);
-        if (A_indices_raw) c_free(A_indices_raw);
-        if (A_indptr_raw) c_free(A_indptr_raw);
-        throw std::runtime_error("Failed to allocate OSQP constraint buffers.");
-      }
-      std::memcpy(A_data_raw, A_data.data(), A_data.size() * sizeof(c_float));
-      std::memcpy(A_indices_raw, A_indices.data(), A_indices.size() * sizeof(c_int));
-      std::memcpy(A_indptr_raw, A_indptr.data(), A_indptr.size() * sizeof(c_int));
-      csc* A_csc = csc_matrix(m, n, static_cast<c_int>(A_data.size()), A_data_raw, A_indices_raw,
-                              A_indptr_raw);
-      if (!A_csc) {
-        c_free(A_data_raw);
-        c_free(A_indices_raw);
-        c_free(A_indptr_raw);
-        throw std::runtime_error("Failed to construct OSQP constraint matrix.");
-      }
-
-      c_float* P_data_raw = static_cast<c_float*>(c_malloc(P_data.size() * sizeof(c_float)));
-      c_int* P_indices_raw = static_cast<c_int*>(c_malloc(P_indices.size() * sizeof(c_int)));
-      c_int* P_indptr_raw = static_cast<c_int*>(c_malloc(P_indptr.size() * sizeof(c_int)));
-      if (!P_data_raw || !P_indices_raw || !P_indptr_raw) {
-        if (P_data_raw) c_free(P_data_raw);
-        if (P_indices_raw) c_free(P_indices_raw);
-        if (P_indptr_raw) c_free(P_indptr_raw);
-        csc_spfree(A_csc);
-        throw std::runtime_error("Failed to allocate OSQP Hessian buffers.");
-      }
-      std::memcpy(P_data_raw, P_data.data(), P_data.size() * sizeof(c_float));
-      std::memcpy(P_indices_raw, P_indices.data(), P_indices.size() * sizeof(c_int));
-      std::memcpy(P_indptr_raw, P_indptr.data(), P_indptr.size() * sizeof(c_int));
-
-      csc* P_csc = csc_matrix(n, n, static_cast<c_int>(P_data.size()), P_data_raw, P_indices_raw,
-                              P_indptr_raw);
-      if (!P_csc) {
-        c_free(P_data_raw);
-        c_free(P_indices_raw);
-        c_free(P_indptr_raw);
-        csc_spfree(A_csc);
-        throw std::runtime_error("Failed to construct OSQP Hessian matrix.");
-      }
-
-      std::vector<c_float> q_vec(n, 0.0);
-      Vector7d grad = J.transpose() * e;
-      for (c_int i = 0; i < n; ++i) {
-        q_vec[static_cast<size_t>(i)] =
-            static_cast<c_float>(grad(static_cast<Eigen::Index>(i)));
-      }
-
-      std::vector<c_float> lower(m, 0.0);
-      std::vector<c_float> upper(m, 0.0);
-      for (c_int i = 0; i < m; ++i) {
-        const double min_bound = PANDA_JOINT_LOWER_LIMITS[static_cast<size_t>(i)] -
-                                 q(static_cast<Eigen::Index>(i));
-        const double max_bound = PANDA_JOINT_UPPER_LIMITS[static_cast<size_t>(i)] -
-                                 q(static_cast<Eigen::Index>(i));
-        lower[static_cast<size_t>(i)] = static_cast<c_float>(min_bound);
-        upper[static_cast<size_t>(i)] = static_cast<c_float>(max_bound);
-      }
-
-      c_float* q_raw = static_cast<c_float*>(c_malloc(n * sizeof(c_float)));
-      c_float* l_raw = static_cast<c_float*>(c_malloc(m * sizeof(c_float)));
-      c_float* u_raw = static_cast<c_float*>(c_malloc(m * sizeof(c_float)));
-      if (!q_raw || !l_raw || !u_raw) {
-        if (q_raw) c_free(q_raw);
-        if (l_raw) c_free(l_raw);
-        if (u_raw) c_free(u_raw);
-        csc_spfree(P_csc);
-        csc_spfree(A_csc);
-        throw std::runtime_error("Failed to allocate OSQP vector buffers.");
-      }
-      for (c_int i = 0; i < n; ++i)
-        q_raw[i] = q_vec[static_cast<size_t>(i)];
-      for (c_int i = 0; i < m; ++i) {
-        l_raw[i] = lower[static_cast<size_t>(i)];
-        u_raw[i] = upper[static_cast<size_t>(i)];
-      }
-
-      OSQPData data;
-      data.n = n;
-      data.m = m;
-      data.P = P_csc;
-      data.A = A_csc;
-      data.q = q_raw;
-      data.l = l_raw;
-      data.u = u_raw;
-
-      OSQPWorkspace* workspace = nullptr;
-      const c_int setup_status = osqp_setup(&workspace, &data, &settings);
-      if (setup_status != 0 || workspace == nullptr) {
-        if (workspace) osqp_cleanup(workspace);
-        c_free(q_raw);
-        c_free(l_raw);
-        c_free(u_raw);
-        csc_spfree(P_csc);
-        csc_spfree(A_csc);
-        throw std::runtime_error("Failed to set up OSQP solver.");
-      }
-
-      const c_int solve_status = osqp_solve(workspace);
-      if (solve_status != 0 || workspace->info == nullptr ||
-          (workspace->info->status_val != OSQP_SOLVED &&
-           workspace->info->status_val != OSQP_SOLVED_INACCURATE)) {
-        osqp_cleanup(workspace);
-        c_free(q_raw);
-        c_free(l_raw);
-        c_free(u_raw);
-        csc_spfree(P_csc);
-        csc_spfree(A_csc);
-        break;
-      }
-
-      Vector7d dq = Vector7d::Zero();
-      for (c_int i = 0; i < n; ++i)
-        dq(static_cast<Eigen::Index>(i)) =
-            static_cast<double>(workspace->solution->x[static_cast<size_t>(i)]);
-
-      osqp_cleanup(workspace);
-      c_free(q_raw);
-      c_free(l_raw);
-      c_free(u_raw);
-      csc_spfree(P_csc);
-      csc_spfree(A_csc);
-
-      if (dq.norm() < min_step)
-        break;
-
-      double step_scale = 1.0;
-      if (line_search_alpha > 0.0 && dq.norm() > line_search_alpha)
-        step_scale = line_search_alpha / dq.norm();
-
-      Vector7d q_next = q + step_scale * dq;
-      for (size_t i = 0; i < 7; ++i) {
-        const double lower_limit = PANDA_JOINT_LOWER_LIMITS[i];
-        const double upper_limit = PANDA_JOINT_UPPER_LIMITS[i];
-        q_next(static_cast<Eigen::Index>(i)) =
-            std::clamp(q_next(static_cast<Eigen::Index>(i)), lower_limit, upper_limit);
-      }
-
-      if ((q_next - q).norm() < min_step)
-        break;
-      q = q_next;
-    }
-    return q;
+      return ToolKinematics{ee_pose_matrix_(st), ee_jacobian_(st)};
+    };
+    return solve_pose_ik(kinematics, target_pose_wxyz, q0, max_step);
   }
 
 private:
@@ -813,21 +493,6 @@ private:
   SpatialJacobian ee_jacobian_(const franka::RobotState& st) const {
     const auto J_data = model_->zeroJacobian(franka::Frame::kEndEffector, st);
     return Eigen::Map<const SpatialJacobian>(J_data.data());
-  }
-
-  static Eigen::Matrix<double, 6, 1> cartesian_error_(const Eigen::Matrix4d& T_cur,
-                                                      const Eigen::Vector3d& t_tgt,
-                                                      const Eigen::Matrix3d& R_tgt) {
-    const Eigen::Vector3d t_cur = T_cur.block<3, 1>(0, 3);
-    const Eigen::Matrix3d R_cur = T_cur.block<3, 3>(0, 0);
-    const Eigen::Vector3d e_pos = t_cur - t_tgt;
-    const Eigen::Matrix3d R_rel = R_cur.transpose() * R_tgt;
-    const Eigen::AngleAxisd aa(R_rel);
-    const Eigen::Vector3d w = aa.angle() * aa.axis();
-    const Eigen::Vector3d e_rot = -R_cur * w;
-    Eigen::Matrix<double, 6, 1> e;
-    e << e_pos, e_rot;
-    return e;
   }
 
   static Eigen::Matrix<double, 7, 6> damped_pinv_(const SpatialJacobian& J, double lambda) {
@@ -858,12 +523,12 @@ private:
           }
 
           if (first) {
-            traj.initialize(st);
+            traj.start_at_rest(st.q_d);
             first = false;
           } else if (!stopping && stop_requested_.load()) {
             stopping = true;
             has_target_.store(false);
-            traj.stop_at_current();
+            traj.brake_to_rest();
           }
 
           if (!stopping && has_target_.load()) {
@@ -881,11 +546,11 @@ private:
             if (!planned) {
               fail_goal_(goal_in_flight, "joint target rejected by the trajectory planner");
               goal_in_flight = 0;
-              traj.stop_at_current();
+              traj.brake_to_rest();
             }
           }
 
-          auto pos = traj.step(period);
+          auto pos = traj.step(period.toSec());
 
           // Arrival is physical — at the reference and not moving — not an exhausted trajectory,
           // which the internal controller only tracks approximately. `traj.active()` is passed
@@ -901,7 +566,7 @@ private:
               goal_in_flight = 0;
               // ABORTED says the move stopped short, so the arm has to actually stop rather than
               // keep being driven at the expired target.
-              if (outcome == Arrival::Stalled) traj.stop_at_current();
+              if (outcome == Arrival::Stalled) traj.brake_to_rest();
             }
           }
 
@@ -923,16 +588,17 @@ private:
 
   // Torque-interface control loop running the polymetis hybrid impedance law:
   //   tau = (J^T Kx J + Kq)(q_d - q) - (J^T Kxd J + Kqd) dq + coriolis
-  // with the spring term rate-capped (impedance_law.hpp). Gravity is compensated by
-  // libfranka underneath the torque command. Shares the target/stop/goal machinery with the position
-  // loop; only the reference differs — every target steps q_d instantly and the law pulls the arm in,
-  // where the position loop shapes a Ruckig trajectory.
+  // with the spring term rate-capped (impedance_law.hpp). Gravity is compensated by libfranka underneath the
+  // torque command. Shares the target/stop/goal machinery with the position loop; only the reference differs:
+  // q_d moves to each target in a straight line at max_reference_speed, where the position loop shapes a Ruckig
+  // trajectory.
   void run_joint_torque_control_(SoftwareImpedance imp) {
     Vector7d Kq = Eigen::Map<const Vector7d>(imp.kq.data());
     Vector7d Kqd = Eigen::Map<const Vector7d>(imp.kqd.data());
     Vector6d Kx = Eigen::Map<const Vector6d>(imp.kx.data());
     Vector6d Kxd = Eigen::Map<const Vector6d>(imp.kxd.data());
     SpringTorqueRateLimiter spring_limiter(imp.max_spring_torque_rate);
+    Vector7d max_reference_speed = Eigen::Map<const Vector7d>(imp.max_reference_speed.data());
     std::string thread_error;
     try {
       robot_->control(
@@ -943,25 +609,24 @@ private:
          deadline_s = 0.0,
          stopping = false,
          stop_ticks = 0,
-         ref = Vector7d(Vector7d::Zero())](const franka::RobotState& st,
-                                           franka::Duration period) mutable -> franka::Torques {
+         ref = Vector7d(Vector7d::Zero()),
+         target = Vector7d(Vector7d::Zero())](const franka::RobotState& st,
+                                              franka::Duration period) mutable -> franka::Torques {
           const Vector7d q = Eigen::Map<const Vector7d>(st.q.data());
           const Vector7d dq = Eigen::Map<const Vector7d>(st.dq.data());
 
           if (first) {
-            ref = q;
+            ref = target = q;
             first = false;
           } else if (!stopping && stop_requested_.load()) {
             stopping = true;
             has_target_.store(false);
-            ref = q;
+            ref = target = q;
           }
 
-          // No trajectory here, by design: the reference steps to the target and the impedance law
-          // is what moves the arm. That is what this mode is for.
           if (!stopping && has_target_.load()) {
             std::lock_guard<std::mutex> lk(target_mutex_);
-            ref = target_q_;
+            target = target_q_;
             goal_in_flight = std::exchange(target_goal_id_, 0);
             elapsed_s = 0.0;
             deadline_s = std::exchange(target_deadline_s_, 0.0);
@@ -975,19 +640,23 @@ private:
             Kx = Eigen::Map<const Vector6d>(new_gains_.kx.data());
             Kxd = Eigen::Map<const Vector6d>(new_gains_.kxd.data());
             spring_limiter.set_max_rate(new_gains_.max_spring_torque_rate);
+            max_reference_speed = Eigen::Map<const Vector7d>(new_gains_.max_reference_speed.data());
             has_new_gains_.store(false);
           }
 
-          // The position loop's arrival rule with nothing shaping the reference: it stepped away
-          // from the arm on arrival, so this cannot pass until the spring has pulled the joints in.
+          // No trajectory here: the impedance law moves the arm. The speed cap on q_d keeps a large jump in the
+          // target from becoming a large spring pull, at any command rate.
+          ref = move_reference_toward(ref, target, max_reference_speed, period.toSec());
+
+          // The position loop's arrival rule: there is no arrival to test while the reference still moves.
           if (goal_in_flight != 0) {
             const Arrival outcome =
-                arrival_(ref, q, dq, /*travelling=*/false, period.toSec(), deadline_s, elapsed_s);
+                arrival_(ref, q, dq, /*travelling=*/ref != target, period.toSec(), deadline_s, elapsed_s);
             if (settle_on_arrival_(goal_in_flight, outcome)) {
               goal_in_flight = 0;
               // As above: hold position rather than keep pulling toward a target already reported
               // as not reached.
-              if (outcome == Arrival::Stalled) ref = q;
+              if (outcome == Arrival::Stalled) ref = target = q;
             }
           }
 

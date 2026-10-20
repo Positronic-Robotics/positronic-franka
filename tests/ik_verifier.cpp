@@ -1,6 +1,7 @@
 #include <cstdlib>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <random>
 #include <sstream>
 #include <string>
@@ -19,8 +20,8 @@ using positronic_franka::Vector7d;
 Vector7d clamp_to_limits(const Vector7d& q) {
   Vector7d clamped = q;
   for (int i = 0; i < 7; ++i) {
-    clamped(i) = std::min(positronic_franka::PANDA_JOINT_UPPER_LIMITS[static_cast<size_t>(i)],
-                          std::max(positronic_franka::PANDA_JOINT_LOWER_LIMITS[static_cast<size_t>(i)],
+    clamped(i) = std::min(positronic_franka::FR3_JOINT_UPPER_LIMITS[static_cast<size_t>(i)],
+                          std::max(positronic_franka::FR3_JOINT_LOWER_LIMITS[static_cast<size_t>(i)],
                                    q(i)));
   }
   return clamped;
@@ -71,7 +72,8 @@ Metrics verify_method(positronic_franka::Robot& robot,
     Vector7d q_solution;
     try {
       if (use_limits_solver) {
-        q_solution = robot.inverse_kinematics_with_limits(pose_vec, q_seed);
+        q_solution = robot.inverse_kinematics_with_limits(pose_vec, q_seed,
+                                                          std::numeric_limits<double>::infinity());
       } else {
         q_solution = robot.inverse_kinematics_q0(pose_vec, q_seed);
       }

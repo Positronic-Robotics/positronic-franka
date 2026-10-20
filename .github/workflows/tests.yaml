@@ -34,3 +34,39 @@ jobs:
           g++ -std=c++17 -Wall -Wextra -Werror -I src $(pkg-config --cflags eigen3) \
             tests/test_impedance_law.cpp -o test_impedance_law
           ./test_impedance_law
+
+  pose-ik:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Eigen
+        run: sudo apt-get update && sudo apt-get install -y libeigen3-dev
+
+      # The pose IK takes the kinematics as an argument, so this test runs on FR3 kinematics without libfranka.
+      - name: Run the pose IK tests
+        run: |
+          g++ -std=c++17 -Wall -Wextra -Werror -I src $(pkg-config --cflags eigen3) \
+            tests/test_pose_ik.cpp -o test_pose_ik
+          ./test_pose_ik
+
+  trajectory-generator:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Eigen
+        run: sudo apt-get update && sudo apt-get install -y libeigen3-dev
+
+      # The trajectory generator needs Eigen and the vendored Ruckig, so this test runs without libfranka.
+      # Ruckig needs C++20 and is built without the warning flags.
+      - name: Run the trajectory generator tests
+        run: |
+          for f in $(ls external/ruckig/src/ruckig/*.cpp | grep -v -e cloud_client -e python); do
+            g++ -std=c++20 -O2 -I external/ruckig/include -c "$f" -o "$(basename "$f" .cpp).o"
+          done
+          g++ -std=c++20 -Wall -Wextra -Werror -I src -I external/ruckig/include $(pkg-config --cflags eigen3) \
+            tests/test_trajectory_generator.cpp *.o -o test_trajectory_generator
+          ./test_trajectory_generator

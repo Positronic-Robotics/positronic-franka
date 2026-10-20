@@ -27,26 +27,32 @@ PYBIND11_MODULE(_franka, m) {
 
   py::class_<positronic_franka::SoftwareImpedance>(m, "SoftwareImpedance",
       "Software impedance law on the torque interface (polymetis HybridJointImpedanceControl): "
-      "tau = (J^T Kx J + Kq)(q_d - q) - (J^T Kxd J + Kqd) dq + coriolis. Every target steps the "
-      "reference instantly and the law pulls the arm in. Default gains are polymetis'. Otherwise "
+      "tau = (J^T Kx J + Kq)(q_d - q) - (J^T Kxd J + Kqd) dq + coriolis. The reference q_d moves to "
+      "each target and the law pulls the arm in. Default gains are polymetis'. Otherwise "
       "all four are passed together, and each half (joint kq/kqd, Cartesian kx/kxd) is either all "
       "zero — disabled — or strictly positive, with at least one half active. "
       "max_spring_torque_rate (7,), Nm/s, caps how fast the spring term (J^T Kx J + Kq)(q_d - q) may "
       "change per joint, so a target step ramps the spring torque in rather than stepping it; damping "
       "and coriolis are not capped. Finite and strictly positive. The default is tuned for the default "
-      "gains; values at or above libfranka's own 1000 Nm/s torque rate limit have no practical effect.")
-      .def(py::init<const std::array<double, 7>&>(), py::kw_only(),
-           py::arg("max_spring_torque_rate") = positronic_franka::DEFAULT_MAX_SPRING_TORQUE_RATE)
+      "gains; values at or above libfranka's own 1000 Nm/s torque rate limit have no practical effect. "
+      "max_reference_speed (7,), rad/s, is the speed at which q_d moves to a new target, in a straight "
+      "line in joint space with all joints arriving together, so a large target jump is a slow move at "
+      "any command rate. Finite and strictly positive.")
+      .def(py::init<const std::array<double, 7>&, const std::array<double, 7>&>(), py::kw_only(),
+           py::arg("max_spring_torque_rate") = positronic_franka::DEFAULT_MAX_SPRING_TORQUE_RATE,
+           py::arg("max_reference_speed") = positronic_franka::DEFAULT_MAX_REFERENCE_SPEED)
       .def(py::init<const std::array<double, 7>&, const std::array<double, 7>&,
                     const std::array<double, 6>&, const std::array<double, 6>&,
-                    const std::array<double, 7>&>(),
+                    const std::array<double, 7>&, const std::array<double, 7>&>(),
            py::arg("kq"), py::arg("kqd"), py::arg("kx"), py::arg("kxd"), py::kw_only(),
-           py::arg("max_spring_torque_rate") = positronic_franka::DEFAULT_MAX_SPRING_TORQUE_RATE)
+           py::arg("max_spring_torque_rate") = positronic_franka::DEFAULT_MAX_SPRING_TORQUE_RATE,
+           py::arg("max_reference_speed") = positronic_franka::DEFAULT_MAX_REFERENCE_SPEED)
       .def_readonly("kq", &positronic_franka::SoftwareImpedance::kq)
       .def_readonly("kqd", &positronic_franka::SoftwareImpedance::kqd)
       .def_readonly("kx", &positronic_franka::SoftwareImpedance::kx)
       .def_readonly("kxd", &positronic_franka::SoftwareImpedance::kxd)
       .def_readonly("max_spring_torque_rate", &positronic_franka::SoftwareImpedance::max_spring_torque_rate)
+      .def_readonly("max_reference_speed", &positronic_franka::SoftwareImpedance::max_reference_speed)
       .def(py::self == py::self);
 
   py::enum_<positronic_franka::GoalStatus>(m, "GoalStatus",
@@ -174,15 +180,18 @@ PYBIND11_MODULE(_franka, m) {
             return r.inverse_kinematics_with_limits(target_pose_wxyz);
           },
           py::arg("target_pose_wxyz"),
-          "IK to EndEffector pose with Panda joint limits enforced via OSQP; returns q (7,)")
+          "IK for a live command to EndEffector pose (tx,ty,tz,qw,qx,qy,qz), from the measured joints, within "
+          "the FR3 joint limits, with each joint at most 0.5 rad from the measured joints; returns q (7,)")
       .def(
           "inverse_kinematics_with_limits",
           [](positronic_franka::Robot& r, const positronic_franka::Vector7d& target_pose_wxyz,
-             const positronic_franka::Vector7d& q0) {
-            return r.inverse_kinematics_with_limits(target_pose_wxyz, q0);
+             const positronic_franka::Vector7d& q0, double max_step) {
+            return r.inverse_kinematics_with_limits(target_pose_wxyz, q0, max_step);
           },
           py::arg("target_pose_wxyz"), py::arg("q0"),
-          "IK with initial guess and Panda joint limits enforced via OSQP; returns q (7,)")
+          py::arg("max_step") = positronic_franka::IK_MAX_JOINT_STEP,
+          "IK from joints q0 with each joint at most max_step (rad) from q0 and within the FR3 joint limits; "
+          "returns q (7,)")
       .def("set_target_joints", &positronic_franka::Robot::set_target_joints,
            py::arg("q_target"), py::arg("deadline_s") = positronic_franka::DEFAULT_MOVE_DEADLINE_S,
            "Command a joint move to target (7,) and return immediately; poll goal() for the outcome. "
