@@ -66,13 +66,6 @@ ToolKinematics fr3_flange(const Vector7d& q) {
   return k;
 }
 
-// F_T_EE as Desk sets it for the Franka Hand: 103.4 mm along the flange axis and -45 deg about it.
-Eigen::Matrix4d franka_hand_from_flange() {
-  return (Eigen::Isometry3d(Eigen::AngleAxisd(-kPi / 4, Eigen::Vector3d::UnitZ())) *
-          Eigen::Translation3d(0, 0, 0.1034))
-      .matrix();
-}
-
 Vector7d pose_wxyz(const Eigen::Matrix4d& T) {
   const Eigen::Quaterniond quat(Eigen::Matrix3d(T.block<3, 3>(0, 0)));
   Vector7d pose;
@@ -273,6 +266,13 @@ void the_move_pulls_the_posture_along_the_null_space_and_keeps_the_tool() {
   check(std::abs(n0.dot(q - q0) - expected) < 0.05 * std::abs(expected), "the null-space pull is 2 % of the offset");
   const auto [mm, deg] = miss(q, target);
   check(mm < 0.1 && deg < 0.1, "the pull moved the tool");
+}
+
+// F_T_EE as Desk sets it for the Franka Hand: 103.4 mm along the flange axis and -45 deg about it.
+Eigen::Matrix4d franka_hand_from_flange() {
+  return (Eigen::Isometry3d(Eigen::AngleAxisd(-kPi / 4, Eigen::Vector3d::UnitZ())) *
+          Eigen::Translation3d(0, 0, 0.1034))
+      .matrix();
 }
 
 void the_flange_pose_takes_the_tool_offset_off_the_end_effector_pose() {

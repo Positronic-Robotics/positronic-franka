@@ -153,7 +153,7 @@ PYBIND11_MODULE(_franka, m) {
           [](positronic_franka::Robot& r, const positronic_franka::Vector7d& q) { return r.zero_jacobian(q); },
           py::arg("q"),
           "Zero Jacobian (6x7) of the end-effector frame F_T_EE at joint values q, with the robot's current "
-          "frames — the J the SoftwareImpedance law uses. The IK uses the flange Jacobian")
+          "frames — the J the SoftwareImpedance law uses")
       .def(
           "coriolis",
           [](positronic_franka::Robot& r, const positronic_franka::Vector7d& q,
