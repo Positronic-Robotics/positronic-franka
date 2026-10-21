@@ -103,9 +103,10 @@ PYBIND11_MODULE(_franka, m) {
           [](const positronic_franka::State& s) { return s.tau_J_d; },
           "Last commanded joint torques (7,) after rate limiting/filtering, without gravity")
       .def_property_readonly(
-          "end_effector_pose",
-          [](const positronic_franka::State& s) { return s.end_effector_pose; },
-          "End-effector pose in robot frame as (tx,ty,tz,qw,qx,qy,qz)")
+          "flange_pose",
+          [](const positronic_franka::State& s) { return s.flange_pose; },
+          "Flange pose O_T_F in robot frame as (tx,ty,tz,qw,qx,qy,qz); the end-effector frame F_T_EE "
+          "that Desk sets does not move it")
       .def_property_readonly(
           "time",
           [](const positronic_franka::State& s) { return s.time; },
@@ -139,20 +140,20 @@ PYBIND11_MODULE(_franka, m) {
                              "Active control mode (InternalImpedance | SoftwareImpedance)")
       .def("state", &positronic_franka::Robot::state,
            "State snapshot from one control tick: measured q/dq/tau_J, tracked reference q_d, commanded "
-           "tau_J_d, EE pose, time, errors, wrench")
+           "tau_J_d, flange pose, time, errors, wrench")
       .def(
           "forward_kinematics",
           [](positronic_franka::Robot& r, const positronic_franka::Vector7d& q) {
             return r.forward_kinematics(q);
           },
           py::arg("q"),
-          "FK from joint vector (7,) to EE pose (tx,ty,tz,qw,qx,qy,qz) in base frame")
+          "FK from joint vector (7,) to the flange pose (tx,ty,tz,qw,qx,qy,qz) in base frame")
       .def(
           "zero_jacobian",
           [](positronic_franka::Robot& r, const positronic_franka::Vector7d& q) { return r.zero_jacobian(q); },
           py::arg("q"),
-          "End-effector zero Jacobian (6x7) at joint values q, with the robot's current frames — the "
-          "J the SoftwareImpedance law uses")
+          "Zero Jacobian (6x7) of the end-effector frame F_T_EE at joint values q, with the robot's current "
+          "frames — the J the SoftwareImpedance law uses. The IK uses the flange Jacobian")
       .def(
           "coriolis",
           [](positronic_franka::Robot& r, const positronic_franka::Vector7d& q,
@@ -161,37 +162,37 @@ PYBIND11_MODULE(_franka, m) {
           "Coriolis torques (7,) at explicit q, dq with the robot's current load configuration")
       .def(
           "inverse_kinematics",
-          [](positronic_franka::Robot& r, const positronic_franka::Vector7d& target_pose_wxyz) {
-            return r.inverse_kinematics(target_pose_wxyz);
+          [](positronic_franka::Robot& r, const positronic_franka::Vector7d& flange_pose_wxyz) {
+            return r.inverse_kinematics(flange_pose_wxyz);
           },
-          py::arg("target_pose_wxyz"),
-          "IK to EndEffector pose (tx,ty,tz,qw,qx,qy,qz) in base frame; returns q (7,)")
+          py::arg("flange_pose_wxyz"),
+          "IK to the flange pose (tx,ty,tz,qw,qx,qy,qz) in base frame; returns q (7,)")
       .def(
           "inverse_kinematics",
-          [](positronic_franka::Robot& r, const positronic_franka::Vector7d& target_pose_wxyz,
+          [](positronic_franka::Robot& r, const positronic_franka::Vector7d& flange_pose_wxyz,
              const positronic_franka::Vector7d& q0) {
-            return r.inverse_kinematics_q0(target_pose_wxyz, q0);
+            return r.inverse_kinematics_q0(flange_pose_wxyz, q0);
           },
-          py::arg("target_pose_wxyz"), py::arg("q0"),
-          "IK with initial guess q0; returns q (7,)")
+          py::arg("flange_pose_wxyz"), py::arg("q0"),
+          "IK to the flange pose with initial guess q0; returns q (7,)")
       .def(
           "inverse_kinematics_with_limits",
-          [](positronic_franka::Robot& r, const positronic_franka::Vector7d& target_pose_wxyz) {
-            return r.inverse_kinematics_with_limits(target_pose_wxyz);
+          [](positronic_franka::Robot& r, const positronic_franka::Vector7d& flange_pose_wxyz) {
+            return r.inverse_kinematics_with_limits(flange_pose_wxyz);
           },
-          py::arg("target_pose_wxyz"),
-          "IK for a live command to EndEffector pose (tx,ty,tz,qw,qx,qy,qz), from the measured joints, within "
+          py::arg("flange_pose_wxyz"),
+          "IK for a live command to the flange pose (tx,ty,tz,qw,qx,qy,qz), from the measured joints, within "
           "the FR3 joint limits, with each joint at most 0.5 rad from the measured joints; returns q (7,)")
       .def(
           "inverse_kinematics_with_limits",
-          [](positronic_franka::Robot& r, const positronic_franka::Vector7d& target_pose_wxyz,
+          [](positronic_franka::Robot& r, const positronic_franka::Vector7d& flange_pose_wxyz,
              const positronic_franka::Vector7d& q0, double max_step) {
-            return r.inverse_kinematics_with_limits(target_pose_wxyz, q0, max_step);
+            return r.inverse_kinematics_with_limits(flange_pose_wxyz, q0, max_step);
           },
-          py::arg("target_pose_wxyz"), py::arg("q0"),
+          py::arg("flange_pose_wxyz"), py::arg("q0"),
           py::arg("max_step") = positronic_franka::IK_MAX_JOINT_STEP,
-          "IK from joints q0 with each joint at most max_step (rad) from q0 and within the FR3 joint limits; "
-          "returns q (7,)")
+          "IK to the flange pose from joints q0 with each joint at most max_step (rad) from q0 and within the "
+          "FR3 joint limits; returns q (7,)")
       .def("set_target_joints", &positronic_franka::Robot::set_target_joints,
            py::arg("q_target"), py::arg("deadline_s") = positronic_franka::DEFAULT_MOVE_DEADLINE_S,
            "Command a joint move to target (7,) and return immediately; poll goal() for the outcome. "
@@ -233,5 +234,6 @@ PYBIND11_MODULE(_franka, m) {
       .def("recover_from_errors", &positronic_franka::Robot::recover_from_errors,
            "Stop active control and attempt libfranka automaticErrorRecovery(); returns True if cleared")
       .def("get_robot_model", [](positronic_franka::Robot& r) { return r.getRobotModel(); },
-           "Return URDF of the robot with F_T_EE (end-effector frame) appended for offline IK");
+           "Return URDF of the robot: libfranka's model, which ends at the flange link where the pose and the "
+           "IK are, and a link 'end_effector' appended at F_T_EE, the end-effector frame that Desk sets");
 }

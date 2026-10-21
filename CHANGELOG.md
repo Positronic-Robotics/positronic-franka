@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.10.0] - 2026-10-21
+
+The published pose and the IK move from the end-effector frame `F_T_EE` to the flange. A pose at the flange stays valid when the tool changes. A pose at `F_T_EE` depends on the tool configuration in Desk.
+
+### Added
+- `flange_pose(O_T_EE, F_T_EE)` in `pose_ik.hpp`: `O_T_F = O_T_EE · F_T_EE⁻¹`. `tests/test_pose_ik.cpp` checks it for the Franka Hand offset and for random offsets.
+- `ik_verifier` compares the published flange pose with the FK of the measured joints, and fails when they differ by more than 0.5 mm or 0.5 deg.
+
+### Changed
+- **Breaking.** `State.end_effector_pose` is replaced by `State.flange_pose`, the flange pose `O_T_F` in the base frame, from the `O_T_EE` and `F_T_EE` of the same `RobotState`. The old name is removed, so a caller that expects a pose at `F_T_EE` gets an error and not a pose at a different point. On the FR3 with the Franka Hand configuration, `F_T_EE` is 103.4 mm along the flange axis and -45 deg about it.
+- **Breaking.** `forward_kinematics` returns the flange pose. `inverse_kinematics` and `inverse_kinematics_with_limits` solve for a flange pose with the flange Jacobian. Their target argument is `flange_pose_wxyz`, which replaces `target_pose_wxyz`. To command an end-effector pose `O_T_EE`, send `O_T_EE · F_T_EE⁻¹`.
+- **Behaviour.** `IK_DAMPING_SINGULAR_VALUE` and the posture pull act on the flange Jacobian. Its smallest singular value differs from the one at `F_T_EE`: at the wrist-singularity pose in the tests it is 0.043 at the flange and 0.041 at the Franka Hand frame. `tests/test_pose_ik.cpp` runs its IK checks on the FR3 flange kinematics.
+- `get_robot_model()` keeps the appended link `end_effector` at `F_T_EE`. The published pose and the IK are at the last link of libfranka's model, `link8` on the FR3.
+- `SoftwareImpedance` keeps its Cartesian terms at `F_T_EE`, and `zero_jacobian` returns that Jacobian. `ee_wrench` stays in the stiffness frame K.
+
 ## [0.9.0] - 2026-10-18
 
 ### Added

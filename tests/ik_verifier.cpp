@@ -140,6 +140,20 @@ int main(int argc, char** argv) {
   positronic_franka::State base_state = robot.state();
   Vector7d q_seed = base_state.q;
 
+  constexpr double kTolPosMm = 0.5;
+  constexpr double kTolRotDeg = 0.5;
+
+  // The published pose and the IK must name one frame: the flange.
+  const Vector7d fk_at_measured = robot.forward_kinematics(base_state.q);
+  const double published_pos_err_mm = (fk_at_measured.head<3>() - base_state.flange_pose.head<3>()).norm() * 1000.0;
+  const double published_rot_err_deg = quaternion_distance_deg(
+      Eigen::Quaterniond(fk_at_measured(3), fk_at_measured(4), fk_at_measured(5), fk_at_measured(6)),
+      Eigen::Quaterniond(base_state.flange_pose(3), base_state.flange_pose(4), base_state.flange_pose(5),
+                         base_state.flange_pose(6)));
+  std::cout << std::fixed << std::setprecision(3) << "Published flange pose against FK of the measured joints: "
+            << published_pos_err_mm << " mm, " << published_rot_err_deg << " deg\n";
+  const bool published_pose_matches = published_pos_err_mm <= kTolPosMm && published_rot_err_deg <= kTolRotDeg;
+
   std::mt19937 rng(seed ? seed : static_cast<unsigned int>(
       std::chrono::steady_clock::now().time_since_epoch().count()));
   std::normal_distribution<double> noise(0.0, 0.05);  // radian std dev
@@ -154,9 +168,6 @@ int main(int argc, char** argv) {
     q_sample = clamp_to_limits(q_sample);
     targets.push_back(q_sample);
   }
-
-  constexpr double kTolPosMm = 0.5;
-  constexpr double kTolRotDeg = 0.5;
 
   Metrics dls_metrics = verify_method(robot, targets, q_seed, false, kTolPosMm, kTolRotDeg);
   Metrics limits_metrics = verify_method(robot, targets, q_seed, true, kTolPosMm, kTolRotDeg);
@@ -174,6 +185,6 @@ int main(int argc, char** argv) {
   print_metrics("Damped IK", dls_metrics);
   print_metrics("Limits IK", limits_metrics);
 
-  const bool success = (dls_metrics.failures == 0 && limits_metrics.failures == 0);
+  const bool success = published_pose_matches && dls_metrics.failures == 0 && limits_metrics.failures == 0;
   return success ? EXIT_SUCCESS : EXIT_FAILURE;
 }
