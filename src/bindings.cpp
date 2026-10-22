@@ -135,7 +135,7 @@ PYBIND11_MODULE(_franka, m) {
            "Apply a control mode (InternalImpedance | SoftwareImpedance): an equal mode is a no-op; a "
            "gains-only SoftwareImpedance change reaches the running torque loop without interrupting "
            "motion; any other change stops the control loop and the next motion command starts the "
-           "matching one")
+           "matching one. Raises RuntimeError when it must stop a loop that gets no robot state any more")
       .def_property_readonly("control_mode", &positronic_franka::Robot::control_mode,
                              "Active control mode (InternalImpedance | SoftwareImpedance)")
       .def("state", &positronic_franka::Robot::state,
@@ -233,7 +233,8 @@ PYBIND11_MODULE(_franka, m) {
            "Ramp motion to a halt and join the joint control thread; a later set_target_joints restarts it. "
            "Raises RuntimeError when the loop gets no robot state any more, because such a loop never ends")
       .def("recover_from_errors", &positronic_franka::Robot::recover_from_errors,
-           "Stop active control and attempt libfranka automaticErrorRecovery(); returns True if cleared")
+           "Stop active control and attempt libfranka automaticErrorRecovery(); returns True if cleared. "
+           "Raises RuntimeError when the loop gets no robot state any more")
       .def("get_robot_model", [](positronic_franka::Robot& r) { return r.getRobotModel(); },
            "Return URDF of the robot: libfranka's model, which ends at the flange link where the pose and the "
            "IK are, and a link 'end_effector' appended at F_T_EE, the end-effector frame that Desk sets");

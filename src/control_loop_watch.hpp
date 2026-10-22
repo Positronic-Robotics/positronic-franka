@@ -8,7 +8,11 @@ namespace positronic_franka {
 
 // libfranka calls the control callback every 1 ms while the link to the robot works. With no call for
 // this long, the robot clock in the cached state has stopped and the loop is stuck inside libfranka.
+// rules-allow: installation-constant — set by libfranka's fixed 1 kHz callback period, not by one robot or host.
 constexpr std::chrono::milliseconds CONTROL_LINK_TIMEOUT{500};
+
+// How a wait for a control loop ended.
+enum class LoopEnd { EXITED, STOPPED_TICKING };
 
 // When one control loop last ticked, and whether it exited. A loop stuck inside libfranka neither
 // ticks nor exits, and nothing can end it from outside.
@@ -30,7 +34,7 @@ class ControlLoopWatch {
     last_tick_ = Clock::now();
   }
 
-  // The last thing the loop thread does.
+  // Call it last in the loop thread: a waiter joins the thread as soon as this returns.
   void exited() {
     {
       std::lock_guard<std::mutex> lk(mutex_);
@@ -45,15 +49,15 @@ class ControlLoopWatch {
     return !exited_ && Clock::now() - last_tick_ >= timeout_;
   }
 
-  // Waits while the loop ticks. Returns true when it exits, false when it stops ticking first.
-  bool wait_for_exit() {
+  // Waits while the loop ticks, until it exits or stops ticking.
+  LoopEnd wait_for_exit() {
     std::unique_lock<std::mutex> lk(mutex_);
     while (!exited_) {
       const Clock::time_point give_up = last_tick_ + timeout_;
-      if (Clock::now() >= give_up) return false;
+      if (Clock::now() >= give_up) return LoopEnd::STOPPED_TICKING;
       exit_cv_.wait_until(lk, give_up);
     }
-    return true;
+    return LoopEnd::EXITED;
   }
 
  private:

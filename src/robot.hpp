@@ -978,7 +978,7 @@ private:
   void stop_control_loop_() {
     stop_requested_.store(true);
     if (control_thread_.joinable()) {
-      if (!loop_watch_.wait_for_exit()) {
+      if (loop_watch_.wait_for_exit() == LoopEnd::STOPPED_TICKING) {
         settle_current_goal_(GoalStatus::ABORTED, CONTROL_LINK_LOST);
         throw std::runtime_error(std::string("cannot stop the control loop: ") + CONTROL_LINK_LOST);
       }

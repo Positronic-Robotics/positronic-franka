@@ -18,6 +18,7 @@
 namespace {
 
 using positronic_franka::ControlLoopWatch;
+using positronic_franka::LoopEnd;
 using Clock = std::chrono::steady_clock;
 using std::chrono::milliseconds;
 
@@ -91,7 +92,7 @@ void a_wait_gives_up_on_a_loop_that_stalls() {
   // Free a wait that does not give up, so the suite ends and reports.
   loop.finish();
   check(ended, "the wait ends on its own while the loop stays stalled");
-  check(!waited.get(), "the wait reports that the loop did not exit");
+  check(waited.get() == LoopEnd::STOPPED_TICKING, "the wait reports that the loop stopped ticking");
   check(seconds_since(start) < 10 * std::chrono::duration<double>(TIMEOUT).count(),
         "the wait gives up about one timeout after the last tick");
 }
@@ -104,9 +105,9 @@ void a_wait_lets_a_ticking_loop_run_longer_than_the_timeout() {
     std::this_thread::sleep_for(4 * TIMEOUT);
     loop.finish();
   });
-  const bool exited = watch.wait_for_exit();
+  const LoopEnd end = watch.wait_for_exit();
   finisher.join();
-  check(exited, "a loop that ticks until it exits is waited for");
+  check(end == LoopEnd::EXITED, "a loop that ticks until it exits is waited for");
   check(seconds_since(start) >= 3 * std::chrono::duration<double>(TIMEOUT).count(),
         "the wait lasted until the loop exited");
 }
@@ -114,7 +115,7 @@ void a_wait_lets_a_ticking_loop_run_longer_than_the_timeout() {
 void a_wait_with_no_loop_returns_at_once() {
   ControlLoopWatch watch(TIMEOUT);
   const auto start = Clock::now();
-  check(watch.wait_for_exit(), "no loop ran, so there is nothing to wait for");
+  check(watch.wait_for_exit() == LoopEnd::EXITED, "no loop ran, so there is nothing to wait for");
   check(seconds_since(start) < 0.01, "the wait returned at once");
   check(!watch.stopped_ticking(), "no loop ran, so no loop stopped ticking");
 }
@@ -124,7 +125,7 @@ void a_loop_that_exited_has_not_stopped_ticking() {
   {
     FakeControlLoop loop(watch);
     loop.finish();
-    check(watch.wait_for_exit(), "the loop exited");
+    check(watch.wait_for_exit() == LoopEnd::EXITED, "the loop exited");
   }
   std::this_thread::sleep_for(2 * TIMEOUT);
   check(!watch.stopped_ticking(), "an exited loop is not a loop that stopped ticking");
