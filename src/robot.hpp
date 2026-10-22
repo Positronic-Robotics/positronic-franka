@@ -47,8 +47,9 @@ constexpr double SETTLE_VELOCITY_TOLERANCE = 0.05;  // rad/s
 constexpr int SETTLE_TICKS_CAP = 1000;
 // Deadline used when the caller names none. Generous for a joint move on this arm.
 constexpr double DEFAULT_MOVE_DEADLINE_S = 15.0;
-// A running control loop with no robot state for this long counts as stuck in libfranka.
-constexpr double DEFAULT_CONTROL_LINK_TIMEOUT_S = 0.5;
+// A running control loop with no robot state for this long counts as stuck in libfranka. Far above any
+// normal gap: at the end of a motion, libfranka calls no callback for up to about 1.2 s.
+constexpr double DEFAULT_CONTROL_LINK_TIMEOUT_S = 10.0;
 
 
 // Control modes. InternalImpedance drives the robot's built-in joint impedance controller through the

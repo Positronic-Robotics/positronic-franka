@@ -132,7 +132,7 @@ PYBIND11_MODULE(_franka, m) {
            py::arg("control_mode") = positronic_franka::ControlMode(positronic_franka::InternalImpedance{}),
            py::arg("control_link_timeout_s") = positronic_franka::DEFAULT_CONTROL_LINK_TIMEOUT_S,
            "control_link_timeout_s: a running control loop with no robot state for this long, in seconds, is "
-           "stuck: state() reports an error, goal() aborts the move, and a stop raises RuntimeError")
+           "stuck: state() reports an error, goal() aborts the move, and a stop raises RuntimeError. Default 10 s")
       .def("set_control_mode", &positronic_franka::Robot::set_control_mode,
            py::arg("mode"),
            "Apply a control mode (InternalImpedance | SoftwareImpedance): an equal mode is a no-op; a "

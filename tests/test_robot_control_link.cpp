@@ -66,6 +66,10 @@ Vector7d offset_on_joint_1(const Vector7d& q, double rad) {
 
 bool contains(const std::string& text, const std::string& part) { return text.find(part) != std::string::npos; }
 
+void the_default_control_link_timeout_is_10_s() {
+  check(positronic_franka::DEFAULT_CONTROL_LINK_TIMEOUT_S == 10.0, "the default timeout is 10 s");
+}
+
 void a_bad_control_link_timeout_is_refused() {
   for (const double bad : {0.0, -1.0, std::numeric_limits<double>::quiet_NaN(),
                            std::numeric_limits<double>::infinity()}) {
@@ -168,6 +172,7 @@ void a_longer_timeout_does_not_flag_a_shorter_stall() {
 
 int main() {
   const std::vector<std::pair<std::string, std::function<void()>>> tests = {
+      {"the_default_control_link_timeout_is_10_s", the_default_control_link_timeout_is_10_s},
       {"a_bad_control_link_timeout_is_refused", a_bad_control_link_timeout_is_refused},
       {"a_ticking_loop_reports_no_error_and_stops", a_ticking_loop_reports_no_error_and_stops},
       {"a_stalled_loop_reports_the_lost_link_and_aborts_the_move",

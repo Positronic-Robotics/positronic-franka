@@ -3,7 +3,7 @@
 ## [0.10.1] - 2026-10-22
 
 ### Added
-- `control_link_timeout_s` on `Robot`, a keyword argument: a running control loop that gets no robot state for this long, in seconds, is stuck. The default is `DEFAULT_CONTROL_LINK_TIMEOUT_S`, 0.5 s. A value that is not finite and strictly positive raises `invalid_argument`.
+- `control_link_timeout_s` on `Robot`, a keyword argument: a running control loop that gets no robot state for this long, in seconds, is stuck. The default is `DEFAULT_CONTROL_LINK_TIMEOUT_S`, 10 s. It is far above any normal gap: at the end of a motion, libfranka calls no control callback while the robot ends the move, and on a real arm these gaps were up to 1.21 s. A value that is not finite and strictly positive raises `invalid_argument`.
 - `tests/test_control_loop_watch.cpp` checks the watch with a fake control loop that ticks, stalls or exits. `tests/test_robot_control_link.cpp` checks `Robot` on a fake libfranka, `tests/fake_franka`, whose control call a test can pause. CI builds and runs both.
 
 ### Fixed
