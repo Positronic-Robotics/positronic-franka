@@ -39,10 +39,11 @@ PYBIND11_MODULE(_franka, m) {
       "line in joint space with all joints arriving together, so a large target jump is a slow move at "
       "any command rate. Finite and strictly positive. "
       "stiffness_point (3,), m, is the point the Cartesian terms act at, in flange axes from the flange "
-      "origin. The default is the flange, where polymetis takes them in the DROID stack. Finite.")
-      .def(py::init<const std::array<double, 7>&, const std::array<double, 7>&>(), py::kw_only(),
-           py::arg("max_spring_torque_rate") = positronic_franka::DEFAULT_MAX_SPRING_TORQUE_RATE,
-           py::arg("max_reference_speed") = positronic_franka::DEFAULT_MAX_REFERENCE_SPEED)
+      "origin. The default is the flange, where the default gains are tuned. Finite.")
+      .def(py::init<const std::array<double, 7>&, const std::array<double, 7>&, const std::array<double, 3>&>(),
+           py::kw_only(), py::arg("max_spring_torque_rate") = positronic_franka::DEFAULT_MAX_SPRING_TORQUE_RATE,
+           py::arg("max_reference_speed") = positronic_franka::DEFAULT_MAX_REFERENCE_SPEED,
+           py::arg("stiffness_point") = std::array<double, 3>{0.0, 0.0, 0.0})
       .def(py::init<const std::array<double, 7>&, const std::array<double, 7>&,
                     const std::array<double, 6>&, const std::array<double, 6>&,
                     const std::array<double, 7>&, const std::array<double, 7>&, const std::array<double, 3>&>(),

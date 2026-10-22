@@ -107,14 +107,17 @@ struct SoftwareImpedance {
   std::array<double, 7> max_spring_torque_rate = DEFAULT_MAX_SPRING_TORQUE_RATE;
   // Per-joint speed at which the spring reference q_d moves to a new target, rad/s.
   std::array<double, 7> max_reference_speed = DEFAULT_MAX_REFERENCE_SPEED;
-  // The point the Cartesian terms act at, in flange axes from the flange origin, m. polymetis takes them at the
-  // flange, panda_link8, in the DROID stack.
+  // The point the Cartesian terms act at, in flange axes from the flange origin, m. The default gains are tuned at
+  // the flange.
   std::array<double, 3> stiffness_point{0.0, 0.0, 0.0};
 
   SoftwareImpedance() = default;
   explicit SoftwareImpedance(const std::array<double, 7>& max_spring_torque_rate_in,
-                             const std::array<double, 7>& max_reference_speed_in = DEFAULT_MAX_REFERENCE_SPEED)
-      : max_spring_torque_rate(max_spring_torque_rate_in), max_reference_speed(max_reference_speed_in) {
+                             const std::array<double, 7>& max_reference_speed_in = DEFAULT_MAX_REFERENCE_SPEED,
+                             const std::array<double, 3>& stiffness_point_in = {0.0, 0.0, 0.0})
+      : max_spring_torque_rate(max_spring_torque_rate_in),
+        max_reference_speed(max_reference_speed_in),
+        stiffness_point(stiffness_point_in) {
     validate_guards_();
   }
   SoftwareImpedance(const std::array<double, 7>& kq_in, const std::array<double, 7>& kqd_in,
@@ -411,7 +414,7 @@ class Robot {
   SpatialJacobian zero_jacobian(const Eigen::Ref<const Vector7d>& q, const Eigen::Vector3d& stiffness_point) {
     franka::RobotState st = read_robot_state_();
     st.q = to_std_array7_(q);
-    return stiffness_jacobian_(st, stiffness_point);
+    return flange_point_jacobian_(st, stiffness_point);
   }
 
   Vector7d coriolis(const Eigen::Ref<const Vector7d>& q, const Eigen::Ref<const Vector7d>& dq) {
@@ -526,8 +529,8 @@ private:
     return Eigen::Map<const SpatialJacobian>(J_data.data());
   }
 
-  SpatialJacobian stiffness_jacobian_(const franka::RobotState& st, const Eigen::Vector3d& stiffness_point) const {
-    return point_jacobian(ToolKinematics{flange_pose_matrix_(st), flange_jacobian_(st)}, stiffness_point);
+  SpatialJacobian flange_point_jacobian_(const franka::RobotState& st, const Eigen::Vector3d& flange_to_point) const {
+    return point_jacobian(ToolKinematics{flange_pose_matrix_(st), flange_jacobian_(st)}, flange_to_point);
   }
 
   static Eigen::Matrix<double, 7, 6> damped_pinv_(const SpatialJacobian& J, double lambda) {
@@ -707,7 +710,7 @@ private:
           }
           loop_watch_.tick();
 
-          const SpatialJacobian J = stiffness_jacobian_(st, stiffness_point);
+          const SpatialJacobian J = flange_point_jacobian_(st, stiffness_point);
           const auto cor = model_->coriolis(st);
 
           const Matrix7d Kp = J.transpose() * Kx.asDiagonal() * J + Matrix7d(Kq.asDiagonal());
