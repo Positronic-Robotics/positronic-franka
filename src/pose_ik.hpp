@@ -39,6 +39,15 @@ struct ToolKinematics {
   SpatialJacobian jacobian;
 };
 
+// The zero Jacobian of a point fixed to the tool, from the tool kinematics. `tool_to_point` is the point in
+// tool axes, from the tool origin, in metres. The angular rows are the tool's own.
+inline SpatialJacobian point_jacobian(const ToolKinematics& tool, const Eigen::Vector3d& tool_to_point) {
+  const Eigen::Vector3d r = tool.pose.block<3, 3>(0, 0) * tool_to_point;
+  SpatialJacobian J = tool.jacobian;
+  for (int i = 0; i < 7; ++i) J.block<3, 1>(0, i) += J.block<3, 1>(3, i).cross(r);
+  return J;
+}
+
 // The flange pose in the base frame, O_T_F, from the end-effector pose O_T_EE and the tool offset F_T_EE.
 inline Eigen::Matrix4d flange_pose(const Eigen::Matrix4d& O_T_EE, const Eigen::Matrix4d& F_T_EE) {
   return (Eigen::Isometry3d(O_T_EE) * Eigen::Isometry3d(F_T_EE).inverse()).matrix();

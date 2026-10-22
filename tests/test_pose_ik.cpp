@@ -26,6 +26,7 @@ using positronic_franka::IK_POSTURE_JOINTS;
 using positronic_franka::IK_POSTURE_PULL_PER_COMMAND;
 using positronic_franka::Matrix7d;
 using positronic_franka::minimize_on_box;
+using positronic_franka::point_jacobian;
 using positronic_franka::pose_error;
 using positronic_franka::solve_pose_ik;
 using positronic_franka::SpatialJacobian;
@@ -294,6 +295,36 @@ void the_flange_pose_takes_the_tool_offset_off_the_end_effector_pose() {
   }
 }
 
+// The point's own velocity, by central differences of its position, against the shifted flange Jacobian.
+void the_point_jacobian_is_the_derivative_of_the_point_position() {
+  const Eigen::Vector3d point(0.012, -0.03, 0.155);
+  const auto position = [&](const Vector7d& q) {
+    const Eigen::Matrix4d T = fr3_flange(q).pose;
+    return Eigen::Vector3d(T.block<3, 3>(0, 0) * point + T.block<3, 1>(0, 3));
+  };
+  std::mt19937 rng(7);
+  std::uniform_real_distribution<double> u(-1.0, 1.0);
+  for (int trial = 0; trial < 20; ++trial) {
+    Vector7d q = posture();
+    for (int i = 0; i < 7; ++i) q(i) += u(rng);
+    const SpatialJacobian J = point_jacobian(fr3_flange(q), point);
+    constexpr double h = 1e-6;
+    for (int i = 0; i < 7; ++i) {
+      Vector7d up = q, down = q;
+      up(i) += h;
+      down(i) -= h;
+      const Eigen::Vector3d numeric = (position(up) - position(down)) / (2 * h);
+      check((J.block<3, 1>(0, i) - numeric).cwiseAbs().maxCoeff() < 1e-7, "the linear rows miss the point velocity");
+    }
+    check(J.bottomRows<3>() == fr3_flange(q).jacobian.bottomRows<3>(), "the angular rows are not the flange's");
+  }
+}
+
+void the_point_jacobian_at_the_flange_origin_is_the_flange_jacobian() {
+  const ToolKinematics flange = fr3_flange(posture());
+  check(point_jacobian(flange, Eigen::Vector3d::Zero()) == flange.jacobian, "a zero offset changes the Jacobian");
+}
+
 }  // namespace
 
 int main() {
@@ -318,6 +349,10 @@ int main() {
        the_move_pulls_the_posture_along_the_null_space_and_keeps_the_tool},
       {"the_flange_pose_takes_the_tool_offset_off_the_end_effector_pose",
        the_flange_pose_takes_the_tool_offset_off_the_end_effector_pose},
+      {"the_point_jacobian_is_the_derivative_of_the_point_position",
+       the_point_jacobian_is_the_derivative_of_the_point_position},
+      {"the_point_jacobian_at_the_flange_origin_is_the_flange_jacobian",
+       the_point_jacobian_at_the_flange_origin_is_the_flange_jacobian},
   };
   int failed = 0;
   for (const auto& [name, test] : tests) {

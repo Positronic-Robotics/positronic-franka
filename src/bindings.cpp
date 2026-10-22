@@ -37,22 +37,26 @@ PYBIND11_MODULE(_franka, m) {
       "gains; values at or above libfranka's own 1000 Nm/s torque rate limit have no practical effect. "
       "max_reference_speed (7,), rad/s, is the speed at which q_d moves to a new target, in a straight "
       "line in joint space with all joints arriving together, so a large target jump is a slow move at "
-      "any command rate. Finite and strictly positive.")
+      "any command rate. Finite and strictly positive. "
+      "stiffness_point (3,), m, is the point the Cartesian terms act at, in flange axes from the flange "
+      "origin. The default is the flange, where polymetis takes them in the DROID stack. Finite.")
       .def(py::init<const std::array<double, 7>&, const std::array<double, 7>&>(), py::kw_only(),
            py::arg("max_spring_torque_rate") = positronic_franka::DEFAULT_MAX_SPRING_TORQUE_RATE,
            py::arg("max_reference_speed") = positronic_franka::DEFAULT_MAX_REFERENCE_SPEED)
       .def(py::init<const std::array<double, 7>&, const std::array<double, 7>&,
                     const std::array<double, 6>&, const std::array<double, 6>&,
-                    const std::array<double, 7>&, const std::array<double, 7>&>(),
+                    const std::array<double, 7>&, const std::array<double, 7>&, const std::array<double, 3>&>(),
            py::arg("kq"), py::arg("kqd"), py::arg("kx"), py::arg("kxd"), py::kw_only(),
            py::arg("max_spring_torque_rate") = positronic_franka::DEFAULT_MAX_SPRING_TORQUE_RATE,
-           py::arg("max_reference_speed") = positronic_franka::DEFAULT_MAX_REFERENCE_SPEED)
+           py::arg("max_reference_speed") = positronic_franka::DEFAULT_MAX_REFERENCE_SPEED,
+           py::arg("stiffness_point") = std::array<double, 3>{0.0, 0.0, 0.0})
       .def_readonly("kq", &positronic_franka::SoftwareImpedance::kq)
       .def_readonly("kqd", &positronic_franka::SoftwareImpedance::kqd)
       .def_readonly("kx", &positronic_franka::SoftwareImpedance::kx)
       .def_readonly("kxd", &positronic_franka::SoftwareImpedance::kxd)
       .def_readonly("max_spring_torque_rate", &positronic_franka::SoftwareImpedance::max_spring_torque_rate)
       .def_readonly("max_reference_speed", &positronic_franka::SoftwareImpedance::max_reference_speed)
+      .def_readonly("stiffness_point", &positronic_franka::SoftwareImpedance::stiffness_point)
       .def(py::self == py::self);
 
   py::enum_<positronic_franka::GoalStatus>(m, "GoalStatus",
@@ -153,10 +157,12 @@ PYBIND11_MODULE(_franka, m) {
           "FK from joint vector (7,) to the flange pose (tx,ty,tz,qw,qx,qy,qz) in base frame")
       .def(
           "zero_jacobian",
-          [](positronic_franka::Robot& r, const positronic_franka::Vector7d& q) { return r.zero_jacobian(q); },
-          py::arg("q"),
-          "Zero Jacobian (6x7) of the end-effector frame F_T_EE at joint values q, with the robot's current "
-          "frames — the J the SoftwareImpedance law uses")
+          [](positronic_franka::Robot& r, const positronic_franka::Vector7d& q, const Eigen::Vector3d& stiffness_point) {
+            return r.zero_jacobian(q, stiffness_point);
+          },
+          py::arg("q"), py::arg("stiffness_point") = Eigen::Vector3d::Zero().eval(),
+          "Zero Jacobian (6x7) at joint values q of stiffness_point (3,), in flange axes from the flange origin — "
+          "the J the SoftwareImpedance law with that stiffness_point uses")
       .def(
           "coriolis",
           [](positronic_franka::Robot& r, const positronic_franka::Vector7d& q,
