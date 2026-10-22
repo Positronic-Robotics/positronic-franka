@@ -114,28 +114,31 @@ PYBIND11_MODULE(_franka, m) {
       .def_property_readonly(
           "error",
           [](const positronic_franka::State& s) { return s.error; },
-          "1 if robot reports any current error flags else 0")
+          "1 if the robot reports an error flag, or if the control loop gets no robot state any more; else 0")
       .def_property_readonly(
           "error_message",
           [](const positronic_franka::State& s) { return s.error_message; },
-          "String representation of current error flags, e.g. '[cartesian_reflex]'")
+          "String representation of current error flags, e.g. '[cartesian_reflex]', and the lost control link")
       .def_property_readonly(
           "ee_wrench",
           [](const positronic_franka::State& s) { return s.end_effector_wrench; },
           "External wrench on stiffness frame (Fx,Fy,Fz,Mx,My,Mz)");
 
   py::class_<positronic_franka::Robot>(m, "Robot")
-      .def(py::init<const std::string&, franka::RealtimeConfig, double, positronic_franka::ControlMode>(),
+      .def(py::init<const std::string&, franka::RealtimeConfig, double, positronic_franka::ControlMode, double>(),
            py::arg("ip"),
            py::arg("realtime_config") = franka::RealtimeConfig::kIgnore,
            py::arg("relative_dynamics_factor") = 1.0,
-           py::arg("control_mode") = positronic_franka::ControlMode(positronic_franka::InternalImpedance{}))
+           py::arg("control_mode") = positronic_franka::ControlMode(positronic_franka::InternalImpedance{}),
+           py::arg("control_link_timeout_s") = positronic_franka::DEFAULT_CONTROL_LINK_TIMEOUT_S,
+           "control_link_timeout_s: a running control loop with no robot state for this long, in seconds, is "
+           "stuck: state() reports an error, goal() aborts the move, and a stop raises RuntimeError. Default 10 s")
       .def("set_control_mode", &positronic_franka::Robot::set_control_mode,
            py::arg("mode"),
            "Apply a control mode (InternalImpedance | SoftwareImpedance): an equal mode is a no-op; a "
            "gains-only SoftwareImpedance change reaches the running torque loop without interrupting "
            "motion; any other change stops the control loop and the next motion command starts the "
-           "matching one")
+           "matching one. Raises RuntimeError when it must stop a loop that gets no robot state any more")
       .def_property_readonly("control_mode", &positronic_franka::Robot::control_mode,
                              "Active control mode (InternalImpedance | SoftwareImpedance)")
       .def("state", &positronic_franka::Robot::state,
@@ -230,9 +233,11 @@ PYBIND11_MODULE(_franka, m) {
            py::arg("mass"), py::arg("F_x_Cload"), py::arg("I_x_Cload"),
            "Set tool load: mass [kg], center of mass (3,), inertia (row-major 3x3)")
       .def("stop", &positronic_franka::Robot::stop,
-           "Ramp motion to a halt and join the joint control thread; a later set_target_joints restarts it")
+           "Ramp motion to a halt and join the joint control thread; a later set_target_joints restarts it. "
+           "Raises RuntimeError when the loop gets no robot state any more, because such a loop never ends")
       .def("recover_from_errors", &positronic_franka::Robot::recover_from_errors,
-           "Stop active control and attempt libfranka automaticErrorRecovery(); returns True if cleared")
+           "Stop active control and attempt libfranka automaticErrorRecovery(); returns True if cleared. "
+           "Raises RuntimeError when the loop gets no robot state any more")
       .def("get_robot_model", [](positronic_franka::Robot& r) { return r.getRobotModel(); },
            "Return URDF of the robot: libfranka's model, which ends at the flange link where the pose and the "
            "IK are, and a link 'end_effector' appended at F_T_EE, the end-effector frame that Desk sets");

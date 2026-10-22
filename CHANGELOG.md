@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.10.1] - 2026-10-22
+
+### Added
+- `control_link_timeout_s` on `Robot`, a keyword argument: a running control loop that gets no robot state for this long, in seconds, is stuck. The default is `DEFAULT_CONTROL_LINK_TIMEOUT_S`, 10 s. It is far above any normal gap: at the end of a motion, libfranka calls no control callback while the robot ends the move, and on a real arm these gaps were up to 1.21 s. A value that is not finite and strictly positive raises `invalid_argument`.
+- `tests/test_control_loop_watch.cpp` checks the watch with a fake control loop that ticks, stalls or exits. `tests/test_robot_control_link.cpp` checks `Robot` on a fake libfranka, `tests/fake_franka`, whose control call a test can pause. CI builds and runs both.
+
+### Fixed
+- libfranka can wait inside the control call with no time limit, for example for the reply to a Move command after the robot leaves Move mode. Then it calls no control callback. `state()` served the last state of such a loop for good, with `error` 0 and a robot time that did not advance, so the caller saw no error. Now, after `control_link_timeout_s` with no robot state, `state()` reports `error` 1 and names the lost control link in `error_message`, and `goal()` reports the move in flight as `ABORTED` with the same reason. Both also request a stop, so a loop that ticks again brakes and ends instead of driving on to a target its caller saw aborted.
+- `stop()`, `set_control_mode()` and `recover_from_errors()` joined a stuck control loop for good, so the call never returned. Now they wait while the loop ticks, and raise `RuntimeError` when it gets no robot state for `control_link_timeout_s`. The stuck thread stays: nothing can end the libfranka call. The `Robot` destructor still waits for it.
+
 ## [0.10.0] - 2026-10-21
 
 The published pose and the IK move from the end-effector frame `F_T_EE` to the flange. A pose at the flange stays valid when the tool changes. A pose at `F_T_EE` depends on the tool configuration in Desk.
