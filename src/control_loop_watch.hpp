@@ -6,21 +6,17 @@
 
 namespace positronic_franka {
 
-// libfranka calls the control callback every 1 ms while the link to the robot works. With no call for
-// this long, the robot clock in the cached state has stopped and the loop is stuck inside libfranka.
-// rules-allow: installation-constant — set by libfranka's fixed 1 kHz callback period, not by one robot or host.
-constexpr std::chrono::milliseconds CONTROL_LINK_TIMEOUT{500};
-
 // How a wait for a control loop ended.
 enum class LoopEnd { EXITED, STOPPED_TICKING };
 
-// When one control loop last ticked, and whether it exited. A loop stuck inside libfranka neither
-// ticks nor exits, and nothing can end it from outside.
+// When one control loop last ticked, and whether it exited. libfranka calls the control callback every
+// 1 ms while the link to the robot works, so a loop with no tick for `timeout` is stuck inside libfranka.
+// Such a loop neither ticks nor exits, and nothing can end it from outside.
 class ControlLoopWatch {
  public:
   using Clock = std::chrono::steady_clock;
 
-  explicit ControlLoopWatch(Clock::duration timeout = CONTROL_LINK_TIMEOUT) : timeout_(timeout) {}
+  explicit ControlLoopWatch(Clock::duration timeout) : timeout_(timeout) {}
 
   // A new loop starts. It gets one timeout for its first tick.
   void start() {

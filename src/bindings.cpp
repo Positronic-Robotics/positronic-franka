@@ -125,11 +125,14 @@ PYBIND11_MODULE(_franka, m) {
           "External wrench on stiffness frame (Fx,Fy,Fz,Mx,My,Mz)");
 
   py::class_<positronic_franka::Robot>(m, "Robot")
-      .def(py::init<const std::string&, franka::RealtimeConfig, double, positronic_franka::ControlMode>(),
+      .def(py::init<const std::string&, franka::RealtimeConfig, double, positronic_franka::ControlMode, double>(),
            py::arg("ip"),
            py::arg("realtime_config") = franka::RealtimeConfig::kIgnore,
            py::arg("relative_dynamics_factor") = 1.0,
-           py::arg("control_mode") = positronic_franka::ControlMode(positronic_franka::InternalImpedance{}))
+           py::arg("control_mode") = positronic_franka::ControlMode(positronic_franka::InternalImpedance{}),
+           py::arg("control_link_timeout_s") = positronic_franka::DEFAULT_CONTROL_LINK_TIMEOUT_S,
+           "control_link_timeout_s: a running control loop with no robot state for this long, in seconds, is "
+           "stuck: state() reports an error, goal() aborts the move, and a stop raises RuntimeError")
       .def("set_control_mode", &positronic_franka::Robot::set_control_mode,
            py::arg("mode"),
            "Apply a control mode (InternalImpedance | SoftwareImpedance): an equal mode is a no-op; a "

@@ -81,3 +81,23 @@ jobs:
         run: |
           g++ -std=c++17 -pthread -Wall -Wextra -Werror -I src tests/test_control_loop_watch.cpp -o test_control_loop_watch
           ./test_control_loop_watch
+
+  robot-control-link:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Eigen
+        run: sudo apt-get update && sudo apt-get install -y libeigen3-dev
+
+      # Robot runs on the fake libfranka in tests/fake_franka, so this test needs Eigen and the vendored Ruckig only.
+      - name: Run the robot control link tests
+        run: |
+          for f in $(ls external/ruckig/src/ruckig/*.cpp | grep -v -e cloud_client -e python); do
+            g++ -std=c++20 -O2 -I external/ruckig/include -c "$f" -o "$(basename "$f" .cpp).o"
+          done
+          g++ -std=c++20 -pthread -Wall -Wextra -Werror -I tests/fake_franka -I src -I external/ruckig/include \
+            $(pkg-config --cflags eigen3) tests/test_robot_control_link.cpp *.o -o test_robot_control_link
+          ./test_robot_control_link

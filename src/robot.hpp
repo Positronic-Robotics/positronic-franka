@@ -47,9 +47,8 @@ constexpr double SETTLE_VELOCITY_TOLERANCE = 0.05;  // rad/s
 constexpr int SETTLE_TICKS_CAP = 1000;
 // Deadline used when the caller names none. Generous for a joint move on this arm.
 constexpr double DEFAULT_MOVE_DEADLINE_S = 15.0;
-// The error a stuck control loop reports in state(), in goal() and from a stop.
-inline const std::string CONTROL_LINK_LOST = "no robot state for " + std::to_string(CONTROL_LINK_TIMEOUT.count()) +
-                                             " ms: the control loop is stuck in libfranka and the link to the robot is lost";
+// A running control loop with no robot state for this long counts as stuck in libfranka.
+constexpr double DEFAULT_CONTROL_LINK_TIMEOUT_S = 0.5;
 
 
 // Control modes. InternalImpedance drives the robot's built-in joint impedance controller through the
@@ -201,8 +200,11 @@ class Robot {
   explicit Robot(const std::string& ip,
                  franka::RealtimeConfig realtime_config = franka::RealtimeConfig::kIgnore,
                  double relative_dynamics_factor = 1.0,
-                 ControlMode control_mode = InternalImpedance{})
-      : robot_(std::make_unique<franka::Robot>(ip, realtime_config)),
+                 ControlMode control_mode = InternalImpedance{},
+                 double control_link_timeout_s = DEFAULT_CONTROL_LINK_TIMEOUT_S)
+      : loop_watch_(control_link_timeout_(control_link_timeout_s)),
+        control_link_lost_(control_link_lost_message_(control_link_timeout_s)),
+        robot_(std::make_unique<franka::Robot>(ip, realtime_config)),
         relative_dynamics_factor_(std::clamp(relative_dynamics_factor, 0.0001, 1.0)) {
     model_ = std::make_unique<franka::Model>(robot_->loadModel());
     // Force-apply: the equality guard in set_control_mode must not skip pushing k_theta when the
@@ -245,9 +247,9 @@ class Robot {
     // NOTE: This relies on the fact that we don't configure EE_T_K frame.
     st.end_effector_wrench = Eigen::Map<const Vector6d>(rs.K_F_ext_hat_K.data());
     // A stuck loop serves the same cached state for good, so no robot error can appear in it.
-    if (loop_watch_.stopped_ticking()) {
+    if (end_stuck_loop_()) {
       st.error = 1;
-      st.error_message += st.error_message.empty() ? CONTROL_LINK_LOST : std::string("; ") + CONTROL_LINK_LOST;
+      st.error_message += st.error_message.empty() ? control_link_lost_ : "; " + control_link_lost_;
     }
     return st;
   }
@@ -266,7 +268,7 @@ class Robot {
   // The move in flight, read without blocking.
   Goal goal() {
     // A stuck loop never reaches its deadline check, so end its move here.
-    if (loop_watch_.stopped_ticking()) settle_current_goal_(GoalStatus::ABORTED, CONTROL_LINK_LOST);
+    end_stuck_loop_();
     std::lock_guard<std::mutex> lk(goal_mutex_);
     return Goal{goal_status_, goal_error_};
   }
@@ -529,7 +531,7 @@ private:
   double relative_dynamics_factor() const { return relative_dynamics_factor_; }
 
  private:
-  void run_joint_position_control_(InternalImpedance imp) {
+  void run_joint_position_control_(InternalImpedance) {
     std::string thread_error;
     try {
       TrajectoryGenerator traj(relative_dynamics_factor_);
@@ -909,6 +911,29 @@ private:
  private:
   franka::RobotState read_robot_state_() { return read_state_snapshot_().first; }
 
+  // Returns whether the running loop is stuck. A stuck loop's move is aborted, so the loop must brake
+  // if it ever ticks again: the caller acts as if the move ended.
+  bool end_stuck_loop_() {
+    if (!loop_watch_.stopped_ticking()) return false;
+    stop_requested_.store(true);
+    has_target_.store(false);
+    settle_current_goal_(GoalStatus::ABORTED, control_link_lost_);
+    return true;
+  }
+
+  static ControlLoopWatch::Clock::duration control_link_timeout_(double seconds) {
+    if (!std::isfinite(seconds) || seconds <= 0.0) {
+      throw std::invalid_argument("control_link_timeout_s must be finite and strictly positive");
+    }
+    return std::chrono::duration_cast<ControlLoopWatch::Clock::duration>(std::chrono::duration<double>(seconds));
+  }
+
+  static std::string control_link_lost_message_(double seconds) {
+    std::ostringstream m;
+    m << "no robot state for " << seconds << " s: the control loop is stuck in libfranka and the link to the robot is lost";
+    return m.str();
+  }
+
   // The cached robot state and the software reference copied under one lock, so a state() built from
   // them pairs q/dq/tau with the q_d of the same control tick.
   std::pair<franka::RobotState, std::optional<Vector7d>> read_state_snapshot_() {
@@ -919,13 +944,15 @@ private:
     return {robot_->readOnce(), std::nullopt};
   }
 
+  // Declared before robot_, so a bad timeout raises before the connection opens.
+  ControlLoopWatch loop_watch_;
+  const std::string control_link_lost_;
   std::unique_ptr<franka::Robot> robot_;
   std::unique_ptr<franka::Model> model_;
   std::thread control_thread_;
   std::atomic<bool> control_running_{false};
   std::atomic<bool> stop_requested_{false};
   std::atomic<bool> has_target_{false};
-  ControlLoopWatch loop_watch_;
 
   // The move in flight. Assumes serialized callers (the bindings hold the GIL for the whole
   // publish); concurrent C++ callers are not supported.
@@ -979,8 +1006,8 @@ private:
     stop_requested_.store(true);
     if (control_thread_.joinable()) {
       if (loop_watch_.wait_for_exit() == LoopEnd::STOPPED_TICKING) {
-        settle_current_goal_(GoalStatus::ABORTED, CONTROL_LINK_LOST);
-        throw std::runtime_error(std::string("cannot stop the control loop: ") + CONTROL_LINK_LOST);
+        settle_current_goal_(GoalStatus::ABORTED, control_link_lost_);
+        throw std::runtime_error("cannot stop the control loop: " + control_link_lost_);
       }
       control_thread_.join();
     }

@@ -141,6 +141,20 @@ void a_new_loop_counts_as_ticking_from_its_start() {
   watch.exited();
 }
 
+void each_watch_flags_a_stall_at_its_own_timeout() {
+  ControlLoopWatch short_watch(milliseconds(100));
+  ControlLoopWatch long_watch(milliseconds(1000));
+  FakeControlLoop short_loop(short_watch);
+  FakeControlLoop long_loop(long_watch);
+  short_loop.stall();
+  long_loop.stall();
+  std::this_thread::sleep_for(milliseconds(600));
+  check(short_watch.stopped_ticking(), "a 100 ms watch flags a 600 ms stall");
+  check(!long_watch.stopped_ticking(), "a 1 s watch does not flag a 600 ms stall");
+  std::this_thread::sleep_for(milliseconds(600));
+  check(long_watch.stopped_ticking(), "a 1 s watch flags a 1.2 s stall");
+}
+
 }  // namespace
 
 int main() {
@@ -154,6 +168,7 @@ int main() {
       {"a_wait_with_no_loop_returns_at_once", a_wait_with_no_loop_returns_at_once},
       {"a_loop_that_exited_has_not_stopped_ticking", a_loop_that_exited_has_not_stopped_ticking},
       {"a_new_loop_counts_as_ticking_from_its_start", a_new_loop_counts_as_ticking_from_its_start},
+      {"each_watch_flags_a_stall_at_its_own_timeout", each_watch_flags_a_stall_at_its_own_timeout},
   };
   int failed = 0;
   for (const auto& [name, test] : tests) {
