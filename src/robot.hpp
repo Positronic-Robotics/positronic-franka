@@ -25,6 +25,7 @@
 #include <Eigen/Core>
 #include <Eigen/Geometry>
 
+#include "control_loop_watch.hpp"
 #include "impedance_law.hpp"
 #include "pose_ik.hpp"
 #include "trajectory_generator.hpp"
@@ -46,6 +47,9 @@ constexpr double SETTLE_VELOCITY_TOLERANCE = 0.05;  // rad/s
 constexpr int SETTLE_TICKS_CAP = 1000;
 // Deadline used when the caller names none. Generous for a joint move on this arm.
 constexpr double DEFAULT_MOVE_DEADLINE_S = 15.0;
+// The error a stuck control loop reports in state(), in goal() and from a stop.
+inline const std::string CONTROL_LINK_LOST = "no robot state for " + std::to_string(CONTROL_LINK_TIMEOUT.count()) +
+                                             " ms: the control loop is stuck in libfranka and the link to the robot is lost";
 
 
 // Control modes. InternalImpedance drives the robot's built-in joint impedance controller through the
@@ -207,7 +211,13 @@ class Robot {
   }
 
   ~Robot() {
-    stop_control_loop_();
+    try {
+      stop_control_loop_();
+    } catch (const std::exception& e) {
+      // A stuck loop still uses this object, so it cannot be left behind.
+      std::cerr << "Robot teardown: " << e.what() << "; waiting for the control loop" << std::endl;
+      control_thread_.join();
+    }
   }
 
   State state() {
@@ -234,6 +244,11 @@ class Robot {
     }
     // NOTE: This relies on the fact that we don't configure EE_T_K frame.
     st.end_effector_wrench = Eigen::Map<const Vector6d>(rs.K_F_ext_hat_K.data());
+    // A stuck loop serves the same cached state for good, so no robot error can appear in it.
+    if (loop_watch_.stopped_ticking()) {
+      st.error = 1;
+      st.error_message += st.error_message.empty() ? CONTROL_LINK_LOST : std::string("; ") + CONTROL_LINK_LOST;
+    }
     return st;
   }
 
@@ -250,6 +265,8 @@ class Robot {
 
   // The move in flight, read without blocking.
   Goal goal() {
+    // A stuck loop never reaches its deadline check, so end its move here.
+    if (loop_watch_.stopped_ticking()) settle_current_goal_(GoalStatus::ABORTED, CONTROL_LINK_LOST);
     std::lock_guard<std::mutex> lk(goal_mutex_);
     return Goal{goal_status_, goal_error_};
   }
@@ -317,6 +334,7 @@ class Robot {
         last_state_ = std::move(preflight);
         last_software_ref_.reset();
       }
+      loop_watch_.start();
       control_running_.store(true);
       // Snapshot the mode here: the caller is GIL-serialized with set_control_mode, while the thread
       // body would race a concurrent gains handoff writing control_mode_.
@@ -332,6 +350,7 @@ class Robot {
       } catch (...) {
         // No thread means nothing will ever clear control_running_ or settle the goal armed above.
         control_running_.store(false);
+        loop_watch_.exited();
         fail_goal_(goal_id, "could not start the control loop");
         throw;
       }
@@ -526,6 +545,7 @@ private:
             std::lock_guard<std::mutex> lk(last_state_mutex_);
             last_state_ = std::make_unique<franka::RobotState>(st);
           }
+          loop_watch_.tick();
 
           if (first) {
             traj.start_at_rest(st.q_d);
@@ -672,6 +692,7 @@ private:
             last_state_ = std::make_unique<franka::RobotState>(st);
             last_software_ref_ = ref;
           }
+          loop_watch_.tick();
 
           const auto J_arr = model_->zeroJacobian(franka::Frame::kEndEffector, st);
           const SpatialJacobian J = Eigen::Map<const SpatialJacobian>(J_arr.data());
@@ -791,6 +812,7 @@ private:
     }
     if (reason.empty()) reason = "control loop stopped before the joint target was reached";
     settle_current_goal_(GoalStatus::ABORTED, std::move(reason));
+    loop_watch_.exited();
   }
 
  public:
@@ -903,6 +925,7 @@ private:
   std::atomic<bool> control_running_{false};
   std::atomic<bool> stop_requested_{false};
   std::atomic<bool> has_target_{false};
+  ControlLoopWatch loop_watch_;
 
   // The move in flight. Assumes serialized callers (the bindings hold the GIL for the whole
   // publish); concurrent C++ callers are not supported.
@@ -950,9 +973,15 @@ private:
     }
   }
 
+  // Raises when the loop is stuck in libfranka: nothing can end that call, so the thread stays, and
+  // stop_requested_ stays set so that the loop stops if it ever ticks again.
   void stop_control_loop_() {
     stop_requested_.store(true);
     if (control_thread_.joinable()) {
+      if (!loop_watch_.wait_for_exit()) {
+        settle_current_goal_(GoalStatus::ABORTED, CONTROL_LINK_LOST);
+        throw std::runtime_error(std::string("cannot stop the control loop: ") + CONTROL_LINK_LOST);
+      }
       control_thread_.join();
     }
     control_running_.store(false);

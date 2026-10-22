@@ -70,3 +70,14 @@ jobs:
           g++ -std=c++20 -Wall -Wextra -Werror -I src -I external/ruckig/include $(pkg-config --cflags eigen3) \
             tests/test_trajectory_generator.cpp *.o -o test_trajectory_generator
           ./test_trajectory_generator
+
+  control-loop-watch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The watch uses only the standard library and drives a fake control loop, so this test runs without libfranka.
+      - name: Run the control loop watch tests
+        run: |
+          g++ -std=c++17 -pthread -Wall -Wextra -Werror -I src tests/test_control_loop_watch.cpp -o test_control_loop_watch
+          ./test_control_loop_watch
