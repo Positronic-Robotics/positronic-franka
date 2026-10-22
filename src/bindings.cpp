@@ -43,14 +43,14 @@ PYBIND11_MODULE(_franka, m) {
       .def(py::init<const std::array<double, 7>&, const std::array<double, 7>&, const std::array<double, 3>&>(),
            py::kw_only(), py::arg("max_spring_torque_rate") = positronic_franka::DEFAULT_MAX_SPRING_TORQUE_RATE,
            py::arg("max_reference_speed") = positronic_franka::DEFAULT_MAX_REFERENCE_SPEED,
-           py::arg("stiffness_point") = std::array<double, 3>{0.0, 0.0, 0.0})
+           py::arg("stiffness_point") = positronic_franka::DEFAULT_STIFFNESS_POINT)
       .def(py::init<const std::array<double, 7>&, const std::array<double, 7>&,
                     const std::array<double, 6>&, const std::array<double, 6>&,
                     const std::array<double, 7>&, const std::array<double, 7>&, const std::array<double, 3>&>(),
            py::arg("kq"), py::arg("kqd"), py::arg("kx"), py::arg("kxd"), py::kw_only(),
            py::arg("max_spring_torque_rate") = positronic_franka::DEFAULT_MAX_SPRING_TORQUE_RATE,
            py::arg("max_reference_speed") = positronic_franka::DEFAULT_MAX_REFERENCE_SPEED,
-           py::arg("stiffness_point") = std::array<double, 3>{0.0, 0.0, 0.0})
+           py::arg("stiffness_point") = positronic_franka::DEFAULT_STIFFNESS_POINT)
       .def_readonly("kq", &positronic_franka::SoftwareImpedance::kq)
       .def_readonly("kqd", &positronic_franka::SoftwareImpedance::kqd)
       .def_readonly("kx", &positronic_franka::SoftwareImpedance::kx)
@@ -132,9 +132,9 @@ PYBIND11_MODULE(_franka, m) {
   py::class_<positronic_franka::Robot>(m, "Robot")
       .def(py::init<const std::string&, franka::RealtimeConfig, double, positronic_franka::ControlMode, double>(),
            py::arg("ip"),
-           py::arg("realtime_config") = franka::RealtimeConfig::kIgnore,
-           py::arg("relative_dynamics_factor") = 1.0,
-           py::arg("control_mode") = positronic_franka::ControlMode(positronic_franka::InternalImpedance{}),
+           py::arg("realtime_config") = positronic_franka::DEFAULT_REALTIME_CONFIG,
+           py::arg("relative_dynamics_factor") = positronic_franka::DEFAULT_RELATIVE_DYNAMICS_FACTOR,
+           py::arg("control_mode") = positronic_franka::DEFAULT_CONTROL_MODE,
            py::arg("control_link_timeout_s") = positronic_franka::DEFAULT_CONTROL_LINK_TIMEOUT_S,
            "control_link_timeout_s: a running control loop with no robot state for this long, in seconds, is "
            "stuck: state() reports an error, goal() aborts the move, and a stop raises RuntimeError. Default 10 s")
@@ -158,10 +158,11 @@ PYBIND11_MODULE(_franka, m) {
           "FK from joint vector (7,) to the flange pose (tx,ty,tz,qw,qx,qy,qz) in base frame")
       .def(
           "zero_jacobian",
-          [](positronic_franka::Robot& r, const positronic_franka::Vector7d& q, const Eigen::Vector3d& stiffness_point) {
+          [](positronic_franka::Robot& r, const positronic_franka::Vector7d& q,
+             const std::array<double, 3>& stiffness_point) {
             return r.zero_jacobian(q, stiffness_point);
           },
-          py::arg("q"), py::arg("stiffness_point") = Eigen::Vector3d::Zero().eval(),
+          py::arg("q"), py::arg("stiffness_point") = positronic_franka::DEFAULT_STIFFNESS_POINT,
           "Zero Jacobian (6x7) at joint values q of stiffness_point (3,), in flange axes from the flange origin — "
           "the J the SoftwareImpedance law with that stiffness_point uses")
       .def(

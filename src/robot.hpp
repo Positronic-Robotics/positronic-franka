@@ -95,6 +95,8 @@ constexpr std::array<double, 7> DEFAULT_MAX_SPRING_TORQUE_RATE = {130.0, 130.0, 
 // Per-joint speed, rad/s, at which the spring reference q_d moves to a new target. Recorded policy motion stays
 // below 1.3 rad/s on every joint over any 0.2 s. The FR3 limit on joints 1 to 4 is 2.62 rad/s.
 constexpr std::array<double, 7> DEFAULT_MAX_REFERENCE_SPEED = {1.5, 1.5, 1.5, 1.5, 1.5, 1.5, 1.5};
+// The point the SoftwareImpedance Cartesian terms act at, in flange axes from the flange origin, m: the flange.
+constexpr std::array<double, 3> DEFAULT_STIFFNESS_POINT = {0.0, 0.0, 0.0};
 
 // Gain defaults are copied from fairo polymetis/conf/robot_client/franka_hardware.yaml, the
 // configuration HybridJointImpedanceControl runs with in the DROID data-collection stack.
@@ -109,12 +111,12 @@ struct SoftwareImpedance {
   std::array<double, 7> max_reference_speed = DEFAULT_MAX_REFERENCE_SPEED;
   // The point the Cartesian terms act at, in flange axes from the flange origin, m. The default gains are tuned at
   // the flange.
-  std::array<double, 3> stiffness_point{0.0, 0.0, 0.0};
+  std::array<double, 3> stiffness_point = DEFAULT_STIFFNESS_POINT;
 
   SoftwareImpedance() = default;
   explicit SoftwareImpedance(const std::array<double, 7>& max_spring_torque_rate_in,
                              const std::array<double, 7>& max_reference_speed_in = DEFAULT_MAX_REFERENCE_SPEED,
-                             const std::array<double, 3>& stiffness_point_in = {0.0, 0.0, 0.0})
+                             const std::array<double, 3>& stiffness_point_in = DEFAULT_STIFFNESS_POINT)
       : max_spring_torque_rate(max_spring_torque_rate_in),
         max_reference_speed(max_reference_speed_in),
         stiffness_point(stiffness_point_in) {
@@ -124,7 +126,7 @@ struct SoftwareImpedance {
                     const std::array<double, 6>& kx_in, const std::array<double, 6>& kxd_in,
                     const std::array<double, 7>& max_spring_torque_rate_in = DEFAULT_MAX_SPRING_TORQUE_RATE,
                     const std::array<double, 7>& max_reference_speed_in = DEFAULT_MAX_REFERENCE_SPEED,
-                    const std::array<double, 3>& stiffness_point_in = {0.0, 0.0, 0.0})
+                    const std::array<double, 3>& stiffness_point_in = DEFAULT_STIFFNESS_POINT)
       : kq(kq_in),
         kqd(kqd_in),
         kx(kx_in),
@@ -165,6 +167,11 @@ inline bool operator==(const SoftwareImpedance& a, const SoftwareImpedance& b) {
 }
 
 using ControlMode = std::variant<InternalImpedance, SoftwareImpedance>;
+
+// Robot construction defaults, shared with the Python bindings.
+constexpr franka::RealtimeConfig DEFAULT_REALTIME_CONFIG = franka::RealtimeConfig::kIgnore;
+constexpr double DEFAULT_RELATIVE_DYNAMICS_FACTOR = 1.0;
+inline const ControlMode DEFAULT_CONTROL_MODE = InternalImpedance{};
 
 // How the joint move now in flight is going. Every `set_target_joints` starts one; a newer target
 // replaces an older one, and only the move in flight has a status — the replaced one is never
@@ -211,9 +218,9 @@ struct State {
 class Robot {
  public:
   explicit Robot(const std::string& ip,
-                 franka::RealtimeConfig realtime_config = franka::RealtimeConfig::kIgnore,
-                 double relative_dynamics_factor = 1.0,
-                 ControlMode control_mode = InternalImpedance{},
+                 franka::RealtimeConfig realtime_config = DEFAULT_REALTIME_CONFIG,
+                 double relative_dynamics_factor = DEFAULT_RELATIVE_DYNAMICS_FACTOR,
+                 ControlMode control_mode = DEFAULT_CONTROL_MODE,
                  double control_link_timeout_s = DEFAULT_CONTROL_LINK_TIMEOUT_S)
       : loop_watch_(control_link_timeout_(control_link_timeout_s)),
         control_link_lost_(control_link_lost_message_(control_link_timeout_s)),
@@ -411,10 +418,10 @@ class Robot {
   // Model terms at explicit joint values, with the robot's current frames and load. The same terms
   // the SoftwareImpedance loop uses, so logged traces can be checked offline against the law. The
   // Jacobian is at `stiffness_point`, in flange axes from the flange origin, where the law's Cartesian gains act.
-  SpatialJacobian zero_jacobian(const Eigen::Ref<const Vector7d>& q, const Eigen::Vector3d& stiffness_point) {
+  SpatialJacobian zero_jacobian(const Eigen::Ref<const Vector7d>& q, const std::array<double, 3>& stiffness_point) {
     franka::RobotState st = read_robot_state_();
     st.q = to_std_array7_(q);
-    return flange_point_jacobian_(st, stiffness_point);
+    return flange_point_jacobian_(st, Eigen::Map<const Eigen::Vector3d>(stiffness_point.data()));
   }
 
   Vector7d coriolis(const Eigen::Ref<const Vector7d>& q, const Eigen::Ref<const Vector7d>& dq) {
