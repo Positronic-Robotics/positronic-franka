@@ -1,4 +1,4 @@
-// Checks the pose IK in pose_ik.hpp on the FR3 kinematics. Needs only Eigen, not libfranka:
+// Checks the pose IK in pose_ik.hpp on the FR3 flange kinematics. Needs only Eigen, not libfranka:
 //   g++ -std=c++17 -I src $(pkg-config --cflags eigen3) tests/test_pose_ik.cpp -o test_pose_ik
 //   ./test_pose_ik
 
@@ -17,6 +17,7 @@
 
 namespace {
 
+using positronic_franka::flange_pose;
 using positronic_franka::FR3_JOINT_LOWER_LIMITS;
 using positronic_franka::FR3_JOINT_UPPER_LIMITS;
 using positronic_franka::IK_DAMPING_SINGULAR_VALUE;
@@ -42,8 +43,8 @@ void check(bool ok, const std::string& what) {
 
 constexpr double kPi = 3.14159265358979323846;
 
-// FR3 kinematics from Franka's modified DH parameters, with the Franka Hand frame (the robot's kEndEffector).
-ToolKinematics fr3_tool(const Vector7d& q) {
+// The FR3 flange (link8, the robot's kFlange) and the zero Jacobian there, from Franka's modified DH parameters.
+ToolKinematics fr3_flange(const Vector7d& q) {
   const std::array<double, 8> a = {0, 0, 0, 0.0825, -0.0825, 0, 0.088, 0};
   const std::array<double, 8> d = {0.333, 0, 0.316, 0, 0.384, 0, 0, 0.107};
   const std::array<double, 8> alpha = {0, -kPi / 2, kPi / 2, kPi / 2, -kPi / 2, kPi / 2, kPi / 2, 0};
@@ -57,7 +58,6 @@ ToolKinematics fr3_tool(const Vector7d& q) {
       origin[i] = T.translation();
     }
   }
-  T = T * Eigen::AngleAxisd(-kPi / 4, Eigen::Vector3d::UnitZ()) * Eigen::Translation3d(0, 0, 0.1034);
   ToolKinematics k{T.matrix(), SpatialJacobian::Zero()};
   for (int i = 0; i < 7; ++i) {
     k.jacobian.block<3, 1>(0, i) = axis[i].cross(T.translation() - origin[i]);
@@ -77,7 +77,7 @@ Vector7d pose_wxyz(const Eigen::Matrix4d& T) {
 std::pair<double, double> miss(const Vector7d& q, const Vector7d& target) {
   const Eigen::Matrix3d R =
       Eigen::Quaterniond(target(3), target(4), target(5), target(6)).normalized().toRotationMatrix();
-  const Vector6d e = pose_error(fr3_tool(q).pose, target.head<3>(), R);
+  const Vector6d e = pose_error(fr3_flange(q).pose, target.head<3>(), R);
   return {e.head<3>().norm() * 1e3, e.tail<3>().norm() * 180.0 / kPi};
 }
 
@@ -123,8 +123,8 @@ void a_nearby_pose_away_from_a_singularity_is_reached_within_0_1_mm_and_0_1_deg(
   for (int trial = 0; trial < 300; ++trial) {
     Vector7d q_target = q0;
     for (int i = 0; i < 7; ++i) q_target(i) += u(rng);
-    const Vector7d target = pose_wxyz(fr3_tool(q_target).pose);
-    const auto [mm, deg] = miss(solve_pose_ik(fr3_tool, target, q0, IK_MAX_JOINT_STEP), target);
+    const Vector7d target = pose_wxyz(fr3_flange(q_target).pose);
+    const auto [mm, deg] = miss(solve_pose_ik(fr3_flange, target, q0, IK_MAX_JOINT_STEP), target);
     check(mm < 0.1 && deg < 0.1, "miss " + std::to_string(mm) + " mm, " + std::to_string(deg) + " deg");
   }
 }
@@ -144,7 +144,7 @@ void every_joint_stays_within_the_step_bound_and_the_fr3_limits() {
       q_target(i) = q0(i) + u(rng);
     }
     const double step = trial % 2 == 0 ? IK_MAX_JOINT_STEP : 0.05;
-    const Vector7d q = solve_pose_ik(fr3_tool, pose_wxyz(fr3_tool(q_target).pose), q0, step);
+    const Vector7d q = solve_pose_ik(fr3_flange, pose_wxyz(fr3_flange(q_target).pose), q0, step);
     check(((q - q0).cwiseAbs().array() <= step + 1e-12).all(), "a joint stepped past the bound");
     check((q.array() >= lower.array()).all() && (q.array() <= upper.array()).all(), "a joint left its limits");
   }
@@ -152,7 +152,7 @@ void every_joint_stays_within_the_step_bound_and_the_fr3_limits() {
 
 bool refuses(const Vector7d& q0, double step) {
   try {
-    solve_pose_ik(fr3_tool, pose_wxyz(fr3_tool(posture()).pose), q0, step);
+    solve_pose_ik(fr3_flange, pose_wxyz(fr3_flange(posture()).pose), q0, step);
   } catch (const std::invalid_argument&) {
     return true;
   }
@@ -180,7 +180,7 @@ void an_infinite_step_bound_leaves_only_the_fr3_limits() {
   check(!refuses_step(INFINITY), "an infinite step was refused");
   const Vector7d q0 = posture();
   const Vector7d q_target = q0 + Vector7d::Constant(0.8);
-  const Vector7d q = solve_pose_ik(fr3_tool, pose_wxyz(fr3_tool(q_target).pose), q0, INFINITY);
+  const Vector7d q = solve_pose_ik(fr3_flange, pose_wxyz(fr3_flange(q_target).pose), q0, INFINITY);
   check((q - q0).cwiseAbs().maxCoeff() > IK_MAX_JOINT_STEP, "a joint was held to the default step");
   check((q.array() >= limit(FR3_JOINT_LOWER_LIMITS).array()).all() &&
             (q.array() <= limit(FR3_JOINT_UPPER_LIMITS).array()).all(),
@@ -190,11 +190,11 @@ void an_infinite_step_bound_leaves_only_the_fr3_limits() {
 void a_zero_step_bound_holds_every_joint() {
   check(!refuses_step(0.0), "a zero step was refused");
   const Vector7d q0 = posture();
-  const Vector7d target = pose_wxyz(fr3_tool(q0 + Vector7d::Constant(0.1)).pose);
-  check((solve_pose_ik(fr3_tool, target, q0, 0.0) - q0).norm() == 0.0, "a joint moved with a zero step");
+  const Vector7d target = pose_wxyz(fr3_flange(q0 + Vector7d::Constant(0.1)).pose);
+  check((solve_pose_ik(fr3_flange, target, q0, 0.0) - q0).norm() == 0.0, "a joint moved with a zero step");
 }
 
-// A measured FR3 pose just before a wrist-singularity spin: joint 6 near pi, s_min 0.041.
+// A measured FR3 pose just before a wrist-singularity spin: joint 6 near pi, s_min 0.043 at the flange.
 Vector7d near_wrist_singularity() {
   Vector7d q;
   q << 0.810, 0.0319, 0.060, -2.5503, 1.0741, 3.1396, -0.9533;
@@ -212,7 +212,7 @@ Eigen::Matrix4d twisted(const Eigen::Matrix4d& pose, const Vector6d& twist) {
 
 void near_a_singularity_the_weak_direction_gain_is_at_most_one_over_the_threshold() {
   const Vector7d q0 = near_wrist_singularity();
-  const ToolKinematics k = fr3_tool(q0);
+  const ToolKinematics k = fr3_flange(q0);
   const SpatialJacobian& J = k.jacobian;
   const Eigen::SelfAdjointEigenSolver<Eigen::Matrix<double, 6, 6>> left(J * J.transpose());
   const double s = std::sqrt(left.eigenvalues()(0));
@@ -222,7 +222,7 @@ void near_a_singularity_the_weak_direction_gain_is_at_most_one_over_the_threshol
 
   // A small tool twist along the weak left singular vector.
   const double eps = 0.002;
-  const Vector7d q = solve_pose_ik(fr3_tool, pose_wxyz(twisted(k.pose, eps * weak_twist)), q0, IK_MAX_JOINT_STEP);
+  const Vector7d q = solve_pose_ik(fr3_flange, pose_wxyz(twisted(k.pose, eps * weak_twist)), q0, IK_MAX_JOINT_STEP);
 
   const double weak_move = std::abs(weak_joints.dot(q - q0));
   const double S0 = IK_DAMPING_SINGULAR_VALUE;
@@ -234,24 +234,24 @@ void near_a_singularity_the_weak_direction_gain_is_at_most_one_over_the_threshol
 
 void near_a_singularity_the_damping_keeps_a_wrist_command_inside_the_step_bound() {
   const Vector7d q0 = near_wrist_singularity();
-  const ToolKinematics k = fr3_tool(q0);
+  const ToolKinematics k = fr3_flange(q0);
   const SpatialJacobian& J = k.jacobian;
   const Eigen::SelfAdjointEigenSolver<Eigen::Matrix<double, 6, 6>> left(J * J.transpose());
   const double s = std::sqrt(left.eigenvalues()(0));
   const Vector6d weak_twist = left.eigenvectors().col(0);
   const Vector7d weak_joints = J.transpose() * weak_twist / s;
 
-  // A 1.7 deg command along the weak direction: the exact answer moves the wrist eps / s, 0.73 rad.
+  // A 1.7 deg command along the weak direction: the exact answer moves the wrist eps / s, 0.70 rad.
   const double eps = 0.03;
   check(eps / s > IK_MAX_JOINT_STEP, "the exact answer needs more than the step bound");
-  const Vector7d q = solve_pose_ik(fr3_tool, pose_wxyz(twisted(k.pose, eps * weak_twist)), q0, IK_MAX_JOINT_STEP);
+  const Vector7d q = solve_pose_ik(fr3_flange, pose_wxyz(twisted(k.pose, eps * weak_twist)), q0, IK_MAX_JOINT_STEP);
   check((q - q0).cwiseAbs().maxCoeff() < IK_MAX_JOINT_STEP - 0.05, "the step bound is not what holds the move");
   check(std::abs(weak_joints.dot(q - q0)) <= eps / IK_DAMPING_SINGULAR_VALUE,
         "the weak-direction move exceeds the change over the threshold");
 }
 
 Vector7d null_direction(const Vector7d& q) {
-  const SpatialJacobian J = fr3_tool(q).jacobian;
+  const SpatialJacobian J = fr3_flange(q).jacobian;
   return Eigen::SelfAdjointEigenSolver<Matrix7d>(J.transpose() * J).eigenvectors().col(0);
 }
 
@@ -259,13 +259,39 @@ void the_move_pulls_the_posture_along_the_null_space_and_keeps_the_tool() {
   const Vector7d home = posture();
   const Vector7d q0 = home + 0.5 * null_direction(home);
   const Vector7d n0 = null_direction(q0);
-  const Vector7d target = pose_wxyz(fr3_tool(q0).pose);
+  const Vector7d target = pose_wxyz(fr3_flange(q0).pose);
 
-  const Vector7d q = solve_pose_ik(fr3_tool, target, q0, IK_MAX_JOINT_STEP);
+  const Vector7d q = solve_pose_ik(fr3_flange, target, q0, IK_MAX_JOINT_STEP);
   const double expected = -IK_POSTURE_PULL_PER_COMMAND * n0.dot(q0 - home);
   check(std::abs(n0.dot(q - q0) - expected) < 0.05 * std::abs(expected), "the null-space pull is 2 % of the offset");
   const auto [mm, deg] = miss(q, target);
   check(mm < 0.1 && deg < 0.1, "the pull moved the tool");
+}
+
+// F_T_EE as Desk sets it for the Franka Hand: 103.4 mm along the flange axis and -45 deg about it.
+Eigen::Matrix4d franka_hand_from_flange() {
+  return (Eigen::Isometry3d(Eigen::AngleAxisd(-kPi / 4, Eigen::Vector3d::UnitZ())) *
+          Eigen::Translation3d(0, 0, 0.1034))
+      .matrix();
+}
+
+void the_flange_pose_takes_the_tool_offset_off_the_end_effector_pose() {
+  std::mt19937 rng(17);
+  std::uniform_real_distribution<double> u(-1.0, 1.0);
+  for (int trial = 0; trial < 100; ++trial) {
+    Vector7d q = posture();
+    for (int i = 0; i < 7; ++i) q(i) += u(rng);
+    const Eigen::Matrix4d O_T_F = fr3_flange(q).pose;
+    Eigen::Matrix4d F_T_EE = franka_hand_from_flange();
+    if (trial % 2) {
+      const Eigen::Vector3d offset(0.05 * u(rng), 0.05 * u(rng), 0.2 * u(rng));
+      const Eigen::Vector3d axis = Eigen::Vector3d(u(rng), u(rng), u(rng)).normalized();
+      F_T_EE = (Eigen::Translation3d(offset) * Eigen::AngleAxisd(kPi * u(rng), axis)).matrix();
+    }
+    const Eigen::Matrix4d O_T_EE = O_T_F * F_T_EE;
+    check((flange_pose(O_T_EE, F_T_EE) - O_T_F).cwiseAbs().maxCoeff() < 1e-12,
+          "the flange pose is not O_T_EE F_T_EE^-1");
+  }
 }
 
 }  // namespace
@@ -290,6 +316,8 @@ int main() {
        near_a_singularity_the_damping_keeps_a_wrist_command_inside_the_step_bound},
       {"the_move_pulls_the_posture_along_the_null_space_and_keeps_the_tool",
        the_move_pulls_the_posture_along_the_null_space_and_keeps_the_tool},
+      {"the_flange_pose_takes_the_tool_offset_off_the_end_effector_pose",
+       the_flange_pose_takes_the_tool_offset_off_the_end_effector_pose},
   };
   int failed = 0;
   for (const auto& [name, test] : tests) {

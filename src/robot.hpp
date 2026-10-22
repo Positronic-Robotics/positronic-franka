@@ -182,8 +182,8 @@ struct State {
   Vector7d tau_J;
   // Last commanded joint torques (after rate limiting/filtering), without gravity.
   Vector7d tau_J_d;
-  // End-effector pose in base (robot) frame: [tx, ty, tz, qw, qx, qy, qz]
-  Vector7d end_effector_pose;
+  // Flange pose in base (robot) frame, O_T_F: [tx, ty, tz, qw, qx, qy, qz]
+  Vector7d flange_pose;
   // Robot controller time since start, seconds.
   double time = 0.0;
   int error = 0;
@@ -212,8 +212,8 @@ class Robot {
 
   State state() {
     auto [rs, software_ref] = read_state_snapshot_();
-    // Map the column-major 4x4 transform into Eigen
-    Eigen::Map<const Eigen::Matrix4d> T(rs.O_T_EE.data());
+    const Eigen::Matrix4d T = flange_pose(Eigen::Map<const Eigen::Matrix4d>(rs.O_T_EE.data()),
+                                          Eigen::Map<const Eigen::Matrix4d>(rs.F_T_EE.data()));
     const Eigen::Vector3d t = T.block<3, 1>(0, 3);
     const Eigen::Matrix3d R = T.block<3, 3>(0, 0);
     const Eigen::Quaterniond q(R);
@@ -226,7 +226,7 @@ class Robot {
     st.q_d = software_ref ? *software_ref : Eigen::Map<const Vector7d>(rs.q_d.data());
     st.tau_J = Eigen::Map<const Vector7d>(rs.tau_J.data());
     st.tau_J_d = Eigen::Map<const Vector7d>(rs.tau_J_d.data());
-    st.end_effector_pose << t.x(), t.y(), t.z(), q.w(), q.x(), q.y(), q.z();
+    st.flange_pose << t.x(), t.y(), t.z(), q.w(), q.x(), q.y(), q.z();
     st.time = rs.time.toSec();
     st.error = rs.current_errors ? 1 : 0;
     if (st.error) {
@@ -358,14 +358,13 @@ class Robot {
     }
   }
 
-  // Forward Kinematics: compute EE pose (tx, ty, tz, qw, qx, qy, qz) from joints q (7,)
+  // Forward Kinematics: compute the flange pose (tx, ty, tz, qw, qx, qy, qz) from joints q (7,)
   Vector7d forward_kinematics(
       const Eigen::Ref<const Vector7d>& q) {
-    // Use current robot state for fixed frames (F_T_EE, EE_T_K), override q
     franka::RobotState st = read_robot_state_();
     st.q = to_std_array7_(q);
 
-    const Eigen::Matrix4d T = ee_pose_matrix_(st);
+    const Eigen::Matrix4d T = flange_pose_matrix_(st);
     const Eigen::Vector3d t = T.block<3, 1>(0, 3);
     const Eigen::Matrix3d R = T.block<3, 3>(0, 0);
     const Eigen::Quaterniond quat(R);
@@ -376,7 +375,8 @@ class Robot {
   }
 
   // Model terms at explicit joint values, with the robot's current frames and load. The same terms
-  // the SoftwareImpedance loop uses, so logged traces can be checked offline against the law.
+  // the SoftwareImpedance loop uses, so logged traces can be checked offline against the law. The
+  // Jacobian is at the end-effector frame F_T_EE, where the law's Cartesian gains act.
   SpatialJacobian zero_jacobian(const Eigen::Ref<const Vector7d>& q) {
     franka::RobotState st = read_robot_state_();
     st.q = to_std_array7_(q);
@@ -391,31 +391,31 @@ class Robot {
     return Eigen::Map<const Vector7d>(cor.data());
   }
 
-  // Inverse Kinematics to EndEffector pose in base frame (tx, ty, tz, qw, qx, qy, qz)
+  // Inverse Kinematics to the flange pose in base frame (tx, ty, tz, qw, qx, qy, qz)
   Vector7d inverse_kinematics(
-      const Eigen::Ref<const Vector7d>& target_pose_wxyz,
+      const Eigen::Ref<const Vector7d>& flange_pose_wxyz,
       double tol = 1e-4, int max_iters = 150, double min_step = 1e-8, double pinv_reg = 0.03,
       double nullspace_gain = 0.002, double line_search_alpha = 1.0, double line_search_beta = 0.5,
       int line_search_max_steps = 20) {
     auto base = read_robot_state_();
     Vector7d q0 = Eigen::Map<const Vector7d>(base.q.data());
-    return inverse_kinematics_q0(target_pose_wxyz, q0, tol, max_iters, min_step, pinv_reg, nullspace_gain,
+    return inverse_kinematics_q0(flange_pose_wxyz, q0, tol, max_iters, min_step, pinv_reg, nullspace_gain,
                                  line_search_alpha, line_search_beta, line_search_max_steps);
   }
 
   Vector7d inverse_kinematics_q0(
-      const Eigen::Ref<const Vector7d>& target_pose_wxyz,
+      const Eigen::Ref<const Vector7d>& flange_pose_wxyz,
       const Eigen::Ref<const Vector7d>& q0,
       double tol = 1e-4, int max_iters = 150, double min_step = 1e-8, double pinv_reg = 0.03,
       double nullspace_gain = 0.002, double line_search_alpha = 1.0, double line_search_beta = 0.5,
       int line_search_max_steps = 20) {
     // Target
-    const Eigen::Vector3d t_tgt = target_pose_wxyz.head<3>();
-    Eigen::Quaterniond q_tgt(target_pose_wxyz(3), target_pose_wxyz(4), target_pose_wxyz(5), target_pose_wxyz(6));
+    const Eigen::Vector3d t_tgt = flange_pose_wxyz.head<3>();
+    Eigen::Quaterniond q_tgt(flange_pose_wxyz(3), flange_pose_wxyz(4), flange_pose_wxyz(5), flange_pose_wxyz(6));
     q_tgt.normalize();
     const Eigen::Matrix3d R_tgt = q_tgt.toRotationMatrix();
 
-    // Base state for frames (F_T_EE, EE_T_K). We'll vary q only.
+    // Base state for the model; only q varies.
     franka::RobotState base = read_robot_state_();
     franka::RobotState st = base;
     Vector7d q = q0;
@@ -425,13 +425,13 @@ class Robot {
       st.q = to_std_array7_(q);
 
       // Pose and error
-      const Eigen::Matrix4d T_cur = ee_pose_matrix_(st);
+      const Eigen::Matrix4d T_cur = flange_pose_matrix_(st);
       const Eigen::Matrix<double, 6, 1> e = pose_error(T_cur, t_tgt, R_tgt);
       const double err_norm = e.norm();
       if (err_norm < tol) break;
 
       // Jacobian and DLS step with nullspace bias
-      const SpatialJacobian J = ee_jacobian_(st);
+      const SpatialJacobian J = flange_jacobian_(st);
       const Eigen::Matrix<double, 7, 6> J_pinv = damped_pinv_(J, pinv_reg);
       const Vector7d dq_primary = -J_pinv * e;
       const Eigen::Matrix<double, 7, 7> N = Eigen::Matrix<double, 7, 7>::Identity() - J_pinv * J;
@@ -444,7 +444,7 @@ class Robot {
       for (int ls = 0; ls < line_search_max_steps; ++ls) {
         const Vector7d q_trial = q + step * dq;
         st.q = to_std_array7_(q_trial);
-        const Eigen::Matrix4d T_trial = ee_pose_matrix_(st);
+        const Eigen::Matrix4d T_trial = flange_pose_matrix_(st);
         const double err_trial = pose_error(T_trial, t_tgt, R_tgt).norm();
         if (err_trial < best_err) {
           best_err = err_trial;
@@ -458,22 +458,22 @@ class Robot {
     return q;
   }
 
-  // The IK for a live command: the joints that bring the tool as close as the bounds allow to
-  // target_pose_wxyz, from the measured joints.
-  Vector7d inverse_kinematics_with_limits(const Eigen::Ref<const Vector7d>& target_pose_wxyz) {
+  // The IK for a live command: the joints that bring the flange as close as the bounds allow to
+  // flange_pose_wxyz, from the measured joints.
+  Vector7d inverse_kinematics_with_limits(const Eigen::Ref<const Vector7d>& flange_pose_wxyz) {
     const franka::RobotState base = read_robot_state_();
-    return inverse_kinematics_with_limits(target_pose_wxyz, Eigen::Map<const Vector7d>(base.q.data()),
+    return inverse_kinematics_with_limits(flange_pose_wxyz, Eigen::Map<const Vector7d>(base.q.data()),
                                           IK_MAX_JOINT_STEP);
   }
 
-  Vector7d inverse_kinematics_with_limits(const Eigen::Ref<const Vector7d>& target_pose_wxyz,
+  Vector7d inverse_kinematics_with_limits(const Eigen::Ref<const Vector7d>& flange_pose_wxyz,
                                           const Eigen::Ref<const Vector7d>& q0, double max_step) {
     franka::RobotState st = read_robot_state_();
     const auto kinematics = [&](const Vector7d& q) {
       st.q = to_std_array7_(q);
-      return ToolKinematics{ee_pose_matrix_(st), ee_jacobian_(st)};
+      return ToolKinematics{flange_pose_matrix_(st), flange_jacobian_(st)};
     };
-    return solve_pose_ik(kinematics, target_pose_wxyz, q0, max_step);
+    return solve_pose_ik(kinematics, flange_pose_wxyz, q0, max_step);
   }
 
 private:
@@ -485,9 +485,14 @@ private:
     return a;
   }
 
-  Eigen::Matrix4d ee_pose_matrix_(const franka::RobotState& st) const {
-    const auto T_data = model_->pose(franka::Frame::kEndEffector, st);
+  Eigen::Matrix4d flange_pose_matrix_(const franka::RobotState& st) const {
+    const auto T_data = model_->pose(franka::Frame::kFlange, st);
     return Eigen::Map<const Eigen::Matrix4d>(T_data.data());
+  }
+
+  SpatialJacobian flange_jacobian_(const franka::RobotState& st) const {
+    const auto J_data = model_->zeroJacobian(franka::Frame::kFlange, st);
+    return Eigen::Map<const SpatialJacobian>(J_data.data());
   }
 
   SpatialJacobian ee_jacobian_(const franka::RobotState& st) const {
@@ -818,9 +823,9 @@ private:
   std::string getRobotModel() {
     std::string urdf = robot_->getRobotModel();
 
-    // F_T_EE (flange-to-end-effector) accounts for the mounted tool and is what libfranka's
-    // model->pose(kEndEffector) uses. The base URDF stops at the flange (link8), so append a fixed
-    // joint + link to complete the chain.
+    // The base URDF stops at the flange (link8), where the published pose and the IK are. Append the
+    // end-effector frame F_T_EE that Desk sets for the mounted tool, where the SoftwareImpedance law's
+    // Cartesian gains act.
     auto state = read_robot_state_();
     Eigen::Map<const Eigen::Matrix4d> F_T_EE(state.F_T_EE.data());
     const Eigen::Vector3d t = F_T_EE.block<3, 1>(0, 3);
@@ -851,8 +856,8 @@ private:
             << "  <!-- WARNING: This link and joint were appended by positronic-franka,\n"
             << "       NOT part of the original URDF from libfranka getRobotModel().\n"
             << "       They encode F_T_EE (flange-to-end-effector transform) read from\n"
-            << "       franka::RobotState at the time of this call, so that the URDF\n"
-            << "       matches the full kinematic chain used by the driver's runtime IK. -->\n"
+            << "       franka::RobotState at the time of this call: the tool frame that\n"
+            << "       Desk sets. The driver's pose and IK are at the flange. -->\n"
             << "  <link name=\"end_effector\"/>\n"
             << "  <joint name=\"flange_to_end_effector\" type=\"fixed\">\n"
             << "    <parent link=\"" << flange_link << "\"/>\n"

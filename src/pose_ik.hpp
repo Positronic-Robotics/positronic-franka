@@ -39,6 +39,11 @@ struct ToolKinematics {
   SpatialJacobian jacobian;
 };
 
+// The flange pose in the base frame, O_T_F, from the end-effector pose O_T_EE and the tool offset F_T_EE.
+inline Eigen::Matrix4d flange_pose(const Eigen::Matrix4d& O_T_EE, const Eigen::Matrix4d& F_T_EE) {
+  return (Eigen::Isometry3d(O_T_EE) * Eigen::Isometry3d(F_T_EE).inverse()).matrix();
+}
+
 // Position error, then rotation error as an angle-axis vector in the base frame. J dq moves it.
 inline Vector6d pose_error(const Eigen::Matrix4d& T_cur, const Eigen::Vector3d& t_tgt,
                            const Eigen::Matrix3d& R_tgt) {
