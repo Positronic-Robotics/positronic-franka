@@ -95,6 +95,8 @@ constexpr std::array<double, 7> DEFAULT_MAX_SPRING_TORQUE_RATE = {130.0, 130.0, 
 // Per-joint speed, rad/s, at which the spring reference q_d moves to a new target. Recorded policy motion stays
 // below 1.3 rad/s on every joint over any 0.2 s. The FR3 limit on joints 1 to 4 is 2.62 rad/s.
 constexpr std::array<double, 7> DEFAULT_MAX_REFERENCE_SPEED = {1.5, 1.5, 1.5, 1.5, 1.5, 1.5, 1.5};
+// The point the SoftwareImpedance Cartesian terms act at, in flange axes from the flange origin, m: the flange.
+constexpr std::array<double, 3> DEFAULT_STIFFNESS_POINT = {0.0, 0.0, 0.0};
 
 // Gain defaults are copied from fairo polymetis/conf/robot_client/franka_hardware.yaml, the
 // configuration HybridJointImpedanceControl runs with in the DROID data-collection stack.
@@ -107,23 +109,31 @@ struct SoftwareImpedance {
   std::array<double, 7> max_spring_torque_rate = DEFAULT_MAX_SPRING_TORQUE_RATE;
   // Per-joint speed at which the spring reference q_d moves to a new target, rad/s.
   std::array<double, 7> max_reference_speed = DEFAULT_MAX_REFERENCE_SPEED;
+  // The point the Cartesian terms act at, in flange axes from the flange origin, m. The default gains are tuned at
+  // the flange.
+  std::array<double, 3> stiffness_point = DEFAULT_STIFFNESS_POINT;
 
   SoftwareImpedance() = default;
   explicit SoftwareImpedance(const std::array<double, 7>& max_spring_torque_rate_in,
-                             const std::array<double, 7>& max_reference_speed_in = DEFAULT_MAX_REFERENCE_SPEED)
-      : max_spring_torque_rate(max_spring_torque_rate_in), max_reference_speed(max_reference_speed_in) {
+                             const std::array<double, 7>& max_reference_speed_in = DEFAULT_MAX_REFERENCE_SPEED,
+                             const std::array<double, 3>& stiffness_point_in = DEFAULT_STIFFNESS_POINT)
+      : max_spring_torque_rate(max_spring_torque_rate_in),
+        max_reference_speed(max_reference_speed_in),
+        stiffness_point(stiffness_point_in) {
     validate_guards_();
   }
   SoftwareImpedance(const std::array<double, 7>& kq_in, const std::array<double, 7>& kqd_in,
                     const std::array<double, 6>& kx_in, const std::array<double, 6>& kxd_in,
                     const std::array<double, 7>& max_spring_torque_rate_in = DEFAULT_MAX_SPRING_TORQUE_RATE,
-                    const std::array<double, 7>& max_reference_speed_in = DEFAULT_MAX_REFERENCE_SPEED)
+                    const std::array<double, 7>& max_reference_speed_in = DEFAULT_MAX_REFERENCE_SPEED,
+                    const std::array<double, 3>& stiffness_point_in = DEFAULT_STIFFNESS_POINT)
       : kq(kq_in),
         kqd(kqd_in),
         kx(kx_in),
         kxd(kxd_in),
         max_spring_torque_rate(max_spring_torque_rate_in),
-        max_reference_speed(max_reference_speed_in) {
+        max_reference_speed(max_reference_speed_in),
+        stiffness_point(stiffness_point_in) {
     validate_half(kq, kqd, "joint (kq/kqd)");
     validate_half(kx, kxd, "Cartesian (kx/kxd)");
     if (all_zero(kq) && all_zero(kx)) {
@@ -140,6 +150,9 @@ struct SoftwareImpedance {
     if (!all_positive(max_reference_speed)) {
       throw std::invalid_argument("max_reference_speed must be finite and strictly positive");
     }
+    if (!std::all_of(stiffness_point.begin(), stiffness_point.end(), [](double v) { return std::isfinite(v); })) {
+      throw std::invalid_argument("stiffness_point must be finite");
+    }
   }
 };
 
@@ -149,10 +162,16 @@ inline bool operator==(const InternalImpedance& a, const InternalImpedance& b) {
 
 inline bool operator==(const SoftwareImpedance& a, const SoftwareImpedance& b) {
   return a.kq == b.kq && a.kqd == b.kqd && a.kx == b.kx && a.kxd == b.kxd &&
-         a.max_spring_torque_rate == b.max_spring_torque_rate && a.max_reference_speed == b.max_reference_speed;
+         a.max_spring_torque_rate == b.max_spring_torque_rate && a.max_reference_speed == b.max_reference_speed &&
+         a.stiffness_point == b.stiffness_point;
 }
 
 using ControlMode = std::variant<InternalImpedance, SoftwareImpedance>;
+
+// Robot construction defaults, shared with the Python bindings.
+constexpr franka::RealtimeConfig DEFAULT_REALTIME_CONFIG = franka::RealtimeConfig::kIgnore;
+constexpr double DEFAULT_RELATIVE_DYNAMICS_FACTOR = 1.0;
+inline const ControlMode DEFAULT_CONTROL_MODE = InternalImpedance{};
 
 // How the joint move now in flight is going. Every `set_target_joints` starts one; a newer target
 // replaces an older one, and only the move in flight has a status — the replaced one is never
@@ -199,9 +218,9 @@ struct State {
 class Robot {
  public:
   explicit Robot(const std::string& ip,
-                 franka::RealtimeConfig realtime_config = franka::RealtimeConfig::kIgnore,
-                 double relative_dynamics_factor = 1.0,
-                 ControlMode control_mode = InternalImpedance{},
+                 franka::RealtimeConfig realtime_config = DEFAULT_REALTIME_CONFIG,
+                 double relative_dynamics_factor = DEFAULT_RELATIVE_DYNAMICS_FACTOR,
+                 ControlMode control_mode = DEFAULT_CONTROL_MODE,
                  double control_link_timeout_s = DEFAULT_CONTROL_LINK_TIMEOUT_S)
       : loop_watch_(control_link_timeout_(control_link_timeout_s)),
         control_link_lost_(control_link_lost_message_(control_link_timeout_s)),
@@ -398,11 +417,11 @@ class Robot {
 
   // Model terms at explicit joint values, with the robot's current frames and load. The same terms
   // the SoftwareImpedance loop uses, so logged traces can be checked offline against the law. The
-  // Jacobian is at the end-effector frame F_T_EE, where the law's Cartesian gains act.
-  SpatialJacobian zero_jacobian(const Eigen::Ref<const Vector7d>& q) {
+  // Jacobian is at `stiffness_point`, in flange axes from the flange origin, where the law's Cartesian gains act.
+  SpatialJacobian zero_jacobian(const Eigen::Ref<const Vector7d>& q, const std::array<double, 3>& stiffness_point) {
     franka::RobotState st = read_robot_state_();
     st.q = to_std_array7_(q);
-    return ee_jacobian_(st);
+    return flange_point_jacobian_(st, Eigen::Map<const Eigen::Vector3d>(stiffness_point.data()));
   }
 
   Vector7d coriolis(const Eigen::Ref<const Vector7d>& q, const Eigen::Ref<const Vector7d>& dq) {
@@ -517,9 +536,8 @@ private:
     return Eigen::Map<const SpatialJacobian>(J_data.data());
   }
 
-  SpatialJacobian ee_jacobian_(const franka::RobotState& st) const {
-    const auto J_data = model_->zeroJacobian(franka::Frame::kEndEffector, st);
-    return Eigen::Map<const SpatialJacobian>(J_data.data());
+  SpatialJacobian flange_point_jacobian_(const franka::RobotState& st, const Eigen::Vector3d& flange_to_point) const {
+    return point_jacobian(ToolKinematics{flange_pose_matrix_(st), flange_jacobian_(st)}, flange_to_point);
   }
 
   static Eigen::Matrix<double, 7, 6> damped_pinv_(const SpatialJacobian& J, double lambda) {
@@ -627,6 +645,7 @@ private:
     Vector6d Kxd = Eigen::Map<const Vector6d>(imp.kxd.data());
     SpringTorqueRateLimiter spring_limiter(imp.max_spring_torque_rate);
     Vector7d max_reference_speed = Eigen::Map<const Vector7d>(imp.max_reference_speed.data());
+    Eigen::Vector3d stiffness_point = Eigen::Map<const Eigen::Vector3d>(imp.stiffness_point.data());
     std::string thread_error;
     try {
       robot_->control(
@@ -669,6 +688,7 @@ private:
             Kxd = Eigen::Map<const Vector6d>(new_gains_.kxd.data());
             spring_limiter.set_max_rate(new_gains_.max_spring_torque_rate);
             max_reference_speed = Eigen::Map<const Vector7d>(new_gains_.max_reference_speed.data());
+            stiffness_point = Eigen::Map<const Eigen::Vector3d>(new_gains_.stiffness_point.data());
             has_new_gains_.store(false);
           }
 
@@ -697,8 +717,7 @@ private:
           }
           loop_watch_.tick();
 
-          const auto J_arr = model_->zeroJacobian(franka::Frame::kEndEffector, st);
-          const SpatialJacobian J = Eigen::Map<const SpatialJacobian>(J_arr.data());
+          const SpatialJacobian J = flange_point_jacobian_(st, stiffness_point);
           const auto cor = model_->coriolis(st);
 
           const Matrix7d Kp = J.transpose() * Kx.asDiagonal() * J + Matrix7d(Kq.asDiagonal());
@@ -849,8 +868,7 @@ private:
     std::string urdf = robot_->getRobotModel();
 
     // The base URDF stops at the flange (link8), where the published pose and the IK are. Append the
-    // end-effector frame F_T_EE that Desk sets for the mounted tool, where the SoftwareImpedance law's
-    // Cartesian gains act.
+    // end-effector frame F_T_EE that Desk sets for the mounted tool.
     auto state = read_robot_state_();
     Eigen::Map<const Eigen::Matrix4d> F_T_EE(state.F_T_EE.data());
     const Eigen::Vector3d t = F_T_EE.block<3, 1>(0, 3);

@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.11.0] - 2026-10-22
+
+### Added
+- `stiffness_point` on `SoftwareImpedance`, a keyword argument: the point (3,), in metres, where the Cartesian terms `J^T Kx J` and `J^T Kxd J` act. It is in flange axes, from the flange origin, and must be finite. A change of the point reaches the running torque loop like a gain change.
+- `point_jacobian` in `pose_ik.hpp`: the zero Jacobian of a point fixed to the tool, from the tool pose and its zero Jacobian. `tests/test_pose_ik.cpp` checks it against the central differences of the point position on the FR3 flange kinematics.
+
+### Changed
+- **Behaviour.** `SoftwareImpedance` takes its Cartesian terms at `stiffness_point`, by default the flange. They were at `F_T_EE`. The default gains are polymetis', and polymetis takes them at the flange, `panda_link8`, in the DROID stack. On the FR3 with the Franka Hand configuration, `F_T_EE` is 103.4 mm past the flange. To keep the old point, pass the `F_T_EE` translation as `stiffness_point`.
+- **Breaking.** `zero_jacobian(q, stiffness_point=(0, 0, 0))` returns the Jacobian at `stiffness_point`, by default the flange. It returned the Jacobian at `F_T_EE`.
+
 ## [0.10.1] - 2026-10-22
 
 ### Added
