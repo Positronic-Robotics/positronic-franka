@@ -258,7 +258,6 @@ def test_prepare_in_programming_mode_stops_before_any_acknowledge_self_test_or_b
 
 
 def test_prepare_in_programming_mode_names_a_demanded_recovery_first():
-    # A reboot does not clear a demanded recovery, so the person at the robot hears of it first.
     box = FakeDesk(time_to_td2=600, recovery_joints=(4,), operating_mode=desk.PROGRAMMING_MODE)
 
     with pytest.raises(desk.JointRecoveryRequired, match='joint 5'):

@@ -51,7 +51,7 @@ _ACKNOWLEDGEABLE_ERRORS = {
 
 
 # The operating mode in which Desk refuses FCI (424 ActionUnavailable/WrongOperatingMode). A hand recovery of a joint
-# in Desk can leave it, and a control box reboot returns the box to `Execution`.
+# in Desk can leave it.
 PROGRAMMING_MODE = 'Programming'
 
 
