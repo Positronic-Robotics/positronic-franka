@@ -248,7 +248,7 @@ def test_prepare_names_the_recovery_a_self_test_leaves_when_desk_refuses_the_bra
 
 
 def test_prepare_in_programming_mode_stops_before_any_acknowledge_self_test_or_brake():
-    box = FakeDesk(time_to_td2=600, recoverable_errors=('jointPositionError',), operating_mode='Programming')
+    box = FakeDesk(time_to_td2=600, recoverable_errors=('jointPositionError',), operating_mode=desk.PROGRAMMING_MODE)
 
     with pytest.raises(desk.ProgrammingModeError, match='Reboot the control box'):
         _desk_on(box).prepare()
@@ -259,16 +259,16 @@ def test_prepare_in_programming_mode_stops_before_any_acknowledge_self_test_or_b
 
 def test_prepare_in_programming_mode_names_a_demanded_recovery_first():
     # A reboot does not clear a demanded recovery, so the person at the robot hears of it first.
-    box = FakeDesk(time_to_td2=600, recovery_joints=(4,), operating_mode='Programming')
+    box = FakeDesk(time_to_td2=600, recovery_joints=(4,), operating_mode=desk.PROGRAMMING_MODE)
 
     with pytest.raises(desk.JointRecoveryRequired, match='joint 5'):
         _desk_on(box).prepare()
 
 
 def test_operating_mode_is_the_mode_desk_names():
-    assert _desk_on(FakeDesk(time_to_td2=TD2_PERIOD_SEC, operating_mode='Programming')).operating_mode() == (
-        'Programming'
-    )
+    box = FakeDesk(time_to_td2=TD2_PERIOD_SEC, operating_mode=desk.PROGRAMMING_MODE)
+
+    assert _desk_on(box).operating_mode() == desk.PROGRAMMING_MODE
 
 
 def test_programming_mode_error_survives_a_process_boundary():
