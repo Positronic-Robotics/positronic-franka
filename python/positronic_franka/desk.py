@@ -50,6 +50,11 @@ _ACKNOWLEDGEABLE_ERRORS = {
 }
 
 
+# The operating mode in which Desk refuses FCI (424 ActionUnavailable/WrongOperatingMode). A hand recovery of a joint
+# in Desk can leave it, and a control box reboot returns the box to `Execution`.
+PROGRAMMING_MODE = 'Programming'
+
+
 def _acknowledgeable_errors(status: dict) -> list[str]:
     return [error_id for flag, error_id in _ACKNOWLEDGEABLE_ERRORS.items() if status['recoverableErrors'][flag]]
 
@@ -75,6 +80,16 @@ class SafetyControllerError(RuntimeError):
         super().__init__(
             f'Safety controller is in SafetyError ({detail}); Desk refuses every recovery action in this state. '
             f'Reboot the control box (`Desk.reboot()` or the Desk web UI).'
+        )
+
+
+class ProgrammingModeError(RuntimeError):
+    """Desk is in Programming mode and refuses FCI. A control box reboot (``Desk.reboot()``) clears the mode."""
+
+    def __str__(self) -> str:
+        return (
+            f'Desk is in {PROGRAMMING_MODE} mode, so it refuses FCI. Reboot the control box (`Desk.reboot()` or the '
+            'Desk web UI).'
         )
 
 
@@ -216,6 +231,10 @@ class Desk:
     def safety_status(self) -> dict:
         return self._request('GET', '/admin/api/safety/status').json()
 
+    def operating_mode(self) -> str:
+        """The operating mode as Desk names it, for example ``Execution`` or ``Programming``."""
+        return self._request('GET', '/api/system/operating-mode').json()['status']
+
     def _wait_for_brakes(self, state: str) -> None:
         deadline = time.monotonic() + _BRAKE_TIMEOUT_SEC
         while time.monotonic() < deadline:
@@ -348,12 +367,15 @@ class Desk:
         """Run the TD2 self-test if one is due or overdue, open the brakes, and activate FCI. Requires held control.
 
         Raises `JointRecoveryRequired` while Desk demands a recovery: before any acknowledge or self-test, and when
-        the self-test leaves one.
+        the self-test leaves one. Raises `ProgrammingModeError` in Programming mode, after the check for a demanded
+        recovery and before any other step.
         """
         status = self.safety_status()
         if status['safetyControllerStatus'] == 'SafetyError':
             raise SafetyControllerError(_safety_error_reasons(status))
         self._refuse_demanded_recoveries(status)
+        if self.operating_mode() == PROGRAMMING_MODE:
+            raise ProgrammingModeError()
         if status['timeToTd2'] <= SELF_TEST_LEAD_SEC or _acknowledgeable_errors(status):
             logger.info('TD2 self-test due within %ds, running it now', SELF_TEST_LEAD_SEC)
             self.run_self_test()

@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.12.0] - 2026-10-24
+
+### Added
+- `Desk.operating_mode()`: the operating mode as Desk names it, for example `Execution` or `Programming`. It reads `GET /api/system/operating-mode`.
+- `ProgrammingModeError`: Desk is in Programming mode and refuses FCI. A hand recovery of a joint in Desk can leave this mode, and a control box reboot clears it.
+
+### Changed
+- **Behaviour.** `prepare()` raises `ProgrammingModeError` in Programming mode. It does this after the check for a demanded recovery, and before an acknowledge, a self-test, a brake unlock or an FCI activation. Before, `prepare()` went on to those steps, and Desk refused the FCI activation with `424 ActionUnavailable WrongOperatingMode`.
+
 ## [0.11.0] - 2026-10-22
 
 ### Added
