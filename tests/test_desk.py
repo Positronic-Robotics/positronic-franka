@@ -52,6 +52,7 @@ class FakeDesk:
         recovery_joints: tuple[int, ...] = (),
         test_demands_recovery_of: tuple[int, ...] = (),
         unlock_fails_with: int | None = None,
+        operating_mode: str = 'Execution',
     ):
         """``recovery_joints`` and ``test_demands_recovery_of`` are joint indices as Desk sends them, from 0.
 
@@ -61,6 +62,7 @@ class FakeDesk:
         self.recovery_joints = recovery_joints
         self.test_demands_recovery_of = test_demands_recovery_of
         self.unlock_fails_with = unlock_fails_with
+        self.operating_mode = operating_mode
         self.offline = False
         self.requests: list[str] = []
         self.recoverable_errors = {flag: flag in recoverable_errors for flag in desk._ACKNOWLEDGEABLE_ERRORS}
@@ -103,6 +105,8 @@ class FakeDesk:
         path = url.split('://', 1)[1].split('/', 1)[1]
         if method == 'GET' and path == 'admin/api/safety/status':
             return FakeResponse(self._status())
+        if method == 'GET' and path == 'api/system/operating-mode':
+            return FakeResponse({'status': self.operating_mode})
         if method == 'GET' and path == 'admin/api/control-token':
             return FakeResponse({'activeToken': self.active_token, 'fciActive': False, 'tokenRequest': None})
         self.requests.append(f'{method} {path}')
@@ -241,6 +245,37 @@ def test_prepare_names_the_recovery_a_self_test_leaves_when_desk_refuses_the_bra
 
     assert box.tests_run == 1
     assert box.requests[-1] == 'POST desk/api/joints/unlock'
+
+
+def test_prepare_in_programming_mode_stops_before_any_acknowledge_self_test_or_brake():
+    box = FakeDesk(time_to_td2=600, recoverable_errors=('jointPositionError',), operating_mode=desk.PROGRAMMING_MODE)
+
+    with pytest.raises(desk.ProgrammingModeError, match='Reboot the control box'):
+        _desk_on(box).prepare()
+
+    assert box.requests == []
+    assert box.tests_run == 0
+
+
+def test_prepare_in_programming_mode_names_a_demanded_recovery_first():
+    box = FakeDesk(time_to_td2=600, recovery_joints=(4,), operating_mode=desk.PROGRAMMING_MODE)
+
+    with pytest.raises(desk.JointRecoveryRequired, match='joint 5'):
+        _desk_on(box).prepare()
+
+
+def test_operating_mode_is_the_mode_desk_names():
+    box = FakeDesk(time_to_td2=TD2_PERIOD_SEC, operating_mode=desk.PROGRAMMING_MODE)
+
+    assert _desk_on(box).operating_mode() == desk.PROGRAMMING_MODE
+
+
+def test_programming_mode_error_survives_a_process_boundary():
+    error = desk.ProgrammingModeError()
+
+    copy = pickle.loads(pickle.dumps(error))
+
+    assert str(copy) == str(error)
 
 
 def test_self_test_refuses_a_demanded_recovery_without_turning_the_robot_off():
