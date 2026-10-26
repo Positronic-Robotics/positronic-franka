@@ -435,9 +435,10 @@ class Robot {
   // Inverse Kinematics to the flange pose in base frame (tx, ty, tz, qw, qx, qy, qz)
   Vector7d inverse_kinematics(
       const Eigen::Ref<const Vector7d>& flange_pose_wxyz,
-      double tol = 1e-4, int max_iters = 150, double min_step = 1e-8, double pinv_reg = 0.03,
-      double nullspace_gain = 0.002, double line_search_alpha = 1.0, double line_search_beta = 0.5,
-      int line_search_max_steps = 20) {
+      double tol = DAMPED_IK_TOLERANCE, int max_iters = DAMPED_IK_MAX_ITERATIONS, double min_step = DAMPED_IK_MIN_STEP,
+      double pinv_reg = DAMPED_IK_DAMPING, double nullspace_gain = DAMPED_IK_NULLSPACE_GAIN,
+      double line_search_alpha = DAMPED_IK_LINE_SEARCH_ALPHA, double line_search_beta = DAMPED_IK_LINE_SEARCH_BETA,
+      int line_search_max_steps = DAMPED_IK_LINE_SEARCH_MAX_STEPS) {
     auto base = read_robot_state_();
     Vector7d q0 = Eigen::Map<const Vector7d>(base.q.data());
     return inverse_kinematics_q0(flange_pose_wxyz, q0, tol, max_iters, min_step, pinv_reg, nullspace_gain,
@@ -447,9 +448,10 @@ class Robot {
   Vector7d inverse_kinematics_q0(
       const Eigen::Ref<const Vector7d>& flange_pose_wxyz,
       const Eigen::Ref<const Vector7d>& q0,
-      double tol = 1e-4, int max_iters = 150, double min_step = 1e-8, double pinv_reg = 0.03,
-      double nullspace_gain = 0.002, double line_search_alpha = 1.0, double line_search_beta = 0.5,
-      int line_search_max_steps = 20) {
+      double tol = DAMPED_IK_TOLERANCE, int max_iters = DAMPED_IK_MAX_ITERATIONS, double min_step = DAMPED_IK_MIN_STEP,
+      double pinv_reg = DAMPED_IK_DAMPING, double nullspace_gain = DAMPED_IK_NULLSPACE_GAIN,
+      double line_search_alpha = DAMPED_IK_LINE_SEARCH_ALPHA, double line_search_beta = DAMPED_IK_LINE_SEARCH_BETA,
+      int line_search_max_steps = DAMPED_IK_LINE_SEARCH_MAX_STEPS) {
     franka::RobotState st = read_robot_state_();
     const auto kinematics = [&](const Vector7d& q) {
       st.q = to_std_array7_(q);
