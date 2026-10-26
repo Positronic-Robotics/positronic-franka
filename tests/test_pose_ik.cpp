@@ -2,6 +2,7 @@
 //   g++ -std=c++17 -I src $(pkg-config --cflags eigen3) tests/test_pose_ik.cpp -o test_pose_ik
 //   ./test_pose_ik
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdlib>
@@ -26,8 +27,10 @@ using positronic_franka::IK_POSTURE_JOINTS;
 using positronic_franka::IK_POSTURE_PULL_PER_COMMAND;
 using positronic_franka::Matrix7d;
 using positronic_franka::minimize_on_box;
+using positronic_franka::nullspace_projector;
 using positronic_franka::point_jacobian;
 using positronic_franka::pose_error;
+using positronic_franka::solve_damped_pose_ik;
 using positronic_franka::solve_pose_ik;
 using positronic_franka::SpatialJacobian;
 using positronic_franka::ToolKinematics;
@@ -127,6 +130,48 @@ void a_nearby_pose_away_from_a_singularity_is_reached_within_0_1_mm_and_0_1_deg(
     const Vector7d target = pose_wxyz(fr3_flange(q_target).pose);
     const auto [mm, deg] = miss(solve_pose_ik(fr3_flange, target, q0, IK_MAX_JOINT_STEP), target);
     check(mm < 0.1 && deg < 0.1, "miss " + std::to_string(mm) + " mm, " + std::to_string(deg) + " deg");
+  }
+}
+
+// The damped IK with the defaults of Robot::inverse_kinematics_q0.
+Vector7d damped_ik(const Vector7d& target, const Vector7d& q0) {
+  return solve_damped_pose_ik(fr3_flange, target, q0, 1e-4, 150, 1e-8, 0.03, 0.002, 1.0, 0.5, 20);
+}
+
+// Joints at q0 plus 0.05 rad of normal noise on each, inside the FR3 limits: the targets of ik_verifier.
+std::vector<Vector7d> joints_near(const Vector7d& q0, unsigned int seed, int count) {
+  std::mt19937 rng(seed);
+  std::normal_distribution<double> noise(0.0, 0.05);
+  std::vector<Vector7d> joints;
+  for (int n = 0; n < count; ++n) {
+    Vector7d q = q0;
+    for (int i = 0; i < 7; ++i) {
+      q(i) = std::clamp(q(i) + noise(rng), FR3_JOINT_LOWER_LIMITS[static_cast<size_t>(i)],
+                        FR3_JOINT_UPPER_LIMITS[static_cast<size_t>(i)]);
+    }
+    joints.push_back(q);
+  }
+  return joints;
+}
+
+void the_damped_ik_reaches_a_nearby_pose_within_its_tolerance() {
+  const Vector7d droid_home = (Vector7d() << 0.0, -0.628, 0.0, -2.513, 0.0, 1.885, 0.0).finished();
+  for (const Vector7d& q0 : {posture(), droid_home}) {
+    for (const Vector7d& q_target : joints_near(q0, 17, 100)) {
+      const Vector7d target = pose_wxyz(fr3_flange(q_target).pose);
+      const auto [mm, deg] = miss(damped_ik(target, q0), target);
+      check(mm < 0.1 && deg < 0.01, "miss " + std::to_string(mm) + " mm, " + std::to_string(deg) + " deg");
+    }
+  }
+}
+
+void the_null_space_projector_keeps_the_tool_and_the_one_redundant_direction() {
+  for (const Vector7d& q : joints_near(posture(), 19, 50)) {
+    const SpatialJacobian J = fr3_flange(q).jacobian;
+    const Matrix7d N = nullspace_projector(J);
+    check((J * N).norm() < 1e-12, "a step through the projector moves the tool");
+    check((N * N - N).norm() < 1e-12, "the projector is not idempotent");
+    check(std::abs(N.trace() - 1.0) < 1e-9, "the projector frees " + std::to_string(N.trace()) + " directions, not 1");
   }
 }
 
@@ -334,6 +379,10 @@ int main() {
        minimize_on_box_without_an_active_bound_is_the_newton_step},
       {"a_nearby_pose_away_from_a_singularity_is_reached_within_0_1_mm_and_0_1_deg",
        a_nearby_pose_away_from_a_singularity_is_reached_within_0_1_mm_and_0_1_deg},
+      {"the_damped_ik_reaches_a_nearby_pose_within_its_tolerance",
+       the_damped_ik_reaches_a_nearby_pose_within_its_tolerance},
+      {"the_null_space_projector_keeps_the_tool_and_the_one_redundant_direction",
+       the_null_space_projector_keeps_the_tool_and_the_one_redundant_direction},
       {"every_joint_stays_within_the_step_bound_and_the_fr3_limits",
        every_joint_stays_within_the_step_bound_and_the_fr3_limits},
       {"a_negative_or_nan_step_bound_is_refused", a_negative_or_nan_step_bound_is_refused},

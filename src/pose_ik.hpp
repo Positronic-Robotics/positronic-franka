@@ -8,6 +8,7 @@
 #include <Eigen/Core>
 #include <Eigen/Geometry>
 #include <Eigen/Eigenvalues>
+#include <Eigen/SVD>
 
 #include "impedance_law.hpp"
 
@@ -157,6 +158,13 @@ inline Eigen::Matrix<double, 7, 6> damped_pinv(const SpatialJacobian& J, double 
   return J.transpose() * (J * J.transpose() + lambda * Eigen::Matrix<double, 6, 6>::Identity()).inverse();
 }
 
+// The projector onto the null space of J: a step through it leaves the tool pose unchanged to first order.
+inline Matrix7d nullspace_projector(const SpatialJacobian& J) {
+  const Eigen::JacobiSVD<SpatialJacobian> svd(J, Eigen::ComputeFullV);
+  const auto row_space = svd.matrixV().leftCols(svd.rank());
+  return Matrix7d::Identity() - row_space * row_space.transpose();
+}
+
 // Joints that put the tool at `target_pose_wxyz` (tx, ty, tz, qw, qx, qy, qz), from q0, by damped least-squares
 // steps with a pull of q towards zero in the null space and a backtracking line search. No joint bounds.
 template <typename Kinematics>
@@ -178,7 +186,8 @@ Vector7d solve_damped_pose_ik(const Kinematics& kinematics, const Eigen::Ref<con
     if (err_norm < tol) break;
 
     const Eigen::Matrix<double, 7, 6> J_pinv = damped_pinv(k.jacobian, pinv_reg);
-    const Matrix7d N = Matrix7d::Identity() - J_pinv * k.jacobian;
+    // Not I - J_pinv J: with damping, that matrix moves the tool, and the pull then holds the error above tol.
+    const Matrix7d N = nullspace_projector(k.jacobian);
     const Vector7d dq = -J_pinv * e + N * (-nullspace_gain * std::exp(err_norm) * q);
 
     double step = line_search_alpha;
