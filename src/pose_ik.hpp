@@ -169,9 +169,10 @@ inline Matrix7d nullspace_projector(const SpatialJacobian& J) {
 // steps with a pull of q towards zero in the null space and a backtracking line search. No joint bounds.
 template <typename Kinematics>
 Vector7d solve_damped_pose_ik(const Kinematics& kinematics, const Eigen::Ref<const Vector7d>& target_pose_wxyz,
-                              const Eigen::Ref<const Vector7d>& q0, double tol, int max_iters, double min_step,
-                              double pinv_reg, double nullspace_gain, double line_search_alpha,
-                              double line_search_beta, int line_search_max_steps) {
+                              const Eigen::Ref<const Vector7d>& q0, double tol = 1e-4, int max_iters = 150,
+                              double min_step = 1e-8, double pinv_reg = 0.03, double nullspace_gain = 0.002,
+                              double line_search_alpha = 1.0, double line_search_beta = 0.5,
+                              int line_search_max_steps = 20) {
   const Eigen::Vector3d t_tgt = target_pose_wxyz.head<3>();
   const Eigen::Matrix3d R_tgt =
       Eigen::Quaterniond(target_pose_wxyz(3), target_pose_wxyz(4), target_pose_wxyz(5), target_pose_wxyz(6))

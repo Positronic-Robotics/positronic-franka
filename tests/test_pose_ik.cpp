@@ -133,11 +133,6 @@ void a_nearby_pose_away_from_a_singularity_is_reached_within_0_1_mm_and_0_1_deg(
   }
 }
 
-// The damped IK with the defaults of Robot::inverse_kinematics_q0.
-Vector7d damped_ik(const Vector7d& target, const Vector7d& q0) {
-  return solve_damped_pose_ik(fr3_flange, target, q0, 1e-4, 150, 1e-8, 0.03, 0.002, 1.0, 0.5, 20);
-}
-
 // Joints at q0 plus 0.05 rad of normal noise on each, inside the FR3 limits: the targets of ik_verifier.
 std::vector<Vector7d> joints_near(const Vector7d& q0, unsigned int seed, int count) {
   std::mt19937 rng(seed);
@@ -159,7 +154,7 @@ void the_damped_ik_reaches_a_nearby_pose_within_its_tolerance() {
   for (const Vector7d& q0 : {posture(), droid_home}) {
     for (const Vector7d& q_target : joints_near(q0, 17, 100)) {
       const Vector7d target = pose_wxyz(fr3_flange(q_target).pose);
-      const auto [mm, deg] = miss(damped_ik(target, q0), target);
+      const auto [mm, deg] = miss(solve_damped_pose_ik(fr3_flange, target, q0), target);
       check(mm < 0.1 && deg < 0.01, "miss " + std::to_string(mm) + " mm, " + std::to_string(deg) + " deg");
     }
   }
