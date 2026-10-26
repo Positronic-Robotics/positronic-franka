@@ -152,6 +152,52 @@ inline Vector7d minimize_on_box(const Matrix7d& H, const Vector7d& g, const Vect
   return d;
 }
 
+// J^T (J J^T + lambda I)^-1.
+inline Eigen::Matrix<double, 7, 6> damped_pinv(const SpatialJacobian& J, double lambda) {
+  return J.transpose() * (J * J.transpose() + lambda * Eigen::Matrix<double, 6, 6>::Identity()).inverse();
+}
+
+// Joints that put the tool at `target_pose_wxyz` (tx, ty, tz, qw, qx, qy, qz), from q0, by damped least-squares
+// steps with a pull of q towards zero in the null space and a backtracking line search. No joint bounds.
+template <typename Kinematics>
+Vector7d solve_damped_pose_ik(const Kinematics& kinematics, const Eigen::Ref<const Vector7d>& target_pose_wxyz,
+                              const Eigen::Ref<const Vector7d>& q0, double tol, int max_iters, double min_step,
+                              double pinv_reg, double nullspace_gain, double line_search_alpha,
+                              double line_search_beta, int line_search_max_steps) {
+  const Eigen::Vector3d t_tgt = target_pose_wxyz.head<3>();
+  const Eigen::Matrix3d R_tgt =
+      Eigen::Quaterniond(target_pose_wxyz(3), target_pose_wxyz(4), target_pose_wxyz(5), target_pose_wxyz(6))
+          .normalized()
+          .toRotationMatrix();
+
+  Vector7d q = q0;
+  for (int it = 0; it < max_iters; ++it) {
+    const ToolKinematics k = kinematics(q);
+    const Vector6d e = pose_error(k.pose, t_tgt, R_tgt);
+    const double err_norm = e.norm();
+    if (err_norm < tol) break;
+
+    const Eigen::Matrix<double, 7, 6> J_pinv = damped_pinv(k.jacobian, pinv_reg);
+    const Matrix7d N = Matrix7d::Identity() - J_pinv * k.jacobian;
+    const Vector7d dq = -J_pinv * e + N * (-nullspace_gain * std::exp(err_norm) * q);
+
+    double step = line_search_alpha;
+    double best_err = err_norm;
+    for (int ls = 0; ls < line_search_max_steps; ++ls) {
+      const Vector7d q_trial = q + step * dq;
+      const double err_trial = pose_error(kinematics(q_trial).pose, t_tgt, R_tgt).norm();
+      if (err_trial < best_err) {
+        best_err = err_trial;
+        q = q_trial;
+      }
+      step *= line_search_beta;
+      if (step < min_step) break;
+    }
+    if (best_err >= err_norm - 1e-9) break;  // no step lowers the error
+  }
+  return q;
+}
+
 // Joints that put the tool as close as the bounds allow to `target_pose_wxyz` (tx, ty, tz, qw, qx, qy, qz).
 // Each joint stays within the FR3 limits and within `max_step` of q0; near a singularity the move q - q0 is damped.
 template <typename Kinematics>
