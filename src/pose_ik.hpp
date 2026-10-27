@@ -8,6 +8,7 @@
 #include <Eigen/Core>
 #include <Eigen/Geometry>
 #include <Eigen/Eigenvalues>
+#include <Eigen/SVD>
 
 #include "impedance_law.hpp"
 
@@ -32,6 +33,20 @@ constexpr double IK_MAX_JOINT_STEP = 0.5;
 constexpr std::array<double, 7> IK_POSTURE_JOINTS = {0.0, -0.31, 0.0, -1.65, 0.0, 1.522, 0.0};
 // Part of the null-space offset from IK_POSTURE_JOINTS that one command removes.
 constexpr double IK_POSTURE_PULL_PER_COMMAND = 0.02;
+
+// The damped IK stops when the norm of the pose error is below this value, or after DAMPED_IK_MAX_ITERATIONS steps.
+constexpr double DAMPED_IK_TOLERANCE = 1e-4;
+constexpr int DAMPED_IK_MAX_ITERATIONS = 150;
+// The lambda of the damped pseudo-inverse J^T (J J^T + lambda I)^-1.
+constexpr double DAMPED_IK_DAMPING = 0.03;
+// The gain of the pull of the joints towards zero in the null space.
+constexpr double DAMPED_IK_NULLSPACE_GAIN = 0.002;
+// The line search tries this part of the step first, and multiplies it by DAMPED_IK_LINE_SEARCH_BETA per trial.
+// It stops after DAMPED_IK_LINE_SEARCH_MAX_STEPS trials, or when the part is below DAMPED_IK_MIN_STEP.
+constexpr double DAMPED_IK_LINE_SEARCH_ALPHA = 1.0;
+constexpr double DAMPED_IK_LINE_SEARCH_BETA = 0.5;
+constexpr int DAMPED_IK_LINE_SEARCH_MAX_STEPS = 20;
+constexpr double DAMPED_IK_MIN_STEP = 1e-8;
 
 // The tool pose (4x4, base frame) and its zero Jacobian (6x7, linear rows first) at one q.
 struct ToolKinematics {
@@ -150,6 +165,63 @@ inline Vector7d minimize_on_box(const Matrix7d& H, const Vector7d& g, const Vect
     hold[release] = BoxHold::kFree;
   }
   return d;
+}
+
+// J^T (J J^T + lambda I)^-1.
+inline Eigen::Matrix<double, 7, 6> damped_pinv(const SpatialJacobian& J, double lambda) {
+  return J.transpose() * (J * J.transpose() + lambda * Eigen::Matrix<double, 6, 6>::Identity()).inverse();
+}
+
+// The projector onto the null space of J: a step through it leaves the tool pose unchanged to first order.
+inline Matrix7d nullspace_projector(const SpatialJacobian& J) {
+  const Eigen::JacobiSVD<SpatialJacobian> svd(J, Eigen::ComputeFullV);
+  const auto row_space = svd.matrixV().leftCols(svd.rank());
+  return Matrix7d::Identity() - row_space * row_space.transpose();
+}
+
+// Joints that put the tool at `target_pose_wxyz` (tx, ty, tz, qw, qx, qy, qz), from q0, by damped least-squares
+// steps with a pull of q towards zero in the null space and a backtracking line search. No joint bounds.
+template <typename Kinematics>
+Vector7d solve_damped_pose_ik(const Kinematics& kinematics, const Eigen::Ref<const Vector7d>& target_pose_wxyz,
+                              const Eigen::Ref<const Vector7d>& q0, double tol = DAMPED_IK_TOLERANCE,
+                              int max_iters = DAMPED_IK_MAX_ITERATIONS, double min_step = DAMPED_IK_MIN_STEP,
+                              double pinv_reg = DAMPED_IK_DAMPING, double nullspace_gain = DAMPED_IK_NULLSPACE_GAIN,
+                              double line_search_alpha = DAMPED_IK_LINE_SEARCH_ALPHA,
+                              double line_search_beta = DAMPED_IK_LINE_SEARCH_BETA,
+                              int line_search_max_steps = DAMPED_IK_LINE_SEARCH_MAX_STEPS) {
+  const Eigen::Vector3d t_tgt = target_pose_wxyz.head<3>();
+  const Eigen::Matrix3d R_tgt =
+      Eigen::Quaterniond(target_pose_wxyz(3), target_pose_wxyz(4), target_pose_wxyz(5), target_pose_wxyz(6))
+          .normalized()
+          .toRotationMatrix();
+
+  Vector7d q = q0;
+  for (int it = 0; it < max_iters; ++it) {
+    const ToolKinematics k = kinematics(q);
+    const Vector6d e = pose_error(k.pose, t_tgt, R_tgt);
+    const double err_norm = e.norm();
+    if (err_norm < tol) break;
+
+    const Eigen::Matrix<double, 7, 6> J_pinv = damped_pinv(k.jacobian, pinv_reg);
+    // Not I - J_pinv J: with damping, that matrix moves the tool, and the pull then holds the error above tol.
+    const Matrix7d N = nullspace_projector(k.jacobian);
+    const Vector7d dq = -J_pinv * e + N * (-nullspace_gain * std::exp(err_norm) * q);
+
+    double step = line_search_alpha;
+    double best_err = err_norm;
+    for (int ls = 0; ls < line_search_max_steps; ++ls) {
+      const Vector7d q_trial = q + step * dq;
+      const double err_trial = pose_error(kinematics(q_trial).pose, t_tgt, R_tgt).norm();
+      if (err_trial < best_err) {
+        best_err = err_trial;
+        q = q_trial;
+      }
+      step *= line_search_beta;
+      if (step < min_step) break;
+    }
+    if (best_err >= err_norm - 1e-9) break;  // no step lowers the error
+  }
+  return q;
 }
 
 // Joints that put the tool as close as the bounds allow to `target_pose_wxyz` (tx, ty, tz, qw, qx, qy, qz).

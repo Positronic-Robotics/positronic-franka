@@ -1,5 +1,13 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+- `solve_damped_pose_ik` and `nullspace_projector` in `pose_ik.hpp`. `solve_damped_pose_ik` is the solver of `inverse_kinematics`, and it takes the kinematics as an argument. `tests/test_pose_ik.cpp` checks both on the FR3 flange kinematics.
+
+### Fixed
+- `inverse_kinematics` stopped 0.5 to 0.8 mm from most reachable targets near the start joints. Its pull of the joints towards zero went through `I - J⁺J` with the damped pseudo-inverse `J⁺`. With damping, that matrix moves the flange, so the pull held the error above the stop tolerance `tol`. Now the pull goes through the null-space projector of the flange Jacobian, and the solver stops within `tol`. `ik_verifier` failed its Damped IK check on about half of its targets, and now passes it. `inverse_kinematics_with_limits` does not change.
+
 ## [0.12.0] - 2026-10-24
 
 ### Added
