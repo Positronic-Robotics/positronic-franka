@@ -8,6 +8,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -73,6 +74,20 @@ class Model {
   std::array<double, 42> zeroJacobian(Frame, const RobotState&) const { return {}; }
   std::array<double, 7> coriolis(const RobotState&) const { return {}; }
 };
+
+// No speed limit at any position: these tests do not move near a joint limit. test_impedance_law checks the
+// reference against the real libfranka limit.
+inline std::array<double, 7> computeUpperLimitsJointVelocity(const std::array<double, 7>&) {
+  std::array<double, 7> limit;
+  limit.fill(std::numeric_limits<double>::infinity());
+  return limit;
+}
+
+inline std::array<double, 7> computeLowerLimitsJointVelocity(const std::array<double, 7>&) {
+  std::array<double, 7> limit;
+  limit.fill(-std::numeric_limits<double>::infinity());
+  return limit;
+}
 
 namespace fake {
 
