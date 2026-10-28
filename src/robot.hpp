@@ -593,8 +593,8 @@ private:
   //   tau = (J^T Kx J + Kq)(q_d - q) - (J^T Kxd J + Kqd) dq + coriolis
   // with the spring term rate-capped (impedance_law.hpp). Gravity is compensated by libfranka underneath the
   // torque command. Shares the target/stop/goal machinery with the position loop; only the reference differs:
-  // q_d moves to each target in a straight line at max_reference_speed, where the position loop shapes a Ruckig
-  // trajectory.
+  // q_d moves to each target in a straight line at max_reference_speed, and slower near a joint position limit
+  // (move_reference_toward), where the position loop shapes a Ruckig trajectory.
   void run_joint_torque_control_(SoftwareImpedance imp) {
     Vector7d Kq = Eigen::Map<const Vector7d>(imp.kq.data());
     Vector7d Kqd = Eigen::Map<const Vector7d>(imp.kqd.data());
