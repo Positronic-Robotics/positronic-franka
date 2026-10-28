@@ -1,8 +1,9 @@
-// Checks the joint trajectory generator in trajectory_generator.hpp. Needs Eigen and the vendored Ruckig, not libfranka.
+// Checks the joint trajectory generator in trajectory_generator.hpp. Needs Eigen, the vendored Ruckig and the libfranka
+// header franka/rate_limiting.h, not the libfranka library.
 // Ruckig needs C++20. Build it once, then this test:
 //   for f in $(ls external/ruckig/src/ruckig/*.cpp | grep -v -e cloud_client -e python); do
 //     g++ -std=c++20 -O2 -I external/ruckig/include -c $f -o $(basename $f .cpp).o; done
-//   g++ -std=c++20 -I src -I external/ruckig/include $(pkg-config --cflags eigen3) tests/test_trajectory_generator.cpp *.o
+//   g++ -std=c++20 -I src -I <libfranka>/include -I external/ruckig/include $(pkg-config --cflags eigen3) tests/test_trajectory_generator.cpp *.o
 //   ./a.out
 
 #include <array>

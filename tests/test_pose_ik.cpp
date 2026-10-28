@@ -1,5 +1,6 @@
-// Checks the pose IK in pose_ik.hpp on the FR3 flange kinematics. Needs only Eigen, not libfranka:
-//   g++ -std=c++17 -I src $(pkg-config --cflags eigen3) tests/test_pose_ik.cpp -o test_pose_ik
+// Checks the pose IK in pose_ik.hpp on the FR3 flange kinematics. Needs Eigen and the libfranka header
+// franka/rate_limiting.h, not the libfranka library:
+//   g++ -std=c++17 -I src -I <libfranka>/include $(pkg-config --cflags eigen3) tests/test_pose_ik.cpp -o test_pose_ik
 //   ./test_pose_ik
 
 #include <algorithm>

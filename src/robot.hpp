@@ -93,7 +93,8 @@ struct InternalImpedance {
 // Per-joint spring torque rate cap, Nm/s, tuned for the default SoftwareImpedance gains.
 constexpr std::array<double, 7> DEFAULT_MAX_SPRING_TORQUE_RATE = {130.0, 130.0, 130.0, 130.0, 85.0, 60.0, 35.0};
 // Per-joint speed, rad/s, at which the spring reference q_d moves to a new target. Recorded policy motion stays
-// below 1.3 rad/s on every joint over any 0.2 s. The FR3 limit on joints 1 to 4 is 2.62 rad/s.
+// below 1.3 rad/s on every joint over any 0.2 s. The FR3 limit on joints 1 to 4 is 2.62 rad/s. Near a joint position
+// limit, the FR3 limit falls, and move_reference_toward slows q_d below it (impedance_law.hpp).
 constexpr std::array<double, 7> DEFAULT_MAX_REFERENCE_SPEED = {1.5, 1.5, 1.5, 1.5, 1.5, 1.5, 1.5};
 // The point the SoftwareImpedance Cartesian terms act at, in flange axes from the flange origin, m: the flange.
 constexpr std::array<double, 3> DEFAULT_STIFFNESS_POINT = {0.0, 0.0, 0.0};
@@ -649,7 +650,8 @@ private:
           }
 
           // No trajectory here: the impedance law moves the arm. The speed cap on q_d keeps a large jump in the
-          // target from becoming a large spring pull, at any command rate.
+          // target from becoming a large spring pull, at any command rate, and keeps q_d below the FR3 joint speed
+          // limit near a joint position limit.
           ref = move_reference_toward(ref, target, max_reference_speed, period.toSec());
 
           // The position loop's arrival rule: there is no arrival to test while the reference still moves.
