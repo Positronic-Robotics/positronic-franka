@@ -5,6 +5,11 @@
 ### Added
 - `solve_damped_pose_ik` and `nullspace_projector` in `pose_ik.hpp`. `solve_damped_pose_ik` is the solver of `inverse_kinematics`, and it takes the kinematics as an argument. `tests/test_pose_ik.cpp` checks both on the FR3 flange kinematics.
 
+### Changed
+- **Behaviour.** In `SoftwareImpedance`, each joint of the reference `q_d` moves at most at `REFERENCE_SHARE_OF_FR3_SPEED_LIMIT` (0.8) of the FR3 position-dependent joint speed limit, in the direction of its target. libfranka computes that limit (`computeUpperLimitsJointVelocity` and `computeLowerLimitsJointVelocity` in `franka/rate_limiting.h`). The limit falls to zero near each joint position limit. libfranka applies it to its position and velocity generators, not to a torque command, so the arm could stop with `joint_velocity_violation` near a joint limit while `q_d` moved at the flat `max_reference_speed`. Far from the limits, `max_reference_speed` alone sets the speed, as before. All joints still arrive together, so a joint near its limit slows the whole move. Motion away from a limit is not slowed.
+- On joints 1, 4 and 6, the FR3 speed limit is zero from 1 to 8 mrad inside the position limits `FR3_JOINT_LOWER_LIMITS` and `FR3_JOINT_UPPER_LIMITS` (on joint 5, from 0.02 mrad). `q_d` stops there, so a goal in that band does not report `REACHED`, and it ends at its deadline.
+- The Eigen-only tests in CI take `franka/rate_limiting.h` from libfranka 0.15.3. `impedance_law.hpp` needs that header, not the libfranka library.
+
 ### Fixed
 - `inverse_kinematics` stopped 0.5 to 0.8 mm from most reachable targets near the start joints. Its pull of the joints towards zero went through `I - J⁺J` with the damped pseudo-inverse `J⁺`. With damping, that matrix moves the flange, so the pull held the error above the stop tolerance `tol`. Now the pull goes through the null-space projector of the flange Jacobian, and the solver stops within `tol`. `ik_verifier` failed its Damped IK check on about half of its targets, and now passes it. `inverse_kinematics_with_limits` does not change.
 
