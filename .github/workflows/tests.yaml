@@ -118,6 +118,16 @@ jobs:
         with:
           submodules: recursive
 
+      # Ruckig includes <format>, which GCC 13 is the first to ship. Ubuntu 22.04 carries GCC 11.
+      - name: Install GCC 13
+        if: matrix.os == 'ubuntu-22.04'
+        run: |
+          sudo add-apt-repository -y ppa:ubuntu-toolchain-r/test
+          sudo apt-get update
+          sudo apt-get install -y gcc-13 g++-13
+          echo "CC=gcc-13" >> "$GITHUB_ENV"
+          echo "CXX=g++-13" >> "$GITHUB_ENV"
+
       - name: Install the libfranka dependencies
         run: |
           sudo apt-get update
@@ -132,6 +142,8 @@ jobs:
           sudo apt-get install -y robotpkg-pinocchio
           echo "PINOCCHIO_VERSION=$(dpkg-query -W -f='${Version}' robotpkg-pinocchio)" >> "$GITHUB_ENV"
           echo "LIBFRANKA_PREFIX=$HOME/libfranka-install" >> "$GITHUB_ENV"
+          # The linker reads it to find Pinocchio under libfranka, and the loader reads it to find both.
+          echo "LD_LIBRARY_PATH=$HOME/libfranka-install/lib:$ROBOTPKG_PREFIX/lib" >> "$GITHUB_ENV"
 
       # libfranka links Pinocchio, so a new Pinocchio package builds libfranka again.
       - name: Restore libfranka
@@ -162,7 +174,6 @@ jobs:
       # libfranka puts major.minor in its soname, so the soname names the libfranka that the extension loads.
       - name: Load the extension and check its libfranka
         run: |
-          export LD_LIBRARY_PATH="$LIBFRANKA_PREFIX/lib:$ROBOTPKG_PREFIX/lib"
           version="${{ matrix.libfranka }}"
           extension=$(.venv/bin/python -c 'import positronic_franka._franka as m; print(m.__file__)')
           ldd "$extension" | grep libfranka
