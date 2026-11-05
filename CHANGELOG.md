@@ -3,6 +3,7 @@
 ## [Unreleased]
 
 ### Added
+- CI builds the extension against libfranka 0.15.3 and 0.21.3, on Ubuntu 22.04 and 24.04, and checks that it loads the libfranka it was built against. The source needs no change for 0.21.3. The README states which libfranka each robot system version needs: 0.15.3 before system version 5.9.0, and 0.21.3 from 5.9.0. It also lists the two extra packages that 0.21.3 needs, `libconsole-bridge-dev` and `libtinyxml2-dev`.
 - `solve_damped_pose_ik` and `nullspace_projector` in `pose_ik.hpp`. `solve_damped_pose_ik` is the solver of `inverse_kinematics`, and it takes the kinematics as an argument. `tests/test_pose_ik.cpp` checks both on the FR3 flange kinematics.
 
 ### Fixed
