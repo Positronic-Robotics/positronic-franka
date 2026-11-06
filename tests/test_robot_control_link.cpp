@@ -64,6 +64,8 @@ Vector7d offset_on_joint_1(const Vector7d& q, double rad) {
   return target;
 }
 
+Vector7d offset_on_every_joint(const Vector7d& q, double rad) { return (q.array() + rad).matrix(); }
+
 bool contains(const std::string& text, const std::string& part) { return text.find(part) != std::string::npos; }
 
 void the_default_control_link_timeout_is_10_s() {
@@ -168,6 +170,20 @@ void a_longer_timeout_does_not_flag_a_shorter_stall() {
   robot.stop();
 }
 
+// The end of this move carries rounding residue in position and velocity, and Ruckig refuses to time a new plan from
+// there to the same target.
+void a_repeated_target_after_arrival_is_reached_again() {
+  Robot robot = make_robot();
+  const Vector7d target = offset_on_every_joint(current_q(robot), 0.693);
+  robot.set_target_joints(target);
+  check(wait_until([&] { return robot.goal().status == GoalStatus::REACHED; }), "the first move is reached");
+  robot.set_target_joints(target);
+  check(wait_until([&] { return robot.goal().status != GoalStatus::IN_FLIGHT; }), "the repeated move ends");
+  const auto goal = robot.goal();
+  check(goal.status == GoalStatus::REACHED, "the repeated move is reached, not aborted: " + goal.reason);
+  robot.stop();
+}
+
 }  // namespace
 
 int main() {
@@ -183,6 +199,7 @@ int main() {
       {"a_loop_that_resumes_after_state_reported_the_stall_brakes",
        a_loop_that_resumes_after_state_reported_the_stall_brakes},
       {"a_longer_timeout_does_not_flag_a_shorter_stall", a_longer_timeout_does_not_flag_a_shorter_stall},
+      {"a_repeated_target_after_arrival_is_reached_again", a_repeated_target_after_arrival_is_reached_again},
   };
   int failed = 0;
   for (const auto& [name, test] : tests) {

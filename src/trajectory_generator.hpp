@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <iostream>
+#include <optional>
 
 #include <ruckig/ruckig.hpp>
 
@@ -40,21 +41,29 @@ class TrajectoryGenerator {
     input_.current_velocity.fill(0.0);
     input_.current_acceleration.fill(0.0);
     input_.target_position = q_d;
+    playing_plan_target_.reset();
     replan_();
   }
 
   // Returns whether the plan to the new target was accepted; on failure the previous plan keeps playing.
+  // A target equal to the target of the playing plan keeps that plan, also after the plan ends. A new plan re-times
+  // every joint, and Ruckig often refuses one from the rounding residue at the end of a plan (error -111).
   bool set_target(const Vector7d& target) {
+    std::array<double, 7> position;
+    for (size_t i = 0; i < 7; ++i) position[i] = target[i];
+    if (playing_plan_target_ == position) return true;
     input_.control_interface = ruckig::ControlInterface::Position;
-    for (size_t i = 0; i < 7; ++i) input_.target_position[i] = target[i];
-    return replan_();
+    input_.target_position = position;
+    if (!replan_()) return false;
+    playing_plan_target_ = position;
+    return true;
   }
 
   // Brakes every joint to zero speed, and the arm rests where the brake ends. A plan back to the position
   // at the stop call is refused often, and a refused plan keeps the arm going to the old target.
   void brake_to_rest() {
     input_.control_interface = ruckig::ControlInterface::Velocity;
-    replan_();
+    if (replan_()) playing_plan_target_.reset();
   }
 
   // Advances the trajectory by `dt_s` seconds and returns the position. libfranka reports a zero period
@@ -103,6 +112,8 @@ class TrajectoryGenerator {
   ruckig::Ruckig<7> otg_{NOMINAL_DT};
   ruckig::InputParameter<7> input_;
   ruckig::Trajectory<7> trajectory_;
+  // Where the playing plan ends; empty while it is a brake or the hold of `start_at_rest`.
+  std::optional<std::array<double, 7>> playing_plan_target_;
   double cumulative_time_ = 0.0;
   double duration_ = 0.0;
   bool active_ = false;

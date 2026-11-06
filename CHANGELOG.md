@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.12.1] - 2026-11-06
 
 ### Added
 - CI builds the extension against libfranka 0.15.3 and 0.21.3, on Ubuntu 22.04 and 24.04, and checks that it loads the libfranka it was built against. The source needs no change for 0.21.3. The README states which libfranka each robot system version needs: 0.15.3 before system version 5.9.0, and 0.21.3 from 5.9.0. It also lists the two extra packages that 0.21.3 needs, `libconsole-bridge-dev` and `libtinyxml2-dev`.
@@ -8,6 +8,7 @@
 
 ### Fixed
 - `inverse_kinematics` stopped 0.5 to 0.8 mm from most reachable targets near the start joints. Its pull of the joints towards zero went through `I - J⁺J` with the damped pseudo-inverse `J⁺`. With damping, that matrix moves the flange, so the pull held the error above the stop tolerance `tol`. Now the pull goes through the null-space projector of the flange Jacobian, and the solver stops within `tol`. `ik_verifier` failed its Damped IK check on about half of its targets, and now passes it. `inverse_kinematics_with_limits` does not change.
+- Under `InternalImpedance`, `set_target_joints` with the target of the move in flight could end that move. The driver made a new plan from where the arm was, and Ruckig often refused a plan from the end of a plan to its own target (error -111). The goal then reported `ABORTED` with `joint target rejected by the trajectory planner`, and the arm braked short of the target. Now a target equal to the target of the playing plan keeps that plan, also after the plan ends, and the new goal gets its own deadline. A repeated target mid-move also re-timed the joints before, so the path of the arm changed. A different target, and a target after a brake, make a new plan as before.
 
 ## [0.12.0] - 2026-10-24
 
