@@ -142,7 +142,6 @@ void a_brake_after_a_move_ends_holds_the_arm_where_it_is() {
   }
 }
 
-// A new plan to the same target re-times every joint from where the arm is, so the path changes.
 void a_repeated_target_mid_move_keeps_the_plan_that_plays() {
   std::mt19937 rng(13);
   for (int k = 0; k < 20; ++k) {
@@ -164,8 +163,6 @@ void a_repeated_target_mid_move_keeps_the_plan_that_plays() {
   }
 }
 
-// The end of a plan carries rounding residue in position and velocity. Ruckig often refuses to time a new plan
-// across that residue to the same target.
 void a_repeated_target_after_the_plan_ends_holds_the_arm() {
   std::mt19937 rng(17);
   for (int k = 0; k < 40; ++k) {

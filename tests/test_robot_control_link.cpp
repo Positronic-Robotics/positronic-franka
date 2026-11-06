@@ -168,8 +168,7 @@ void a_longer_timeout_does_not_flag_a_shorter_stall() {
   robot.stop();
 }
 
-// The end of this move carries rounding residue in position and velocity, and Ruckig refuses to time a new plan from
-// there to the same target.
+// Ruckig refuses a new plan from the end of this move to its own target.
 void a_repeated_target_after_arrival_is_reached_again() {
   Robot robot = make_robot();
   const Vector7d target = (current_q(robot).array() + 0.693).matrix();
