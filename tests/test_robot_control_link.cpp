@@ -64,8 +64,6 @@ Vector7d offset_on_joint_1(const Vector7d& q, double rad) {
   return target;
 }
 
-Vector7d offset_on_every_joint(const Vector7d& q, double rad) { return (q.array() + rad).matrix(); }
-
 bool contains(const std::string& text, const std::string& part) { return text.find(part) != std::string::npos; }
 
 void the_default_control_link_timeout_is_10_s() {
@@ -174,7 +172,7 @@ void a_longer_timeout_does_not_flag_a_shorter_stall() {
 // there to the same target.
 void a_repeated_target_after_arrival_is_reached_again() {
   Robot robot = make_robot();
-  const Vector7d target = offset_on_every_joint(current_q(robot), 0.693);
+  const Vector7d target = (current_q(robot).array() + 0.693).matrix();
   robot.set_target_joints(target);
   check(wait_until([&] { return robot.goal().status == GoalStatus::REACHED; }), "the first move is reached");
   robot.set_target_joints(target);
