@@ -22,6 +22,10 @@ constexpr std::array<double, 7> FR3_JOINT_LOWER_LIMITS = {
     -2.7437, -1.7837, -2.9007, -3.0421, -2.8065, 0.5445, -3.0159};
 constexpr std::array<double, 7> FR3_JOINT_UPPER_LIMITS = {
     2.7437, 1.7837, 2.9007, -0.1518, 2.8065, 4.5169, 3.0159};
+// The live IK keeps joint 4 at or below -0.7 rad. From a straighter elbow, the IK pushes joint 4 into its
+// limit and cannot fold the arm back to a lower target. The bound costs 1.6 cm of reach.
+constexpr std::array<double, 7> IK_JOINT_UPPER_LIMITS = {
+    2.7437, 1.7837, 2.9007, -0.7, 2.8065, 4.5169, 3.0159};
 
 // The IK damps the move when the smallest singular value of the tool Jacobian is below this value.
 // The rotation rows count 1 m per rad.
@@ -259,6 +263,8 @@ Vector7d solve_pose_ik(const Kinematics& kinematics, const Eigen::Ref<const Vect
     // The step term goes first: std::max and std::min return their first argument when the other is NaN.
     lower(i) = std::max(q0(i) - max_step, FR3_JOINT_LOWER_LIMITS[i]);
     upper(i) = std::min(q0(i) + max_step, FR3_JOINT_UPPER_LIMITS[i]);
+    // A joint above its IK bound moves back towards it by up to max_step per command.
+    upper(i) = std::min(upper(i), std::max(IK_JOINT_UPPER_LIMITS[i], lower(i)));
   }
   // minimize_on_box needs a box that holds a point. NaN fails the comparison too.
   if (!(lower.array() <= upper.array()).all())

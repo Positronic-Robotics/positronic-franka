@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.12.2] - 2026-11-07
+
+### Changed
+- **Behaviour.** `inverse_kinematics_with_limits` keeps joint 4 at or below -0.7 rad (`IK_JOINT_UPPER_LIMITS` in `pose_ik.hpp`). The FR3 allows -0.1518 rad. After a far reach, the elbow was straight, at its limit. A later command to a lower pose then pushed joint 4 into the limit again, and the arm stopped 0.2 to 0.4 m from the command. The arm could reach that pose only with the elbow bent by about 2.4 rad, and the IK did not find that answer. Now the IK finds it: along a 30-call path from a straight elbow to a bent-elbow target, 49 of 60 random cases reach the target, and 9 of 60 before. The bound costs 1.6 cm of reach at full stretch (0.603 m to 0.588 m from the shoulder to the flange).
+- A measured joint 4 above -0.7 rad moves back towards the bound by up to the step bound per command.
+
 ## [0.12.1] - 2026-11-06
 
 ### Added

@@ -22,6 +22,7 @@ using positronic_franka::flange_pose;
 using positronic_franka::FR3_JOINT_LOWER_LIMITS;
 using positronic_franka::FR3_JOINT_UPPER_LIMITS;
 using positronic_franka::IK_DAMPING_SINGULAR_VALUE;
+using positronic_franka::IK_JOINT_UPPER_LIMITS;
 using positronic_franka::IK_MAX_JOINT_STEP;
 using positronic_franka::IK_POSTURE_JOINTS;
 using positronic_franka::IK_POSTURE_PULL_PER_COMMAND;
@@ -217,14 +218,14 @@ void a_start_farther_than_the_step_outside_a_limit_is_refused() {
   check(refuses(q0, IK_MAX_JOINT_STEP), "a NaN start was accepted");
 }
 
-void an_infinite_step_bound_leaves_only_the_fr3_limits() {
+void an_infinite_step_bound_leaves_only_the_ik_limits() {
   check(!refuses_step(INFINITY), "an infinite step was refused");
   const Vector7d q0 = posture();
   const Vector7d q_target = q0 + Vector7d::Constant(0.8);
   const Vector7d q = solve_pose_ik(fr3_flange, pose_wxyz(fr3_flange(q_target).pose), q0, INFINITY);
   check((q - q0).cwiseAbs().maxCoeff() > IK_MAX_JOINT_STEP, "a joint was held to the default step");
   check((q.array() >= limit(FR3_JOINT_LOWER_LIMITS).array()).all() &&
-            (q.array() <= limit(FR3_JOINT_UPPER_LIMITS).array()).all(),
+            (q.array() <= limit(IK_JOINT_UPPER_LIMITS).array()).all(),
         "a joint left its limits");
 }
 
@@ -233,6 +234,94 @@ void a_zero_step_bound_holds_every_joint() {
   const Vector7d q0 = posture();
   const Vector7d target = pose_wxyz(fr3_flange(q0 + Vector7d::Constant(0.1)).pose);
   check((solve_pose_ik(fr3_flange, target, q0, 0.0) - q0).norm() == 0.0, "a joint moved with a zero step");
+}
+
+// Joints and the flange target (x, y, z, w, qx, qy, qz) of three teleop commands after a far reach.
+// The elbow is straight: joint 4 is at -0.2013 rad, near its FR3 limit of -0.1518 rad.
+std::vector<std::pair<Vector7d, Vector7d>> straight_elbow_commands() {
+  const double rows[3][14] = {
+      {-0.2734, 0.6107, 0.0647, -0.2013, 0.2187, 0.8372, -0.4902, 0.2976, -0.0403, 0.4802, -0.076, 0.9758, 0.1905,
+       0.0758},
+      {0.1816, 0.6122, 0.0931, -0.2013, 0.2276, 0.7289, -0.0055, 0.3258, 0.1072, 0.5406, -0.1056, 0.9717, 0.2113,
+       -0.0076},
+      {0.229, 0.6402, 0.0681, -0.2013, 0.1078, 0.8693, 0.0856, 0.3385, 0.1063, 0.5282, -0.0712, 0.9874, 0.1325,
+       0.049}};
+  std::vector<std::pair<Vector7d, Vector7d>> commands;
+  for (const auto& row : rows) commands.emplace_back(Eigen::Map<const Vector7d>(row), Eigen::Map<const Vector7d>(row + 7));
+  return commands;
+}
+
+// The joints after `commands` calls of the live IK, each from the joints of the call before.
+Vector7d follow(Vector7d q, const Vector7d& target, int commands, double step = IK_MAX_JOINT_STEP) {
+  for (int n = 0; n < commands; ++n) q = solve_pose_ik(fr3_flange, target, q, step);
+  return q;
+}
+
+void after_a_far_reach_a_held_lower_target_is_reached_from_a_straight_elbow() {
+  for (const auto& [q0, target] : straight_elbow_commands()) {
+    const auto [mm, deg] = miss(follow(q0, target, 30), target);
+    check(mm < 0.1 && deg < 0.1, "miss " + std::to_string(mm) + " mm, " + std::to_string(deg) + " deg");
+  }
+}
+
+void a_target_with_joint_4_at_its_ik_bound_is_reached() {
+  for (const double j4 : {IK_JOINT_UPPER_LIMITS[3], IK_JOINT_UPPER_LIMITS[3] - 0.05}) {
+    Vector7d q_target = posture();
+    q_target(3) = j4;
+    const Vector7d q0 = posture() + Vector7d::Constant(0.05);
+    const Vector7d target = pose_wxyz(fr3_flange(q_target).pose);
+    const auto [mm, deg] = miss(follow(q0, target, 30), target);
+    check(mm < 0.1 && deg < 0.1, "joint 4 at " + std::to_string(j4) + ": miss " + std::to_string(mm) + " mm");
+  }
+}
+
+void a_measured_joint_4_above_its_ik_bound_moves_back_by_up_to_the_step() {
+  for (const double step : {IK_MAX_JOINT_STEP, 0.05}) {
+    for (const double j4 : {FR3_JOINT_UPPER_LIMITS[3], -0.4, IK_JOINT_UPPER_LIMITS[3] + 0.01}) {
+      Vector7d q0 = posture();
+      q0(3) = j4;
+      check(!refuses(q0, step), "a start with joint 4 at " + std::to_string(j4) + " was refused");
+      const Vector7d q = solve_pose_ik(fr3_flange, pose_wxyz(fr3_flange(q0).pose), q0, step);
+      const double highest = std::max(IK_JOINT_UPPER_LIMITS[3], j4 - step);
+      check(q(3) >= j4 - step - 1e-12 && q(3) <= highest + 1e-12,
+            "joint 4 went from " + std::to_string(j4) + " to " + std::to_string(q(3)) + " with a step of " +
+                std::to_string(step));
+    }
+  }
+}
+
+// Random straight-elbow starts and bent-elbow targets 0.1 m or more away, in front of the base and above the
+// table. The command moves along a straight path to the target in 30 calls, then holds for 30 calls.
+void from_a_straight_elbow_most_bent_elbow_targets_are_reached_along_a_path() {
+  std::mt19937 rng(29);
+  const auto uniform = [&](double lo, double hi) { return std::uniform_real_distribution<double>(lo, hi)(rng); };
+  const auto config = [&](double lo4, double hi4) {
+    for (;;) {
+      Vector7d q;
+      q << uniform(-1.2, 1.2), uniform(-0.6, 1.4), uniform(-0.8, 0.8), uniform(lo4, hi4), uniform(-1.0, 1.0),
+          uniform(0.8, 3.4), uniform(-2.0, 2.0);
+      const Eigen::Vector3d p = fr3_flange(q).pose.block<3, 1>(0, 3);
+      if (p.z() > 0.12 && p.x() > 0.25) return q;
+    }
+  };
+  int reached = 0, cases = 0;
+  while (cases < 60) {
+    Vector7d q = config(-0.25, FR3_JOINT_UPPER_LIMITS[3]);
+    const Vector7d a = pose_wxyz(fr3_flange(q).pose), b = pose_wxyz(fr3_flange(config(-2.6, -0.7)).pose);
+    if ((a.head<3>() - b.head<3>()).norm() < 0.1) continue;
+    ++cases;
+    const Eigen::Quaterniond qa(a(3), a(4), a(5), a(6)), qb(b(3), b(4), b(5), b(6));
+    for (int n = 0; n < 60; ++n) {
+      const double s = std::min(1.0, (n + 1) / 30.0);
+      const Eigen::Quaterniond r = qa.slerp(s, qb);
+      Vector7d target;
+      target << (1 - s) * a.head<3>() + s * b.head<3>(), r.w(), r.x(), r.y(), r.z();
+      q = solve_pose_ik(fr3_flange, target, q, IK_MAX_JOINT_STEP);
+    }
+    const auto [mm, deg] = miss(q, b);
+    if (mm < 1.0 && deg < 0.5) ++reached;
+  }
+  check(reached >= 45, std::to_string(reached) + " of 60 targets reached");
 }
 
 // A measured FR3 pose just before a wrist-singularity spin: joint 6 near pi, s_min 0.043 at the flange.
@@ -384,7 +473,14 @@ int main() {
       {"a_zero_step_bound_holds_every_joint", a_zero_step_bound_holds_every_joint},
       {"a_start_farther_than_the_step_outside_a_limit_is_refused",
        a_start_farther_than_the_step_outside_a_limit_is_refused},
-      {"an_infinite_step_bound_leaves_only_the_fr3_limits", an_infinite_step_bound_leaves_only_the_fr3_limits},
+      {"an_infinite_step_bound_leaves_only_the_ik_limits", an_infinite_step_bound_leaves_only_the_ik_limits},
+      {"after_a_far_reach_a_held_lower_target_is_reached_from_a_straight_elbow",
+       after_a_far_reach_a_held_lower_target_is_reached_from_a_straight_elbow},
+      {"a_target_with_joint_4_at_its_ik_bound_is_reached", a_target_with_joint_4_at_its_ik_bound_is_reached},
+      {"a_measured_joint_4_above_its_ik_bound_moves_back_by_up_to_the_step",
+       a_measured_joint_4_above_its_ik_bound_moves_back_by_up_to_the_step},
+      {"from_a_straight_elbow_most_bent_elbow_targets_are_reached_along_a_path",
+       from_a_straight_elbow_most_bent_elbow_targets_are_reached_along_a_path},
       {"near_a_singularity_the_weak_direction_gain_is_at_most_one_over_the_threshold",
        near_a_singularity_the_weak_direction_gain_is_at_most_one_over_the_threshold},
       {"near_a_singularity_the_damping_keeps_a_wrist_command_inside_the_step_bound",
