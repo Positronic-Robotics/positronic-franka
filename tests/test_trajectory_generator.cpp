@@ -142,6 +142,72 @@ void a_brake_after_a_move_ends_holds_the_arm_where_it_is() {
   }
 }
 
+void a_repeated_target_mid_move_keeps_the_plan_that_plays() {
+  std::mt19937 rng(13);
+  for (int k = 0; k < 20; ++k) {
+    TrajectoryGenerator traj(DYNAMICS_FACTOR);
+    traj.start_at_rest(PARK);
+    const Vector7d target = random_target(rng);
+    check(traj.set_target(target), "plan refused");
+    traj.step(0.0);
+    for (int tick = 1; traj.active(); ++tick) {
+      traj.step(0.001);
+      if (tick % 50 != 0) continue;
+      TrajectoryGenerator repeated = traj;
+      check(repeated.set_target(target), "the repeated target was refused mid-move");
+      TrajectoryGenerator kept = traj;
+      while (kept.active() || repeated.active()) {
+        check(max_offset(repeated.step(0.001), kept.step(0.001)) == 0.0, "the repeated target changed the plan");
+      }
+    }
+  }
+}
+
+void a_repeated_target_after_the_plan_ends_holds_the_arm() {
+  std::mt19937 rng(17);
+  for (int k = 0; k < 40; ++k) {
+    TrajectoryGenerator traj(DYNAMICS_FACTOR);
+    traj.start_at_rest(PARK);
+    const Vector7d target = random_target(rng);
+    check(traj.set_target(target), "plan refused");
+    const auto end = play_out(traj);
+    check(traj.set_target(target), "the repeated target was refused after the plan ended");
+    check(max_offset(play_out(traj), end) == 0.0, "the repeated target moved the arm");
+  }
+}
+
+void a_new_target_mid_move_plans_a_move_to_it() {
+  std::mt19937 rng(19);
+  std::uniform_int_distribution<> retarget_tick(1, 1500);
+  for (int k = 0; k < 50; ++k) {
+    TrajectoryGenerator traj(DYNAMICS_FACTOR);
+    traj.start_at_rest(PARK);
+    check(traj.set_target(random_target(rng)), "plan refused");
+    traj.step(0.0);
+    for (int i = retarget_tick(rng); i > 0 && traj.active(); --i) traj.step(0.001);
+    const Vector7d next = random_target(rng);
+    check(traj.set_target(next), "the new target was refused mid-move");
+    const auto end = play_out(traj);
+    for (size_t i = 0; i < 7; ++i) check(std::abs(end[i] - next[i]) < 1e-9, "the move ended off the new target");
+  }
+}
+
+// A brake leaves the target of the move it stopped in place, and the arm short of it.
+void a_repeated_target_after_a_brake_plans_a_move_to_it() {
+  TrajectoryGenerator traj(DYNAMICS_FACTOR);
+  traj.start_at_rest(PARK);
+  const Vector7d target = park_plus(0.4);
+  check(traj.set_target(target), "plan refused");
+  traj.step(0.0);
+  for (int tick = 0; tick < 300; ++tick) traj.step(0.001);
+  check(traj.active(), "the brake must come mid-move");
+  traj.brake_to_rest();
+  play_out(traj);
+  check(traj.set_target(target), "the target after the brake was refused");
+  const auto end = play_out(traj);
+  for (size_t i = 0; i < 7; ++i) check(std::abs(end[i] - target[i]) < 1e-9, "the arm stayed where the brake left it");
+}
+
 }  // namespace
 
 int main() {
@@ -154,6 +220,10 @@ int main() {
       {"a_brake_mid_move_brings_the_arm_to_rest_in_a_brake_time",
        a_brake_mid_move_brings_the_arm_to_rest_in_a_brake_time},
       {"a_brake_after_a_move_ends_holds_the_arm_where_it_is", a_brake_after_a_move_ends_holds_the_arm_where_it_is},
+      {"a_repeated_target_mid_move_keeps_the_plan_that_plays", a_repeated_target_mid_move_keeps_the_plan_that_plays},
+      {"a_repeated_target_after_the_plan_ends_holds_the_arm", a_repeated_target_after_the_plan_ends_holds_the_arm},
+      {"a_new_target_mid_move_plans_a_move_to_it", a_new_target_mid_move_plans_a_move_to_it},
+      {"a_repeated_target_after_a_brake_plans_a_move_to_it", a_repeated_target_after_a_brake_plans_a_move_to_it},
   };
   int failed = 0;
   for (const auto& [name, test] : tests) {

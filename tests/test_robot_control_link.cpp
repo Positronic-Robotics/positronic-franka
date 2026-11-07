@@ -168,6 +168,19 @@ void a_longer_timeout_does_not_flag_a_shorter_stall() {
   robot.stop();
 }
 
+// Ruckig refuses a new plan from the end of this move to its own target.
+void a_repeated_target_after_arrival_is_reached_again() {
+  Robot robot = make_robot();
+  const Vector7d target = (current_q(robot).array() + 0.693).matrix();
+  robot.set_target_joints(target);
+  check(wait_until([&] { return robot.goal().status == GoalStatus::REACHED; }), "the first move is reached");
+  robot.set_target_joints(target);
+  check(wait_until([&] { return robot.goal().status != GoalStatus::IN_FLIGHT; }), "the repeated move ends");
+  const auto goal = robot.goal();
+  check(goal.status == GoalStatus::REACHED, "the repeated move is reached, not aborted: " + goal.reason);
+  robot.stop();
+}
+
 }  // namespace
 
 int main() {
@@ -183,6 +196,7 @@ int main() {
       {"a_loop_that_resumes_after_state_reported_the_stall_brakes",
        a_loop_that_resumes_after_state_reported_the_stall_brakes},
       {"a_longer_timeout_does_not_flag_a_shorter_stall", a_longer_timeout_does_not_flag_a_shorter_stall},
+      {"a_repeated_target_after_arrival_is_reached_again", a_repeated_target_after_arrival_is_reached_again},
   };
   int failed = 0;
   for (const auto& [name, test] : tests) {
