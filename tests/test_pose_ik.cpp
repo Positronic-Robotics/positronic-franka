@@ -252,8 +252,8 @@ std::vector<std::pair<Vector7d, Vector7d>> straight_elbow_commands() {
 }
 
 // The joints after `commands` calls of the live IK, each from the joints of the call before.
-Vector7d follow(Vector7d q, const Vector7d& target, int commands, double step = IK_MAX_JOINT_STEP) {
-  for (int n = 0; n < commands; ++n) q = solve_pose_ik(fr3_flange, target, q, step);
+Vector7d follow(Vector7d q, const Vector7d& target, int commands) {
+  for (int n = 0; n < commands; ++n) q = solve_pose_ik(fr3_flange, target, q, IK_MAX_JOINT_STEP);
   return q;
 }
 
