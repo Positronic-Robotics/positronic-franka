@@ -8,6 +8,10 @@ on:
 permissions:
   contents: read
 
+# The libfranka version whose header franka/rate_limiting.h the Eigen-only tests use. Keep it the README's version.
+env:
+  LIBFRANKA_VERSION: 0.15.3
+
 jobs:
   desk:
     runs-on: ubuntu-latest
@@ -28,10 +32,17 @@ jobs:
       - name: Install Eigen
         run: sudo apt-get update && sudo apt-get install -y libeigen3-dev
 
-      # The impedance law needs only Eigen, so this test runs without libfranka.
+      # impedance_law.hpp takes the FR3 joint speed limit from this header-only part of libfranka.
+      - name: Fetch the libfranka rate limiting header
+        run: |
+          mkdir -p libfranka/include/franka
+          curl -fsSL "https://raw.githubusercontent.com/frankarobotics/libfranka/${LIBFRANKA_VERSION}/include/franka/rate_limiting.h" \
+            -o libfranka/include/franka/rate_limiting.h
+
+      # The impedance law needs Eigen and one libfranka header, so this test runs without the libfranka library.
       - name: Run the impedance law tests
         run: |
-          g++ -std=c++17 -Wall -Wextra -Werror -I src $(pkg-config --cflags eigen3) \
+          g++ -std=c++17 -Wall -Wextra -Werror -I src -I libfranka/include $(pkg-config --cflags eigen3) \
             tests/test_impedance_law.cpp -o test_impedance_law
           ./test_impedance_law
 
@@ -43,10 +54,17 @@ jobs:
       - name: Install Eigen
         run: sudo apt-get update && sudo apt-get install -y libeigen3-dev
 
-      # The pose IK takes the kinematics as an argument, so this test runs on FR3 kinematics without libfranka.
+      # impedance_law.hpp takes the FR3 joint speed limit from this header-only part of libfranka.
+      - name: Fetch the libfranka rate limiting header
+        run: |
+          mkdir -p libfranka/include/franka
+          curl -fsSL "https://raw.githubusercontent.com/frankarobotics/libfranka/${LIBFRANKA_VERSION}/include/franka/rate_limiting.h" \
+            -o libfranka/include/franka/rate_limiting.h
+
+      # The pose IK takes the kinematics as an argument, so this test runs on FR3 kinematics without the libfranka library.
       - name: Run the pose IK tests
         run: |
-          g++ -std=c++17 -Wall -Wextra -Werror -I src $(pkg-config --cflags eigen3) \
+          g++ -std=c++17 -Wall -Wextra -Werror -I src -I libfranka/include $(pkg-config --cflags eigen3) \
             tests/test_pose_ik.cpp -o test_pose_ik
           ./test_pose_ik
 
@@ -60,14 +78,22 @@ jobs:
       - name: Install Eigen
         run: sudo apt-get update && sudo apt-get install -y libeigen3-dev
 
-      # The trajectory generator needs Eigen and the vendored Ruckig, so this test runs without libfranka.
+      # impedance_law.hpp takes the FR3 joint speed limit from this header-only part of libfranka.
+      - name: Fetch the libfranka rate limiting header
+        run: |
+          mkdir -p libfranka/include/franka
+          curl -fsSL "https://raw.githubusercontent.com/frankarobotics/libfranka/${LIBFRANKA_VERSION}/include/franka/rate_limiting.h" \
+            -o libfranka/include/franka/rate_limiting.h
+
+      # The trajectory generator needs Eigen, the vendored Ruckig and one libfranka header, so this test runs without the
+      # libfranka library.
       # Ruckig needs C++20 and is built without the warning flags.
       - name: Run the trajectory generator tests
         run: |
           for f in $(ls external/ruckig/src/ruckig/*.cpp | grep -v -e cloud_client -e python); do
             g++ -std=c++20 -O2 -I external/ruckig/include -c "$f" -o "$(basename "$f" .cpp).o"
           done
-          g++ -std=c++20 -Wall -Wextra -Werror -I src -I external/ruckig/include $(pkg-config --cflags eigen3) \
+          g++ -std=c++20 -Wall -Wextra -Werror -I src -I libfranka/include -I external/ruckig/include $(pkg-config --cflags eigen3) \
             tests/test_trajectory_generator.cpp *.o -o test_trajectory_generator
           ./test_trajectory_generator
 

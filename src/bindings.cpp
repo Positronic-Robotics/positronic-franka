@@ -37,7 +37,8 @@ PYBIND11_MODULE(_franka, m) {
       "gains; values at or above libfranka's own 1000 Nm/s torque rate limit have no practical effect. "
       "max_reference_speed (7,), rad/s, is the speed at which q_d moves to a new target, in a straight "
       "line in joint space with all joints arriving together, so a large target jump is a slow move at "
-      "any command rate. Finite and strictly positive. "
+      "any command rate. Finite and strictly positive. Near a joint position limit, q_d moves at most at "
+      "0.8 of the FR3 position-dependent joint speed limit, toward that limit. "
       "stiffness_point (3,), m, is the point the Cartesian terms act at, in flange axes from the flange "
       "origin. The default is the flange, where the default gains are tuned. Finite.")
       .def(py::init<const std::array<double, 7>&, const std::array<double, 7>&, const std::array<double, 3>&>(),

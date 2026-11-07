@@ -1,5 +1,6 @@
-// Checks the software impedance law in impedance_law.hpp. Needs only Eigen, not libfranka:
-//   g++ -std=c++17 -I src $(pkg-config --cflags eigen3) tests/test_impedance_law.cpp -o test_impedance_law
+// Checks the software impedance law in impedance_law.hpp. Needs Eigen and the libfranka header
+// franka/rate_limiting.h, not the libfranka library:
+//   g++ -std=c++17 -I src -I <libfranka>/include $(pkg-config --cflags eigen3) tests/test_impedance_law.cpp -o test_impedance_law
 //   ./test_impedance_law
 
 #include <array>
@@ -11,12 +12,15 @@
 #include <utility>
 #include <vector>
 
+#include <franka/rate_limiting.h>
+
 #include "impedance_law.hpp"
 
 namespace {
 
 using positronic_franka::impedance_torque;
 using positronic_franka::move_reference_toward;
+using positronic_franka::REFERENCE_SHARE_OF_FR3_SPEED_LIMIT;
 using positronic_franka::stop_has_settled;
 using positronic_franka::Matrix7d;
 using positronic_franka::SpringTorqueRateLimiter;
@@ -158,6 +162,10 @@ void a_stop_with_a_still_arm_settles_only_once_the_spring_torque_ramps_to_zero()
 }
 
 const Vector7d REFERENCE_SPEED = (Vector7d() << 1.5, 1.5, 1.5, 1.5, 1.2, 1.0, 2.0).finished();
+const Vector7d FLAT_SPEED = Vector7d::Constant(1.5);
+
+// A pose inside the FR3 joint limits. The FR3 speed limit stays above the flat caps on every move from it in these tests.
+const Vector7d HOME = (Vector7d() << 0.0, -0.4, 0.0, -2.2, 0.0, 2.0, 0.8).finished();
 
 // A jump of 2.4 rad on joint 5 against 0.3 rad or less elsewhere: joint 5 at 1.2 rad/s sets the pace.
 Vector7d far_target(const Vector7d& start) {
@@ -167,7 +175,7 @@ Vector7d far_target(const Vector7d& start) {
 }
 
 void the_reference_moves_to_a_far_target_at_the_capped_speed_on_a_straight_line() {
-  const Vector7d start = Vector7d::LinSpaced(-1.1, 1.3);
+  const Vector7d start = HOME;
   const Vector7d target = far_target(start);
   const double dt = 1e-3;
   Vector7d ref = start;
@@ -183,7 +191,7 @@ void the_reference_moves_to_a_far_target_at_the_capped_speed_on_a_straight_line(
 }
 
 void a_far_target_is_reached_exactly_when_the_slowest_joint_arrives() {
-  const Vector7d start = Vector7d::LinSpaced(-1.1, 1.3);
+  const Vector7d start = HOME;
   const Vector7d target = far_target(start);
   const double dt = 1e-3;
   Vector7d ref = start;
@@ -198,13 +206,13 @@ void a_far_target_is_reached_exactly_when_the_slowest_joint_arrives() {
 }
 
 void a_target_within_one_step_is_reached_on_that_tick() {
-  const Vector7d start = Vector7d::LinSpaced(-1.1, 1.3);
+  const Vector7d start = HOME;
   const Vector7d target = start + Vector7d::Constant(0.0009);  // below 1.0 rad/s * 1 ms on every joint
   check(move_reference_toward(start, target, REFERENCE_SPEED, 1e-3) == target, "a small step lands on the target");
 }
 
 void a_new_target_mid_move_turns_the_reference_from_where_it_is() {
-  const Vector7d start = Vector7d::Zero();
+  const Vector7d start = HOME;
   Vector7d ref = start;
   for (int tick = 0; tick < 100; ++tick) ref = move_reference_toward(ref, far_target(start), REFERENCE_SPEED, 1e-3);
   const Vector7d turned_at = ref;
@@ -215,8 +223,76 @@ void a_new_target_mid_move_turns_the_reference_from_where_it_is() {
 }
 
 void a_zero_period_leaves_the_reference_where_it_is() {
-  const Vector7d start = Vector7d::LinSpaced(-1.1, 1.3);
+  const Vector7d start = HOME;
   check(move_reference_toward(start, far_target(start), REFERENCE_SPEED, 0.0) == start, "no time, no move");
+}
+
+
+// The FR3 position-dependent speed limit of each joint at q, in the direction of `toward`, from libfranka.
+Vector7d fr3_speed_limit(const Vector7d& q, const Vector7d& toward) {
+  std::array<double, 7> q_arr;
+  Eigen::Map<Vector7d>(q_arr.data()) = q;
+  const std::array<double, 7> upper = franka::computeUpperLimitsJointVelocity(q_arr);
+  const std::array<double, 7> lower = franka::computeLowerLimitsJointVelocity(q_arr);
+  Vector7d limit;
+  for (int i = 0; i < 7; ++i) limit(i) = toward(i) >= q(i) ? upper[i] : -lower[i];
+  return limit;
+}
+
+// Joint 3 moves to its -2.9007 rad position limit, and joint 1 moves with it. The FR3 speed limit of joint 3 falls
+// below the flat 1.5 rad/s on the way.
+void a_reference_toward_a_near_joint_limit_moves_below_the_fr3_speed_limit() {
+  Vector7d start = HOME;
+  start(2) = -2.80;
+  Vector7d target = start;
+  target(0) += 0.05;
+  target(2) = -2.9007;
+  const double dt = 1e-3;
+
+  // At q3 = -2.80 the FR3 docs give 0.20 - sqrt(7.00 * (2.9065 - 2.80)) = -0.6634 rad/s, and libfranka adds its
+  // 0.001 rad/s tolerance. The reference takes the share of that.
+  const Vector7d first = move_reference_toward(start, target, FLAT_SPEED, dt);
+  check(near((start(2) - first(2)) / dt, REFERENCE_SHARE_OF_FR3_SPEED_LIMIT * (std::sqrt(7.00 * 0.1065) - 0.20 - 0.001)),
+        "joint 3 moved at " + std::to_string((start(2) - first(2)) / dt) + " rad/s, not the share of the FR3 limit");
+
+  Vector7d ref = start;
+  for (int tick = 1; tick <= 5000; ++tick) {
+    const Vector7d next = move_reference_toward(ref, target, FLAT_SPEED, dt);
+    const Vector7d allowed = REFERENCE_SHARE_OF_FR3_SPEED_LIMIT * fr3_speed_limit(ref, target);
+    check(std::abs(next(2) - ref(2)) <= allowed(2) * dt + 1e-12,
+          "tick " + std::to_string(tick) + ": joint 3 moved above the share of its FR3 speed limit");
+    check(std::abs(next(2) - ref(2)) < FLAT_SPEED(2) * dt, "tick " + std::to_string(tick) + ": joint 3 kept the flat speed");
+    // All joints arrive together, so joint 1 slows with joint 3 and the reference stays on the line.
+    check(near((next(0) - start(0)) * (target(2) - start(2)), (next(2) - start(2)) * (target(0) - start(0))),
+          "tick " + std::to_string(tick) + ": the reference left the straight line");
+    ref = next;
+  }
+  check(ref(2) >= -2.9007, "the reference passed the joint 3 position limit");
+}
+
+// From HOME the FR3 speed limit is above 1.5 rad/s on every joint, so the flat cap alone sets the pace.
+void a_joint_far_from_its_limits_keeps_the_flat_speed() {
+  const Vector7d target = HOME + (Vector7d() << 0.3, 0.3, -0.6, 0.3, 0.6, 0.3, 0.6).finished();
+  const Vector7d next = move_reference_toward(HOME, target, FLAT_SPEED, 1e-3);
+  check(near(std::abs(next(2) - HOME(2)), 1.5e-3), "joint 3 set the pace at 1.5 rad/s");
+  check(((next - HOME) - (target - HOME) * (1.5e-3 / 0.6)).cwiseAbs().maxCoeff() < 1e-12,
+        "every joint moved its share of the line at the flat speed");
+}
+
+// Joint 3 starts 21 mrad from its lower limit and moves away from it. The limit toward the far side is 2.62 rad/s.
+void a_reference_away_from_a_near_joint_limit_keeps_the_flat_speed() {
+  Vector7d start = HOME;
+  start(2) = -2.88;
+  Vector7d target = start;
+  target(2) = -2.0;
+  check(fr3_speed_limit(start, Vector7d(start - Vector7d::Constant(1.0)))(2) < 0.5,
+        "the start is near the limit: toward it the FR3 limit is below 0.5 rad/s");
+  Vector7d ref = start;
+  for (int tick = 1; tick <= 100; ++tick) {
+    const Vector7d next = move_reference_toward(ref, target, FLAT_SPEED, 1e-3);
+    check(near(next(2) - ref(2), 1.5e-3), "tick " + std::to_string(tick) + ": joint 3 slowed on its way out");
+    ref = next;
+  }
 }
 
 }  // namespace
@@ -241,6 +317,11 @@ int main() {
       {"a_new_target_mid_move_turns_the_reference_from_where_it_is",
        a_new_target_mid_move_turns_the_reference_from_where_it_is},
       {"a_zero_period_leaves_the_reference_where_it_is", a_zero_period_leaves_the_reference_where_it_is},
+      {"a_reference_toward_a_near_joint_limit_moves_below_the_fr3_speed_limit",
+       a_reference_toward_a_near_joint_limit_moves_below_the_fr3_speed_limit},
+      {"a_joint_far_from_its_limits_keeps_the_flat_speed", a_joint_far_from_its_limits_keeps_the_flat_speed},
+      {"a_reference_away_from_a_near_joint_limit_keeps_the_flat_speed",
+       a_reference_away_from_a_near_joint_limit_keeps_the_flat_speed},
   };
   int failed = 0;
   for (const auto& [name, test] : tests) {
