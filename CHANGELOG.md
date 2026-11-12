@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.12.2] - 2026-11-12
+
+### Added
+- `max_tool_point_speed` and `tool_point` on `SoftwareImpedance`, keyword arguments. `max_tool_point_speed`, in m/s, is the most speed at which the reference q_d moves `tool_point`, a point in flange axes, from the flange origin, in metres. Each tick, a step of q_d that would move the point faster is shortened along the same joint-space line, so the joints still arrive together. The speed of the point comes from its Jacobian at q_d. `max_tool_point_speed` defaults to `None`, which caps nothing, and must be finite and strictly positive. `tool_point` defaults to the flange and must be finite. A change of either reaches the running torque loop like a gain change.
+- `limit_tool_point_speed` in `impedance_law.hpp`, the step limit above. `tests/test_impedance_law.cpp` checks it, and `tests/test_robot_control_link.cpp` checks it in the torque loop on the fake libfranka, whose Jacobian now moves the tool 0.5 m per radian of joint 1.
+
 ## [0.12.1] - 2026-11-06
 
 ### Added

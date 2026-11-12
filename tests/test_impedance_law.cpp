@@ -16,6 +16,7 @@
 namespace {
 
 using positronic_franka::impedance_torque;
+using positronic_franka::limit_tool_point_speed;
 using positronic_franka::move_reference_toward;
 using positronic_franka::stop_has_settled;
 using positronic_franka::Matrix7d;
@@ -219,6 +220,68 @@ void a_zero_period_leaves_the_reference_where_it_is() {
   check(move_reference_toward(start, far_target(start), REFERENCE_SPEED, 0.0) == start, "no time, no move");
 }
 
+// A dense translational Jacobian of a tool point, m/rad.
+using PointJacobian = Eigen::Matrix<double, 3, 7>;
+PointJacobian tool_point_jacobian() {
+  PointJacobian J;
+  J << 0.10, -0.45, 0.20, 0.35, -0.05, 0.15, 0.00,
+       0.55, 0.05, -0.30, 0.10, 0.25, -0.10, 0.00,
+       -0.20, 0.40, 0.15, -0.50, 0.10, 0.20, 0.00;
+  return J;
+}
+
+constexpr double TOOL_POINT_SPEED = 0.7;  // m/s
+
+// A joint step of 1 ms that moves the tool point at `point_speed` m/s under tool_point_jacobian().
+Vector7d step_at_point_speed(double point_speed) {
+  const Vector7d direction = (Vector7d() << 0.4, -1.0, 0.3, 0.8, -0.2, 0.5, 0.0).finished();
+  return direction * (point_speed * 1e-3 / (tool_point_jacobian() * direction).norm());
+}
+
+void a_tool_point_step_over_its_cap_is_cut_to_the_cap_on_the_same_line() {
+  const Vector7d ref = Vector7d::LinSpaced(-1.1, 1.3);
+  const Vector7d step = step_at_point_speed(2.0);
+  const Vector7d next = limit_tool_point_speed(ref, ref + step, tool_point_jacobian(), TOOL_POINT_SPEED, 1e-3);
+  check(near((tool_point_jacobian() * (next - ref)).norm(), TOOL_POINT_SPEED * 1e-3),
+        "the tool point moves 0.7 mm in 1 ms");
+  check(((next - ref) - (TOOL_POINT_SPEED / 2.0) * step).cwiseAbs().maxCoeff() < 1e-12,
+        "every joint keeps its share of the step");
+}
+
+void a_tool_point_step_under_its_cap_keeps_the_joint_step() {
+  const Vector7d ref = Vector7d::LinSpaced(-1.1, 1.3);
+  const Vector7d next = ref + step_at_point_speed(0.69);
+  check(limit_tool_point_speed(ref, next, tool_point_jacobian(), TOOL_POINT_SPEED, 1e-3) == next,
+        "a step below the cap is not changed");
+}
+
+void a_joint_that_does_not_move_the_tool_point_is_not_slowed_by_its_cap() {
+  const Vector7d ref = Vector7d::LinSpaced(-1.1, 1.3);
+  Vector7d next = ref;
+  next(6) += 2e-3;  // joint 7 turns about the tool point in tool_point_jacobian()
+  check(limit_tool_point_speed(ref, next, tool_point_jacobian(), TOOL_POINT_SPEED, 1e-3) == next,
+        "a turn about the tool point is not slowed");
+}
+
+void a_tool_point_capped_move_reaches_the_target_bit_for_bit() {
+  const Vector7d start = Vector7d::LinSpaced(-1.1, 1.3);
+  const Vector7d target = start + step_at_point_speed(TOOL_POINT_SPEED) * 500.0;  // the point moves 0.35 m
+  const double dt = 1e-3;
+  Vector7d ref = start;
+  int ticks = 0;
+  while (ref != target && ticks < 10000) {
+    const Vector7d next = limit_tool_point_speed(ref, move_reference_toward(ref, target, REFERENCE_SPEED, dt),
+                                                 tool_point_jacobian(), TOOL_POINT_SPEED, dt);
+    check((tool_point_jacobian() * (next - ref)).norm() <= TOOL_POINT_SPEED * dt + 1e-12,
+          "tick " + std::to_string(ticks) + ": the tool point moved faster than its cap");
+    ref = next;
+    ++ticks;
+  }
+  check(ref == target, "the reference reaches the target bit for bit");
+  // 0.35 m at 0.7 m/s is 0.5 s, so 500 ticks; one more at most for rounding.
+  check(ticks >= 500 && ticks <= 501, "it took " + std::to_string(ticks) + " ticks, not 500");
+}
+
 }  // namespace
 
 int main() {
@@ -241,6 +304,13 @@ int main() {
       {"a_new_target_mid_move_turns_the_reference_from_where_it_is",
        a_new_target_mid_move_turns_the_reference_from_where_it_is},
       {"a_zero_period_leaves_the_reference_where_it_is", a_zero_period_leaves_the_reference_where_it_is},
+      {"a_tool_point_step_over_its_cap_is_cut_to_the_cap_on_the_same_line",
+       a_tool_point_step_over_its_cap_is_cut_to_the_cap_on_the_same_line},
+      {"a_tool_point_step_under_its_cap_keeps_the_joint_step", a_tool_point_step_under_its_cap_keeps_the_joint_step},
+      {"a_joint_that_does_not_move_the_tool_point_is_not_slowed_by_its_cap",
+       a_joint_that_does_not_move_the_tool_point_is_not_slowed_by_its_cap},
+      {"a_tool_point_capped_move_reaches_the_target_bit_for_bit",
+       a_tool_point_capped_move_reaches_the_target_bit_for_bit},
   };
   int failed = 0;
   for (const auto& [name, test] : tests) {
