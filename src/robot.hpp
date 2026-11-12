@@ -97,6 +97,8 @@ constexpr std::array<double, 7> DEFAULT_MAX_SPRING_TORQUE_RATE = {130.0, 130.0, 
 constexpr std::array<double, 7> DEFAULT_MAX_REFERENCE_SPEED = {1.5, 1.5, 1.5, 1.5, 1.5, 1.5, 1.5};
 // The point the SoftwareImpedance Cartesian terms act at, in flange axes from the flange origin, m: the flange.
 constexpr std::array<double, 3> DEFAULT_STIFFNESS_POINT = {0.0, 0.0, 0.0};
+// The tool point whose speed max_tool_point_speed caps, in flange axes from the flange origin, m: the flange.
+constexpr std::array<double, 3> DEFAULT_TOOL_POINT = {0.0, 0.0, 0.0};
 
 // Gain defaults are copied from fairo polymetis/conf/robot_client/franka_hardware.yaml, the
 // configuration HybridJointImpedanceControl runs with in the DROID data-collection stack.
@@ -112,28 +114,40 @@ struct SoftwareImpedance {
   // The point the Cartesian terms act at, in flange axes from the flange origin, m. The default gains are tuned at
   // the flange.
   std::array<double, 3> stiffness_point = DEFAULT_STIFFNESS_POINT;
+  // The most speed, m/s, at which q_d moves tool_point. Empty caps nothing.
+  std::optional<double> max_tool_point_speed;
+  // The point that max_tool_point_speed caps, in flange axes from the flange origin, m.
+  std::array<double, 3> tool_point = DEFAULT_TOOL_POINT;
 
   SoftwareImpedance() = default;
   explicit SoftwareImpedance(const std::array<double, 7>& max_spring_torque_rate_in,
                              const std::array<double, 7>& max_reference_speed_in = DEFAULT_MAX_REFERENCE_SPEED,
-                             const std::array<double, 3>& stiffness_point_in = DEFAULT_STIFFNESS_POINT)
+                             const std::array<double, 3>& stiffness_point_in = DEFAULT_STIFFNESS_POINT,
+                             const std::optional<double>& max_tool_point_speed_in = std::nullopt,
+                             const std::array<double, 3>& tool_point_in = DEFAULT_TOOL_POINT)
       : max_spring_torque_rate(max_spring_torque_rate_in),
         max_reference_speed(max_reference_speed_in),
-        stiffness_point(stiffness_point_in) {
+        stiffness_point(stiffness_point_in),
+        max_tool_point_speed(max_tool_point_speed_in),
+        tool_point(tool_point_in) {
     validate_guards_();
   }
   SoftwareImpedance(const std::array<double, 7>& kq_in, const std::array<double, 7>& kqd_in,
                     const std::array<double, 6>& kx_in, const std::array<double, 6>& kxd_in,
                     const std::array<double, 7>& max_spring_torque_rate_in = DEFAULT_MAX_SPRING_TORQUE_RATE,
                     const std::array<double, 7>& max_reference_speed_in = DEFAULT_MAX_REFERENCE_SPEED,
-                    const std::array<double, 3>& stiffness_point_in = DEFAULT_STIFFNESS_POINT)
+                    const std::array<double, 3>& stiffness_point_in = DEFAULT_STIFFNESS_POINT,
+                    const std::optional<double>& max_tool_point_speed_in = std::nullopt,
+                    const std::array<double, 3>& tool_point_in = DEFAULT_TOOL_POINT)
       : kq(kq_in),
         kqd(kqd_in),
         kx(kx_in),
         kxd(kxd_in),
         max_spring_torque_rate(max_spring_torque_rate_in),
         max_reference_speed(max_reference_speed_in),
-        stiffness_point(stiffness_point_in) {
+        stiffness_point(stiffness_point_in),
+        max_tool_point_speed(max_tool_point_speed_in),
+        tool_point(tool_point_in) {
     validate_half(kq, kqd, "joint (kq/kqd)");
     validate_half(kx, kxd, "Cartesian (kx/kxd)");
     if (all_zero(kq) && all_zero(kx)) {
@@ -153,6 +167,12 @@ struct SoftwareImpedance {
     if (!std::all_of(stiffness_point.begin(), stiffness_point.end(), [](double v) { return std::isfinite(v); })) {
       throw std::invalid_argument("stiffness_point must be finite");
     }
+    if (max_tool_point_speed && !(std::isfinite(*max_tool_point_speed) && *max_tool_point_speed > 0.0)) {
+      throw std::invalid_argument("max_tool_point_speed must be finite and strictly positive");
+    }
+    if (!std::all_of(tool_point.begin(), tool_point.end(), [](double v) { return std::isfinite(v); })) {
+      throw std::invalid_argument("tool_point must be finite");
+    }
   }
 };
 
@@ -163,7 +183,8 @@ inline bool operator==(const InternalImpedance& a, const InternalImpedance& b) {
 inline bool operator==(const SoftwareImpedance& a, const SoftwareImpedance& b) {
   return a.kq == b.kq && a.kqd == b.kqd && a.kx == b.kx && a.kxd == b.kxd &&
          a.max_spring_torque_rate == b.max_spring_torque_rate && a.max_reference_speed == b.max_reference_speed &&
-         a.stiffness_point == b.stiffness_point;
+         a.stiffness_point == b.stiffness_point && a.max_tool_point_speed == b.max_tool_point_speed &&
+         a.tool_point == b.tool_point;
 }
 
 using ControlMode = std::variant<InternalImpedance, SoftwareImpedance>;
@@ -502,6 +523,13 @@ private:
     return point_jacobian(ToolKinematics{flange_pose_matrix_(st), flange_jacobian_(st)}, flange_to_point);
   }
 
+  // The point Jacobian at joints `q`, with the frames and load of `st`.
+  SpatialJacobian flange_point_jacobian_at_(franka::RobotState st, const Vector7d& q,
+                                            const Eigen::Vector3d& flange_to_point) const {
+    st.q = to_std_array7_(q);
+    return flange_point_jacobian_(st, flange_to_point);
+  }
+
  public:
   double relative_dynamics_factor() const { return relative_dynamics_factor_; }
 
@@ -592,8 +620,8 @@ private:
   //   tau = (J^T Kx J + Kq)(q_d - q) - (J^T Kxd J + Kqd) dq + coriolis
   // with the spring term rate-capped (impedance_law.hpp). Gravity is compensated by libfranka underneath the
   // torque command. Shares the target/stop/goal machinery with the position loop; only the reference differs:
-  // q_d moves to each target in a straight line at max_reference_speed, where the position loop shapes a Ruckig
-  // trajectory.
+  // q_d moves to each target in a straight line at max_reference_speed, and moves tool_point no faster than
+  // max_tool_point_speed, where the position loop shapes a Ruckig trajectory.
   void run_joint_torque_control_(SoftwareImpedance imp) {
     Vector7d Kq = Eigen::Map<const Vector7d>(imp.kq.data());
     Vector7d Kqd = Eigen::Map<const Vector7d>(imp.kqd.data());
@@ -602,6 +630,8 @@ private:
     SpringTorqueRateLimiter spring_limiter(imp.max_spring_torque_rate);
     Vector7d max_reference_speed = Eigen::Map<const Vector7d>(imp.max_reference_speed.data());
     Eigen::Vector3d stiffness_point = Eigen::Map<const Eigen::Vector3d>(imp.stiffness_point.data());
+    std::optional<double> max_tool_point_speed = imp.max_tool_point_speed;
+    Eigen::Vector3d tool_point = Eigen::Map<const Eigen::Vector3d>(imp.tool_point.data());
     std::string thread_error;
     try {
       robot_->control(
@@ -645,12 +675,20 @@ private:
             spring_limiter.set_max_rate(new_gains_.max_spring_torque_rate);
             max_reference_speed = Eigen::Map<const Vector7d>(new_gains_.max_reference_speed.data());
             stiffness_point = Eigen::Map<const Eigen::Vector3d>(new_gains_.stiffness_point.data());
+            max_tool_point_speed = new_gains_.max_tool_point_speed;
+            tool_point = Eigen::Map<const Eigen::Vector3d>(new_gains_.tool_point.data());
             has_new_gains_.store(false);
           }
 
           // No trajectory here: the impedance law moves the arm. The speed cap on q_d keeps a large jump in the
           // target from becoming a large spring pull, at any command rate.
-          ref = move_reference_toward(ref, target, max_reference_speed, period.toSec());
+          Vector7d next_ref = move_reference_toward(ref, target, max_reference_speed, period.toSec());
+          if (max_tool_point_speed && next_ref != ref) {
+            const SpatialJacobian J_ref = flange_point_jacobian_at_(st, ref, tool_point);
+            next_ref = limit_tool_point_speed(ref, next_ref, J_ref.topRows<3>(), *max_tool_point_speed,
+                                              period.toSec());
+          }
+          ref = next_ref;
 
           // The position loop's arrival rule: there is no arrival to test while the reference still moves.
           if (goal_in_flight != 0) {

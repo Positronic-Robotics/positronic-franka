@@ -57,6 +57,17 @@ inline Vector7d move_reference_toward(const Vector7d& ref, const Vector7d& targe
   return fraction == 1.0 ? target : Vector7d(ref + fraction * remaining);
 }
 
+// Shortens the step of q_d from `ref` to `next` so that a point on the tool moves at most `max_point_speed` (m/s)
+// in `dt`. `J_point` is the point's translational zero Jacobian at `ref`. The step keeps its joint-space direction,
+// so the joints still arrive together.
+inline Vector7d limit_tool_point_speed(const Vector7d& ref, const Vector7d& next,
+                                       const Eigen::Matrix<double, 3, 7>& J_point, double max_point_speed, double dt) {
+  const Vector7d step = next - ref;
+  const double point_step = (J_point * step).norm();
+  const double allowed = max_point_speed * dt;
+  return point_step > allowed ? Vector7d(ref + (allowed / point_step) * step) : next;
+}
+
 // The software impedance law: tau = Kp (q_d - q) - Kd dq + coriolis. Only the spring term goes
 // through the limiter; damping and Coriolis pass through as computed.
 inline Vector7d impedance_torque(const Matrix7d& Kp, const Matrix7d& Kd, const Vector7d& q_d, const Vector7d& q,

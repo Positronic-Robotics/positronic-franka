@@ -24,6 +24,7 @@ namespace {
 using positronic_franka::GoalStatus;
 using positronic_franka::InternalImpedance;
 using positronic_franka::Robot;
+using positronic_franka::SoftwareImpedance;
 using positronic_franka::Vector7d;
 using Clock = std::chrono::steady_clock;
 using std::chrono::milliseconds;
@@ -181,6 +182,37 @@ void a_repeated_target_after_arrival_is_reached_again() {
   robot.stop();
 }
 
+// Moves joint 1 under software impedance with the tool point capped at `max_tool_point_speed` m/s, and returns
+// the joint 1 reference speed, rad/s, over the first 200 ms or more.
+double joint_1_reference_speed_under_tool_point_cap(double max_tool_point_speed) {
+  link().reset();
+  Robot robot("fake", franka::RealtimeConfig::kIgnore, 1.0,
+              SoftwareImpedance(positronic_franka::DEFAULT_MAX_SPRING_TORQUE_RATE,
+                                positronic_franka::DEFAULT_MAX_REFERENCE_SPEED,
+                                positronic_franka::DEFAULT_STIFFNESS_POINT, max_tool_point_speed,
+                                positronic_franka::DEFAULT_TOOL_POINT),
+              TIMEOUT_S);
+  const Vector7d start = current_q(robot);
+  robot.set_target_joints(offset_on_joint_1(start, 1.0));
+  check(wait_until([&] { return robot.state().time >= 0.2; }), "the loop ticks for 200 ms");
+  const auto st = robot.state();
+  robot.stop();
+  return (st.q_d(0) - start(0)) / st.time;
+}
+
+void the_tool_point_cap_slows_a_reference_that_would_move_the_tool_faster() {
+  // Joint 1 at its 1.5 rad/s cap moves the fake's tool at 0.75 m/s; a 0.7 m/s cap holds joint 1 at 1.4 rad/s.
+  const double speed = joint_1_reference_speed_under_tool_point_cap(0.7);
+  check(std::abs(speed - 0.7 / franka::Model::JOINT_1_LEVER_ARM_M) < 0.01,
+        "joint 1 moves at " + std::to_string(speed) + " rad/s, not 1.4");
+}
+
+void a_tool_point_cap_above_the_joint_cap_leaves_the_joint_cap_in_charge() {
+  const double speed = joint_1_reference_speed_under_tool_point_cap(1.0);
+  check(std::abs(speed - positronic_franka::DEFAULT_MAX_REFERENCE_SPEED[0]) < 0.01,
+        "joint 1 moves at " + std::to_string(speed) + " rad/s, not its 1.5 rad/s cap");
+}
+
 }  // namespace
 
 int main() {
@@ -197,6 +229,10 @@ int main() {
        a_loop_that_resumes_after_state_reported_the_stall_brakes},
       {"a_longer_timeout_does_not_flag_a_shorter_stall", a_longer_timeout_does_not_flag_a_shorter_stall},
       {"a_repeated_target_after_arrival_is_reached_again", a_repeated_target_after_arrival_is_reached_again},
+      {"the_tool_point_cap_slows_a_reference_that_would_move_the_tool_faster",
+       the_tool_point_cap_slows_a_reference_that_would_move_the_tool_faster},
+      {"a_tool_point_cap_above_the_joint_cap_leaves_the_joint_cap_in_charge",
+       a_tool_point_cap_above_the_joint_cap_leaves_the_joint_cap_in_charge},
   };
   int failed = 0;
   for (const auto& [name, test] : tests) {

@@ -39,18 +39,29 @@ PYBIND11_MODULE(_franka, m) {
       "line in joint space with all joints arriving together, so a large target jump is a slow move at "
       "any command rate. Finite and strictly positive. "
       "stiffness_point (3,), m, is the point the Cartesian terms act at, in flange axes from the flange "
-      "origin. The default is the flange, where the default gains are tuned. Finite.")
-      .def(py::init<const std::array<double, 7>&, const std::array<double, 7>&, const std::array<double, 3>&>(),
+      "origin. The default is the flange, where the default gains are tuned. Finite. "
+      "max_tool_point_speed, m/s, is the most speed at which q_d moves tool_point: a step of q_d that "
+      "would move it faster is shortened along the same joint-space line. None, the default, caps "
+      "nothing. Finite and strictly positive. "
+      "tool_point (3,), m, is that point, in flange axes from the flange origin. The default is the "
+      "flange. Finite.")
+      .def(py::init<const std::array<double, 7>&, const std::array<double, 7>&, const std::array<double, 3>&,
+                    const std::optional<double>&, const std::array<double, 3>&>(),
            py::kw_only(), py::arg("max_spring_torque_rate") = positronic_franka::DEFAULT_MAX_SPRING_TORQUE_RATE,
            py::arg("max_reference_speed") = positronic_franka::DEFAULT_MAX_REFERENCE_SPEED,
-           py::arg("stiffness_point") = positronic_franka::DEFAULT_STIFFNESS_POINT)
+           py::arg("stiffness_point") = positronic_franka::DEFAULT_STIFFNESS_POINT,
+           py::arg("max_tool_point_speed") = py::none(),
+           py::arg("tool_point") = positronic_franka::DEFAULT_TOOL_POINT)
       .def(py::init<const std::array<double, 7>&, const std::array<double, 7>&,
                     const std::array<double, 6>&, const std::array<double, 6>&,
-                    const std::array<double, 7>&, const std::array<double, 7>&, const std::array<double, 3>&>(),
+                    const std::array<double, 7>&, const std::array<double, 7>&, const std::array<double, 3>&,
+                    const std::optional<double>&, const std::array<double, 3>&>(),
            py::arg("kq"), py::arg("kqd"), py::arg("kx"), py::arg("kxd"), py::kw_only(),
            py::arg("max_spring_torque_rate") = positronic_franka::DEFAULT_MAX_SPRING_TORQUE_RATE,
            py::arg("max_reference_speed") = positronic_franka::DEFAULT_MAX_REFERENCE_SPEED,
-           py::arg("stiffness_point") = positronic_franka::DEFAULT_STIFFNESS_POINT)
+           py::arg("stiffness_point") = positronic_franka::DEFAULT_STIFFNESS_POINT,
+           py::arg("max_tool_point_speed") = py::none(),
+           py::arg("tool_point") = positronic_franka::DEFAULT_TOOL_POINT)
       .def_readonly("kq", &positronic_franka::SoftwareImpedance::kq)
       .def_readonly("kqd", &positronic_franka::SoftwareImpedance::kqd)
       .def_readonly("kx", &positronic_franka::SoftwareImpedance::kx)
@@ -58,6 +69,8 @@ PYBIND11_MODULE(_franka, m) {
       .def_readonly("max_spring_torque_rate", &positronic_franka::SoftwareImpedance::max_spring_torque_rate)
       .def_readonly("max_reference_speed", &positronic_franka::SoftwareImpedance::max_reference_speed)
       .def_readonly("stiffness_point", &positronic_franka::SoftwareImpedance::stiffness_point)
+      .def_readonly("max_tool_point_speed", &positronic_franka::SoftwareImpedance::max_tool_point_speed)
+      .def_readonly("tool_point", &positronic_franka::SoftwareImpedance::tool_point)
       .def(py::self == py::self);
 
   py::enum_<positronic_franka::GoalStatus>(m, "GoalStatus",

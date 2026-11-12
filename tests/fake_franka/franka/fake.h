@@ -70,7 +70,13 @@ struct Torques : Finishable {
 class Model {
  public:
   std::array<double, 16> pose(Frame, const RobotState& s) const { return s.O_T_EE; }
-  std::array<double, 42> zeroJacobian(Frame, const RobotState&) const { return {}; }
+  // Column-major 6x7, as libfranka's: joint 1 moves every frame 0.5 m/rad along x, and no joint turns it.
+  std::array<double, 42> zeroJacobian(Frame, const RobotState&) const {
+    std::array<double, 42> J{};
+    J[0] = JOINT_1_LEVER_ARM_M;
+    return J;
+  }
+  static constexpr double JOINT_1_LEVER_ARM_M = 0.5;
   std::array<double, 7> coriolis(const RobotState&) const { return {}; }
 };
 
