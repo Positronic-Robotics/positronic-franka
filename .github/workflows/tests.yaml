@@ -9,6 +9,8 @@ permissions:
   contents: read
 
 jobs:
+  # The tests include Eigen as a system header (-isystem). -Werror then applies to the code of this repository,
+  # not to the warnings in the Eigen headers.
   desk:
     runs-on: ubuntu-latest
     steps:
@@ -31,7 +33,7 @@ jobs:
       # The impedance law needs only Eigen, so this test runs without libfranka.
       - name: Run the impedance law tests
         run: |
-          g++ -std=c++17 -Wall -Wextra -Werror -I src $(pkg-config --cflags eigen3) \
+          g++ -std=c++17 -Wall -Wextra -Werror -I src -isystem /usr/include/eigen3 \
             tests/test_impedance_law.cpp -o test_impedance_law
           ./test_impedance_law
 
@@ -46,7 +48,7 @@ jobs:
       # The pose IK takes the kinematics as an argument, so this test runs on FR3 kinematics without libfranka.
       - name: Run the pose IK tests
         run: |
-          g++ -std=c++17 -Wall -Wextra -Werror -I src $(pkg-config --cflags eigen3) \
+          g++ -std=c++17 -Wall -Wextra -Werror -I src -isystem /usr/include/eigen3 \
             tests/test_pose_ik.cpp -o test_pose_ik
           ./test_pose_ik
 
@@ -67,7 +69,8 @@ jobs:
           for f in $(ls external/ruckig/src/ruckig/*.cpp | grep -v -e cloud_client -e python); do
             g++ -std=c++20 -O2 -I external/ruckig/include -c "$f" -o "$(basename "$f" .cpp).o"
           done
-          g++ -std=c++20 -Wall -Wextra -Werror -I src -I external/ruckig/include $(pkg-config --cflags eigen3) \
+          g++ -std=c++20 -Wall -Wextra -Werror -I src -I external/ruckig/include \
+            -isystem /usr/include/eigen3 \
             tests/test_trajectory_generator.cpp *.o -o test_trajectory_generator
           ./test_trajectory_generator
 
@@ -99,7 +102,8 @@ jobs:
             g++ -std=c++20 -O2 -I external/ruckig/include -c "$f" -o "$(basename "$f" .cpp).o"
           done
           g++ -std=c++20 -pthread -Wall -Wextra -Werror -I tests/fake_franka -I src -I external/ruckig/include \
-            $(pkg-config --cflags eigen3) tests/test_robot_control_link.cpp *.o -o test_robot_control_link
+            -isystem /usr/include/eigen3 \
+            tests/test_robot_control_link.cpp *.o -o test_robot_control_link
           ./test_robot_control_link
 
   # The extension builds against the libfranka on the machine, so it is built here against each supported libfranka.
