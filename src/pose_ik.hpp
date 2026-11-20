@@ -262,7 +262,7 @@ inline Vector7d stop_before_self_collision(const Vector7d& from, const Vector7d&
 
 // Joints that put the tool as close as the bounds allow to `target_pose_wxyz` (tx, ty, tz, qw, qx, qy, qz).
 // Each joint stays within the FR3 limits and within `max_step` of q0; near a singularity the move q - q0 is damped.
-// The checked FR3 links keep IK_SELF_COLLISION_CLEARANCE along the move from q0 (self_collision.hpp).
+// The move from q0, or from its nearest point within the FR3 limits, keeps the floor of stop_before_self_collision.
 template <typename Kinematics>
 Vector7d solve_pose_ik(const Kinematics& kinematics, const Eigen::Ref<const Vector7d>& target_pose_wxyz,
                        const Eigen::Ref<const Vector7d>& q0, double max_step) {

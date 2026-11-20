@@ -206,8 +206,9 @@ PYBIND11_MODULE(_franka, m) {
           },
           py::arg("flange_pose_wxyz"),
           "IK for a live command to the flange pose (tx,ty,tz,qw,qx,qy,qz), from the measured joints, within "
-          "the FR3 joint limits, with each joint at most 0.5 rad from the measured joints, and the arm links at "
-          "least 0.09 m apart along the move; returns q (7,)")
+          "the FR3 joint limits, with each joint at most 0.5 rad from the measured joints. Along the move the arm "
+          "links stay 0.09 m apart, or as far apart as at the measured joints when that is less, to within "
+          "1 mm; returns q (7,)")
       .def(
           "inverse_kinematics_with_limits",
           [](positronic_franka::Robot& r, const positronic_franka::Vector7d& flange_pose_wxyz,
@@ -217,7 +218,9 @@ PYBIND11_MODULE(_franka, m) {
           py::arg("flange_pose_wxyz"), py::arg("q0"),
           py::arg("max_step") = positronic_franka::IK_MAX_JOINT_STEP,
           "IK to the flange pose from joints q0 with each joint at most max_step (rad) from q0, within the "
-          "FR3 joint limits, and the arm links at least 0.09 m apart along the move from q0; returns q (7,)")
+          "FR3 joint limits. Along the move from q0 (from its nearest point within the limits when q0 is outside "
+          "them) the arm links stay 0.09 m apart, or as far apart as at its start when that is less, to within "
+          "1 mm; returns q (7,)")
       .def("set_target_joints", &positronic_franka::Robot::set_target_joints,
            py::arg("q_target"), py::arg("deadline_s") = positronic_franka::DEFAULT_MOVE_DEADLINE_S,
            "Command a joint move to target (7,) and return immediately; poll goal() for the outcome. "
