@@ -87,7 +87,6 @@ inline std::pair<Eigen::Vector3d, Eigen::Vector3d> closest_points_of_segments(co
 struct SelfCollisionClearance {
   double clearance;  // m; negative when the capsules overlap
   Vector7d gradient;  // d clearance / dq
-  int link_a, link_b;
 };
 
 // How fast a point fixed to `link` moves along `direction`, per radian of each joint.
@@ -101,37 +100,40 @@ inline Vector7d point_speed_along(const LinkFrames& f, int link, const Eigen::Ve
   return g;
 }
 
+using CapsuleSegment = std::pair<Eigen::Vector3d, Eigen::Vector3d>;  // the two sphere centres, base frame
+
+// The clearance of two capsules, and its gradient in the joints.
+inline SelfCollisionClearance capsule_clearance(const LinkFrames& f, const Capsule& a, const CapsuleSegment& sa,
+                                                const Capsule& b, const CapsuleSegment& sb) {
+  const auto [pa, pb] = closest_points_of_segments(sa.first, sa.second, sb.first, sb.second);
+  const double distance = (pa - pb).norm();
+  // Crossed axes give no direction to push apart; the IK keeps 0.09 m, far from that depth.
+  const Eigen::Vector3d n = distance > 1e-9 ? Eigen::Vector3d((pa - pb) / distance) : Eigen::Vector3d::Zero();
+  return {distance - a.radius - b.radius, point_speed_along(f, a.link, pa, n) - point_speed_along(f, b.link, pb, n)};
+}
+
 // The clearance of each pair in FR3_SELF_COLLISION_PAIRS, over the closest of their capsules.
 inline std::array<SelfCollisionClearance, FR3_SELF_COLLISION_PAIRS.size()> self_collision_clearances(
     const Vector7d& q) {
   const LinkFrames f = fr3_link_frames(q);
   const auto capsules = fr3_self_collision_capsules();
-  std::array<std::pair<Eigen::Vector3d, Eigen::Vector3d>, capsules.size()> ends;
+  std::array<CapsuleSegment, capsules.size()> segments;
   for (std::size_t i = 0; i < capsules.size(); ++i) {
     const Capsule& cap = capsules[i];
     const Eigen::Vector3d center = f[cap.link] * cap.center;
     const Eigen::Vector3d half = f[cap.link].linear() * cap.axis * (0.5 * cap.length);
-    ends[i] = {center - half, center + half};
+    segments[i] = {center - half, center + half};
   }
   std::array<SelfCollisionClearance, FR3_SELF_COLLISION_PAIRS.size()> out;
   for (std::size_t k = 0; k < FR3_SELF_COLLISION_PAIRS.size(); ++k) {
     const auto [la, lb] = FR3_SELF_COLLISION_PAIRS[k];
-    SelfCollisionClearance best{std::numeric_limits<double>::infinity(), Vector7d::Zero(), la, lb};
-    for (std::size_t i = 0; i < capsules.size(); ++i) {
-      if (capsules[i].link != la) continue;
-      for (std::size_t j = 0; j < capsules.size(); ++j) {
-        if (capsules[j].link != lb) continue;
-        const auto [pa, pb] = closest_points_of_segments(ends[i].first, ends[i].second, ends[j].first, ends[j].second);
-        const double distance = (pa - pb).norm();
-        const double clearance = distance - capsules[i].radius - capsules[j].radius;
-        if (clearance >= best.clearance) continue;
-        best.clearance = clearance;
-        // Crossed axes give no direction to push apart; the IK keeps 0.09 m, far from that depth.
-        const Eigen::Vector3d n = distance > 1e-9 ? Eigen::Vector3d((pa - pb) / distance) : Eigen::Vector3d::Zero();
-        best.gradient = point_speed_along(f, la, pa, n) - point_speed_along(f, lb, pb, n);
-      }
-    }
-    out[k] = best;
+    out[k] = {std::numeric_limits<double>::infinity(), Vector7d::Zero()};
+    for (std::size_t i = 0; i < capsules.size(); ++i)
+      for (std::size_t j = 0; j < capsules.size(); ++j)
+        if (capsules[i].link == la && capsules[j].link == lb) {
+          const SelfCollisionClearance c = capsule_clearance(f, capsules[i], segments[i], capsules[j], segments[j]);
+          if (c.clearance < out[k].clearance) out[k] = c;
+        }
   }
   return out;
 }
