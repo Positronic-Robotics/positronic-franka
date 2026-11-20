@@ -230,14 +230,22 @@ Vector7d solve_damped_pose_ik(const Kinematics& kinematics, const Eigen::Ref<con
 
 // The point of the move from `from` to `to` farthest along it whose path keeps every checked pair at
 // IK_SELF_COLLISION_CLEARANCE, or at the clearance of `from` when `from` is closer than that.
+// Between two checked points the clearance can fall by IK_SELF_COLLISION_PATH_TOLERANCE, and not more:
+// the points are close enough for the rate bound of each joint (fr3_clearance_rate_bounds).
 inline Vector7d stop_before_self_collision(const Vector7d& from, const Vector7d& to) {
-  constexpr int kSamples = 16;
+  constexpr int kLeastSamples = 16;
   constexpr int kBisections = 8;
+  static const Vector7d rate_bounds = fr3_clearance_rate_bounds();
+  // The most the clearance changes over the whole move. Between two points 1 / samples apart that both keep
+  // the floor, the clearance falls at most change_over_move / (2 * samples) below the floor.
+  const double change_over_move = rate_bounds.dot((to - from).cwiseAbs());
+  const int samples =
+      std::max(kLeastSamples, static_cast<int>(std::ceil(change_over_move / (2 * IK_SELF_COLLISION_PATH_TOLERANCE))));
   const double least = std::min(IK_SELF_COLLISION_CLEARANCE, closest_self_collision_pair(from).clearance);
   const auto clear = [&](double s) { return closest_self_collision_pair(from + s * (to - from)).clearance >= least; };
   double safe = 0.0;
-  for (int i = 1; i <= kSamples; ++i) {
-    const double s = static_cast<double>(i) / kSamples;
+  for (int i = 1; i <= samples; ++i) {
+    const double s = static_cast<double>(i) / samples;
     if (clear(s)) {
       safe = s;
       continue;

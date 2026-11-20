@@ -49,18 +49,24 @@ constexpr std::array<std::pair<int, int>, 8> FR3_SELF_COLLISION_PAIRS = {
 // stopped moves at 0.064 m and less, and let moves through at 0.07 m and more.
 constexpr double IK_SELF_COLLISION_CLEARANCE = 0.09;
 
-// Base-frame transforms of link0 .. link7 and of the flange (link8), from Franka's modified DH parameters.
+// How far below its floor the clearance may fall between two checked points of a move.
+constexpr double IK_SELF_COLLISION_PATH_TOLERANCE = 0.001;
+
+// Franka's modified DH parameters of joints 1 .. 7 and of the flange.
+constexpr std::array<double, 8> FR3_DH_A = {0, 0, 0, 0.0825, -0.0825, 0, 0.088, 0};
+constexpr std::array<double, 8> FR3_DH_D = {0.333, 0, 0.316, 0, 0.384, 0, 0, 0.107};
+constexpr std::array<double, 8> FR3_DH_ALPHA = {0, -M_PI / 2, M_PI / 2, M_PI / 2, -M_PI / 2, M_PI / 2, M_PI / 2, 0};
+
+// Base-frame transforms of link0 .. link7 and of the flange (link8).
 using LinkFrames = std::array<Eigen::Isometry3d, 9>;
 
 inline LinkFrames fr3_link_frames(const Vector7d& q) {
-  constexpr std::array<double, 8> a = {0, 0, 0, 0.0825, -0.0825, 0, 0.088, 0};
-  constexpr std::array<double, 8> d = {0.333, 0, 0.316, 0, 0.384, 0, 0, 0.107};
-  constexpr std::array<double, 8> alpha = {0, -M_PI / 2, M_PI / 2, M_PI / 2, -M_PI / 2, M_PI / 2, M_PI / 2, 0};
   LinkFrames f;
   f[0] = Eigen::Isometry3d::Identity();
   for (int i = 0; i < 8; ++i)
-    f[i + 1] = f[i] * Eigen::AngleAxisd(alpha[i], Eigen::Vector3d::UnitX()) * Eigen::Translation3d(a[i], 0, 0) *
-               Eigen::AngleAxisd(i < 7 ? q(i) : 0.0, Eigen::Vector3d::UnitZ()) * Eigen::Translation3d(0, 0, d[i]);
+    f[i + 1] = f[i] * Eigen::AngleAxisd(FR3_DH_ALPHA[i], Eigen::Vector3d::UnitX()) *
+               Eigen::Translation3d(FR3_DH_A[i], 0, 0) * Eigen::AngleAxisd(i < 7 ? q(i) : 0.0, Eigen::Vector3d::UnitZ()) *
+               Eigen::Translation3d(0, 0, FR3_DH_D[i]);
   return f;
 }
 
@@ -136,6 +142,25 @@ inline std::array<SelfCollisionClearance, FR3_SELF_COLLISION_PAIRS.size()> self_
         }
   }
   return out;
+}
+
+// For each joint, the most that the clearance of a checked pair changes per radian of that joint, at any q.
+// A joint turns a point at most its distance from the joint origin per radian. The DH chain from the joint
+// origin to the link origin, plus the farthest capsule end from the link origin, bounds that distance.
+// A joint before both links of a pair turns the two links together and does not change their clearance.
+inline Vector7d fr3_clearance_rate_bounds() {
+  Vector7d bound = Vector7d::Zero();
+  for (const auto& [la, lb] : FR3_SELF_COLLISION_PAIRS)
+    for (const Capsule& cap : fr3_self_collision_capsules()) {
+      if (cap.link != lb) continue;
+      const Eigen::Vector3d half = cap.axis * (0.5 * cap.length);
+      double reach = std::max((cap.center - half).norm(), (cap.center + half).norm());
+      for (int j = lb - 1; j >= la; --j) {  // joint j has its origin at link j + 1
+        bound(j) = std::max(bound(j), reach);
+        reach += std::hypot(FR3_DH_A[j], FR3_DH_D[j]);  // from link j + 1 to link j
+      }
+    }
+  return bound;
 }
 
 inline SelfCollisionClearance closest_self_collision_pair(const Vector7d& q) {

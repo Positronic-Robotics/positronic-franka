@@ -22,6 +22,7 @@ namespace {
 using positronic_franka::closest_points_of_segments;
 using positronic_franka::closest_self_collision_pair;
 using positronic_franka::flange_pose;
+using positronic_franka::fr3_clearance_rate_bounds;
 using positronic_franka::fr3_link_frames;
 using positronic_franka::FR3_JOINT_LOWER_LIMITS;
 using positronic_franka::FR3_JOINT_UPPER_LIMITS;
@@ -30,6 +31,7 @@ using positronic_franka::IK_MAX_JOINT_STEP;
 using positronic_franka::IK_POSTURE_JOINTS;
 using positronic_franka::IK_POSTURE_PULL_PER_COMMAND;
 using positronic_franka::IK_SELF_COLLISION_CLEARANCE;
+using positronic_franka::IK_SELF_COLLISION_PATH_TOLERANCE;
 using positronic_franka::IK_SELF_COLLISION_PUSH_CLEARANCE;
 using positronic_franka::Matrix7d;
 using positronic_franka::minimize_on_box;
@@ -37,8 +39,10 @@ using positronic_franka::nullspace_projector;
 using positronic_franka::point_jacobian;
 using positronic_franka::pose_error;
 using positronic_franka::self_collision_clearances;
+using positronic_franka::SelfCollisionClearance;
 using positronic_franka::solve_damped_pose_ik;
 using positronic_franka::solve_pose_ik;
+using positronic_franka::stop_before_self_collision;
 using positronic_franka::SpatialJacobian;
 using positronic_franka::ToolKinematics;
 using positronic_franka::Vector6d;
@@ -415,13 +419,46 @@ void the_clearance_gradient_is_the_derivative_of_the_clearance() {
   }
 }
 
+// At random joints over the FR3 range, no joint changes the clearance of a checked pair faster than its bound.
+void no_joint_changes_a_clearance_faster_than_its_rate_bound() {
+  std::mt19937 rng(13);
+  std::uniform_real_distribution<double> u(0.0, 1.0);
+  const Vector7d bound = fr3_clearance_rate_bounds();
+  for (int trial = 0; trial < 2000; ++trial) {
+    Vector7d q;
+    for (int i = 0; i < 7; ++i)
+      q(i) = FR3_JOINT_LOWER_LIMITS[i] + u(rng) * (FR3_JOINT_UPPER_LIMITS[i] - FR3_JOINT_LOWER_LIMITS[i]);
+    for (const SelfCollisionClearance& c : self_collision_clearances(q))
+      check((c.gradient.cwiseAbs().array() <= bound.array() + 1e-12).all(),
+            "a joint changes a clearance faster than its bound");
+  }
+}
+
 double clearance(const Vector7d& q) { return closest_self_collision_pair(q).clearance; }
 
-// The least clearance at 200 points of the straight joint move from `from` to `to`.
+// The least clearance at 2000 points of the straight joint move from `from` to `to`.
 double least_clearance_on_the_move(const Vector7d& from, const Vector7d& to) {
   double least = clearance(from);
-  for (int i = 1; i <= 200; ++i) least = std::min(least, clearance(from + i / 200.0 * (to - from)));
+  for (int i = 1; i <= 2000; ++i) least = std::min(least, clearance(from + i / 2000.0 * (to - from)));
   return least;
+}
+
+// A long move whose clearance falls to 0.084 m between its points 8/16 and 9/16, which both keep 0.09 m.
+// The guard stops the move before the dip, and plays the clear rest of the move from 9/16 to its end.
+void a_move_that_dips_between_two_of_sixteen_points_stops_before_the_dip() {
+  Vector7d from, to;
+  from << -2.025573, 1.055818, 2.246552, -2.790485, 2.673202, 2.095729, -1.071398;
+  to << 1.167132, 0.990198, -2.123749, -2.129653, 0.255810, 1.355959, 2.292034;
+  for (int i = 0; i <= 16; ++i)
+    check(clearance(from + i / 16.0 * (to - from)) >= IK_SELF_COLLISION_CLEARANCE, "a sixteenth point is too close");
+  check(least_clearance_on_the_move(from, to) < IK_SELF_COLLISION_CLEARANCE - 0.005, "the move does not dip");
+  const Vector7d stop = stop_before_self_collision(from, to);
+  check(least_clearance_on_the_move(from, stop) >= IK_SELF_COLLISION_CLEARANCE - IK_SELF_COLLISION_PATH_TOLERANCE,
+        "the move goes into the dip");
+  check((stop - from).norm() > 0.5 * (to - from).norm(), "the move stops far before the dip");
+  const Vector7d after_the_dip = from + 9.0 / 16 * (to - from);
+  check(least_clearance_on_the_move(after_the_dip, to) >= IK_SELF_COLLISION_CLEARANCE, "the rest is not clear");
+  check(stop_before_self_collision(after_the_dip, to) == to, "the clear rest of the move stops short");
 }
 
 // An FR3 posture of a recorded episode: the shoulder back and the elbow folded, link 5 5.1 cm from link 2.
@@ -515,6 +552,9 @@ int main() {
        the_closest_points_of_two_segments_are_on_their_common_normal_or_at_an_end},
       {"the_clearance_gradient_is_the_derivative_of_the_clearance",
        the_clearance_gradient_is_the_derivative_of_the_clearance},
+      {"no_joint_changes_a_clearance_faster_than_its_rate_bound", no_joint_changes_a_clearance_faster_than_its_rate_bound},
+      {"a_move_that_dips_between_two_of_sixteen_points_stops_before_the_dip",
+       a_move_that_dips_between_two_of_sixteen_points_stops_before_the_dip},
       {"the_move_to_a_pose_whose_joints_are_too_close_keeps_the_self_collision_clearance",
        the_move_to_a_pose_whose_joints_are_too_close_keeps_the_self_collision_clearance},
       {"a_pose_whose_joints_are_just_outside_the_push_clearance_is_reached_within_0_1_mm_and_0_1_deg",
