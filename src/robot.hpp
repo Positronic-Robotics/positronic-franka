@@ -482,8 +482,8 @@ class Robot {
                                 line_search_alpha, line_search_beta, line_search_max_steps);
   }
 
-  // The IK for a live command: the joints that bring the flange as close as the bounds allow to
-  // flange_pose_wxyz, from the measured joints.
+  // The IK for a live command: the joints that bring the flange as close as the bounds and the self-collision
+  // clearance allow to flange_pose_wxyz, from the measured joints.
   Vector7d inverse_kinematics_with_limits(const Eigen::Ref<const Vector7d>& flange_pose_wxyz) {
     const franka::RobotState base = read_robot_state_();
     return inverse_kinematics_with_limits(flange_pose_wxyz, Eigen::Map<const Vector7d>(base.q.data()),

@@ -11,6 +11,7 @@
 #include <Eigen/SVD>
 
 #include "impedance_law.hpp"
+#include "self_collision.hpp"
 
 namespace positronic_franka {
 
@@ -33,6 +34,9 @@ constexpr double IK_MAX_JOINT_STEP = 0.5;
 constexpr std::array<double, 7> IK_POSTURE_JOINTS = {0.0, -0.31, 0.0, -1.65, 0.0, 1.522, 0.0};
 // Part of the null-space offset from IK_POSTURE_JOINTS that one command removes.
 constexpr double IK_POSTURE_PULL_PER_COMMAND = 0.02;
+// Below this clearance between two checked links, the IK pushes them apart. It is above
+// IK_SELF_COLLISION_CLEARANCE, so the soft push holds the answer clear of the hard floor.
+constexpr double IK_SELF_COLLISION_PUSH_CLEARANCE = 0.10;
 
 // The damped IK stops when the norm of the pose error is below this value, or after DAMPED_IK_MAX_ITERATIONS steps.
 constexpr double DAMPED_IK_TOLERANCE = 1e-4;
@@ -224,8 +228,33 @@ Vector7d solve_damped_pose_ik(const Kinematics& kinematics, const Eigen::Ref<con
   return q;
 }
 
+// The point of the move from `from` to `to` farthest along it whose path keeps every checked pair at
+// IK_SELF_COLLISION_CLEARANCE, or at the clearance of `from` when `from` is closer than that.
+inline Vector7d stop_before_self_collision(const Vector7d& from, const Vector7d& to) {
+  constexpr int kSamples = 16;
+  constexpr int kBisections = 8;
+  const double least = std::min(IK_SELF_COLLISION_CLEARANCE, closest_self_collision_pair(from).clearance);
+  const auto clear = [&](double s) { return closest_self_collision_pair(from + s * (to - from)).clearance >= least; };
+  double safe = 0.0;
+  for (int i = 1; i <= kSamples; ++i) {
+    const double s = static_cast<double>(i) / kSamples;
+    if (clear(s)) {
+      safe = s;
+      continue;
+    }
+    double blocked = s;
+    for (int b = 0; b < kBisections; ++b) {
+      const double mid = 0.5 * (safe + blocked);
+      (clear(mid) ? safe : blocked) = mid;
+    }
+    return from + safe * (to - from);
+  }
+  return to;
+}
+
 // Joints that put the tool as close as the bounds allow to `target_pose_wxyz` (tx, ty, tz, qw, qx, qy, qz).
 // Each joint stays within the FR3 limits and within `max_step` of q0; near a singularity the move q - q0 is damped.
+// The checked FR3 links keep IK_SELF_COLLISION_CLEARANCE along the move from q0 (self_collision.hpp).
 template <typename Kinematics>
 Vector7d solve_pose_ik(const Kinematics& kinematics, const Eigen::Ref<const Vector7d>& target_pose_wxyz,
                        const Eigen::Ref<const Vector7d>& q0, double max_step) {
@@ -253,6 +282,9 @@ Vector7d solve_pose_ik(const Kinematics& kinematics, const Eigen::Ref<const Vect
   const double posture_target = -IK_POSTURE_PULL_PER_COMMAND * null_direction.dot(q0 - posture);
   constexpr double kPostureWeight = 0.1;
   const double w_sq = kPostureWeight * kPostureWeight;
+  // 1 cm inside IK_SELF_COLLISION_PUSH_CLEARANCE costs as much as 20 cm of tool error.
+  constexpr double kCollisionWeight = 20.0;
+  constexpr double kCollisionWeightSq = kCollisionWeight * kCollisionWeight;
 
   Vector7d lower, upper;
   for (int i = 0; i < 7; ++i) {
@@ -270,14 +302,19 @@ Vector7d solve_pose_ik(const Kinematics& kinematics, const Eigen::Ref<const Vect
     const SpatialJacobian& J = k.jacobian;
     const Vector6d e = pose_error(k.pose, t_tgt, R_tgt);
     const double posture_residual = null_direction.dot(q - q0) - posture_target;
-    const Matrix7d H = J.transpose() * J + (mu_sq + kLevenberg) * Matrix7d::Identity() +
-                       w_sq * null_direction * null_direction.transpose();
-    const Vector7d g = J.transpose() * e + mu_sq * (q - q0) + w_sq * posture_residual * null_direction;
+    Matrix7d H = J.transpose() * J + (mu_sq + kLevenberg) * Matrix7d::Identity() +
+                 w_sq * null_direction * null_direction.transpose();
+    Vector7d g = J.transpose() * e + mu_sq * (q - q0) + w_sq * posture_residual * null_direction;
+    for (const SelfCollisionClearance& c : self_collision_clearances(q)) {
+      if (c.clearance >= IK_SELF_COLLISION_PUSH_CLEARANCE) continue;
+      H += kCollisionWeightSq * c.gradient * c.gradient.transpose();
+      g += kCollisionWeightSq * (c.clearance - IK_SELF_COLLISION_PUSH_CLEARANCE) * c.gradient;
+    }
     const Vector7d d = minimize_on_box(H, g, lower - q, upper - q);
     q = (q + d).cwiseMax(lower).cwiseMin(upper);
     if (d.norm() < kStepTolerance) break;
   }
-  return q;
+  return stop_before_self_collision(q0.cwiseMax(lower).cwiseMin(upper), q);
 }
 
 }  // namespace positronic_franka

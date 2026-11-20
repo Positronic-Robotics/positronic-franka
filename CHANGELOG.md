@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.12.3] - 2026-11-20
+
+### Added
+- `self_collision.hpp`: the FR3 self-collision capsules of franka_description, the arm link pairs that its SRDF checks, and the clearance of each pair with its gradient in the joints. The gripper on the flange has no capsule. `tests/test_pose_ik.cpp` checks the gradient against central differences, and the link frames against the flange kinematics.
+
+### Changed
+- **Behaviour.** `inverse_kinematics_with_limits` keeps the arm links apart. When two checked links are closer than `IK_SELF_COLLISION_PUSH_CLEARANCE` (0.10 m), the solver pushes them apart: 1 cm inside that clearance costs as much as 20 cm of flange error. Then the answer stops where the move from q0 first comes closer than `IK_SELF_COLLISION_CLEARANCE` (0.09 m). When q0 is already closer, the clearance at q0 is the floor, so the arm can move out.
+- In a recorded FR3 episode, the self-collision reflex stopped the arm 183 times, each time with link 2 and link 5 at 0.050 to 0.064 m. A replay of all the commands of that episode through the old IK took those links to -0.050 m. Through the new IK, every answer keeps every checked pair at 0.090 m or more. For a flange target 20 cm in front of the base, the old IK put the links 1 cm apart, and the new IK stops about 2 cm short of the target. On the way, the joints can move far from the start: joint 1 turned 1.5 rad in the replay.
+- `ik_verifier` samples targets near the measured joints. Near a self-collision posture, its Limits IK check can now stop short of a target.
+
 ## [0.12.2] - 2026-11-12
 
 ### Added

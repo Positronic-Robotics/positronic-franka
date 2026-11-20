@@ -1,4 +1,5 @@
-// Checks the pose IK in pose_ik.hpp on the FR3 flange kinematics. Needs only Eigen, not libfranka:
+// Checks the pose IK in pose_ik.hpp and its self-collision model in self_collision.hpp on the FR3 flange
+// kinematics. Needs only Eigen, not libfranka:
 //   g++ -std=c++17 -I src $(pkg-config --cflags eigen3) tests/test_pose_ik.cpp -o test_pose_ik
 //   ./test_pose_ik
 
@@ -18,18 +19,24 @@
 
 namespace {
 
+using positronic_franka::closest_points_of_segments;
+using positronic_franka::closest_self_collision_pair;
 using positronic_franka::flange_pose;
+using positronic_franka::fr3_link_frames;
 using positronic_franka::FR3_JOINT_LOWER_LIMITS;
 using positronic_franka::FR3_JOINT_UPPER_LIMITS;
 using positronic_franka::IK_DAMPING_SINGULAR_VALUE;
 using positronic_franka::IK_MAX_JOINT_STEP;
 using positronic_franka::IK_POSTURE_JOINTS;
 using positronic_franka::IK_POSTURE_PULL_PER_COMMAND;
+using positronic_franka::IK_SELF_COLLISION_CLEARANCE;
+using positronic_franka::IK_SELF_COLLISION_PUSH_CLEARANCE;
 using positronic_franka::Matrix7d;
 using positronic_franka::minimize_on_box;
 using positronic_franka::nullspace_projector;
 using positronic_franka::point_jacobian;
 using positronic_franka::pose_error;
+using positronic_franka::self_collision_clearances;
 using positronic_franka::solve_damped_pose_ik;
 using positronic_franka::solve_pose_ik;
 using positronic_franka::SpatialJacobian;
@@ -365,6 +372,112 @@ void the_point_jacobian_at_the_flange_origin_is_the_flange_jacobian() {
   check(point_jacobian(flange, Eigen::Vector3d::Zero()) == flange.jacobian, "a zero offset changes the Jacobian");
 }
 
+
+void the_link_frames_end_at_the_fr3_flange() {
+  std::mt19937 rng(3);
+  std::uniform_real_distribution<double> u(-1.0, 1.0);
+  for (int trial = 0; trial < 50; ++trial) {
+    Vector7d q = posture();
+    for (int i = 0; i < 7; ++i) q(i) += u(rng);
+    check((fr3_link_frames(q)[8].matrix() - fr3_flange(q).pose).cwiseAbs().maxCoeff() < 1e-12,
+          "link 8 is not the flange");
+  }
+}
+
+void the_closest_points_of_two_segments_are_on_their_common_normal_or_at_an_end() {
+  const Eigen::Vector3d o(0, 0, 0), x(1, 0, 0), z(0, 0, 1);
+  const auto [a, b] = closest_points_of_segments(-x, x, Eigen::Vector3d(0, -1, 1), Eigen::Vector3d(0, 1, 1));
+  check((a - o).norm() < 1e-12 && (b - z).norm() < 1e-12, "crossed segments miss their common normal");
+  const auto [c, d] = closest_points_of_segments(o, x, Eigen::Vector3d(2, 1, 0), Eigen::Vector3d(2, -1, 0));
+  check((c - x).norm() < 1e-12 && (d - 2 * x).norm() < 1e-12, "the closest point is not the end of the segment");
+  const auto [e, f] = closest_points_of_segments(o, x, z, z + x);
+  check(std::abs((e - f).norm() - 1.0) < 1e-12, "parallel segments are not 1 m apart");
+}
+
+// Central differences of each pair's clearance, against its gradient.
+void the_clearance_gradient_is_the_derivative_of_the_clearance() {
+  std::mt19937 rng(11);
+  std::uniform_real_distribution<double> u(-1.0, 1.0);
+  for (int trial = 0; trial < 50; ++trial) {
+    Vector7d q = posture();
+    for (int i = 0; i < 7; ++i) q(i) += 1.5 * u(rng);
+    const auto pairs = self_collision_clearances(q);
+    constexpr double h = 1e-6;
+    for (int i = 0; i < 7; ++i) {
+      Vector7d up = q, down = q;
+      up(i) += h;
+      down(i) -= h;
+      const auto above = self_collision_clearances(up), below = self_collision_clearances(down);
+      for (std::size_t k = 0; k < pairs.size(); ++k)
+        check(std::abs(pairs[k].gradient(i) - (above[k].clearance - below[k].clearance) / (2 * h)) < 1e-6,
+              "the gradient misses the clearance derivative");
+    }
+  }
+}
+
+double clearance(const Vector7d& q) { return closest_self_collision_pair(q).clearance; }
+
+// The least clearance at 200 points of the straight joint move from `from` to `to`.
+double least_clearance_on_the_move(const Vector7d& from, const Vector7d& to) {
+  double least = clearance(from);
+  for (int i = 1; i <= 200; ++i) least = std::min(least, clearance(from + i / 200.0 * (to - from)));
+  return least;
+}
+
+// An FR3 posture of a recorded episode: the shoulder back and the elbow folded, link 5 5.1 cm from link 2.
+// The self-collision reflex stopped the arm here again and again.
+Vector7d shoulder_back_elbow_folded() {
+  Vector7d q;
+  q << 0.98877418, -1.15661502, -0.96312511, -2.93868756, -0.990777671, 2.05664039, 1.14565432;
+  return q;
+}
+
+// The flange target of that episode at that posture, 30 cm lower.
+Vector7d flange_target_below_the_folded_elbow() {
+  Vector7d target;
+  target << 0.202441812, -0.005892748, 0.048565254, 0.000218116, 0.993636106, -0.065788185, -0.091428419;
+  return target;
+}
+
+// Joints a part `s` of the way from the posture to the folded elbow, at 0.123 m clearance for s = 0.84.
+Vector7d towards_the_folded_elbow(double s) { return posture() + s * (shoulder_back_elbow_folded() - posture()); }
+
+void the_move_to_a_pose_whose_joints_are_too_close_keeps_the_self_collision_clearance() {
+  const Vector7d q0 = towards_the_folded_elbow(0.84);
+  const Vector7d target = pose_wxyz(fr3_flange(shoulder_back_elbow_folded()).pose);
+  check(clearance(q0) > IK_SELF_COLLISION_PUSH_CLEARANCE, "the start is not clear");
+  const Vector7d q = solve_pose_ik(fr3_flange, target, q0, IK_MAX_JOINT_STEP);
+  check(least_clearance_on_the_move(q0, q) >= IK_SELF_COLLISION_CLEARANCE - 1e-9, "the move goes inside the clearance");
+  check(miss(q, target).first < miss(q0, target).first, "the answer is not nearer the target than the start");
+}
+
+void a_pose_whose_joints_are_just_outside_the_push_clearance_is_reached_within_0_1_mm_and_0_1_deg() {
+  const Vector7d q_target = towards_the_folded_elbow(0.86);
+  const double c = clearance(q_target);
+  check(c > IK_SELF_COLLISION_PUSH_CLEARANCE && c < IK_SELF_COLLISION_PUSH_CLEARANCE + 0.02,
+        "the target joints are not just outside the push clearance");
+  const Vector7d target = pose_wxyz(fr3_flange(q_target).pose);
+  const auto [mm, deg] = miss(solve_pose_ik(fr3_flange, target, towards_the_folded_elbow(0.84), IK_MAX_JOINT_STEP),
+                              target);
+  check(mm < 0.1 && deg < 0.1, "a pose outside the push clearance is not reached");
+}
+
+// From a start inside the clearance, each command moves the links apart, and none brings them closer.
+// The target is 20 cm in front of the base; the clearance holds the flange about 2 cm from it.
+void a_start_inside_the_clearance_moves_out_and_reaches_down_to_the_target() {
+  const Vector7d target = flange_target_below_the_folded_elbow();
+  Vector7d q = shoulder_back_elbow_folded();
+  check(clearance(q) < IK_SELF_COLLISION_CLEARANCE, "the start is not inside the clearance");
+  for (int command = 0; command < 30; ++command) {
+    const Vector7d next = solve_pose_ik(fr3_flange, target, q, IK_MAX_JOINT_STEP);
+    const double least = std::min(IK_SELF_COLLISION_CLEARANCE, clearance(q));
+    check(least_clearance_on_the_move(q, next) >= least - 1e-9, "a move brings the links closer than its start");
+    q = next;
+  }
+  check(clearance(q) >= IK_SELF_COLLISION_CLEARANCE, "the arm stays inside the clearance");
+  check(miss(q, target).first < 25.0, "the flange stays more than 2.5 cm from the target");
+}
+
 }  // namespace
 
 int main() {
@@ -397,6 +510,17 @@ int main() {
        the_point_jacobian_is_the_derivative_of_the_point_position},
       {"the_point_jacobian_at_the_flange_origin_is_the_flange_jacobian",
        the_point_jacobian_at_the_flange_origin_is_the_flange_jacobian},
+      {"the_link_frames_end_at_the_fr3_flange", the_link_frames_end_at_the_fr3_flange},
+      {"the_closest_points_of_two_segments_are_on_their_common_normal_or_at_an_end",
+       the_closest_points_of_two_segments_are_on_their_common_normal_or_at_an_end},
+      {"the_clearance_gradient_is_the_derivative_of_the_clearance",
+       the_clearance_gradient_is_the_derivative_of_the_clearance},
+      {"the_move_to_a_pose_whose_joints_are_too_close_keeps_the_self_collision_clearance",
+       the_move_to_a_pose_whose_joints_are_too_close_keeps_the_self_collision_clearance},
+      {"a_pose_whose_joints_are_just_outside_the_push_clearance_is_reached_within_0_1_mm_and_0_1_deg",
+       a_pose_whose_joints_are_just_outside_the_push_clearance_is_reached_within_0_1_mm_and_0_1_deg},
+      {"a_start_inside_the_clearance_moves_out_and_reaches_down_to_the_target",
+       a_start_inside_the_clearance_moves_out_and_reaches_down_to_the_target},
   };
   int failed = 0;
   for (const auto& [name, test] : tests) {
