@@ -11,6 +11,7 @@
 #include <Eigen/SVD>
 
 #include "impedance_law.hpp"
+#include "self_collision.hpp"
 
 namespace positronic_franka {
 
@@ -33,6 +34,9 @@ constexpr double IK_MAX_JOINT_STEP = 0.5;
 constexpr std::array<double, 7> IK_POSTURE_JOINTS = {0.0, -0.31, 0.0, -1.65, 0.0, 1.522, 0.0};
 // Part of the null-space offset from IK_POSTURE_JOINTS that one command removes.
 constexpr double IK_POSTURE_PULL_PER_COMMAND = 0.02;
+// Below this clearance between two checked links, the IK pushes them apart. It is above
+// IK_SELF_COLLISION_CLEARANCE, so the soft push holds the answer clear of the hard floor.
+constexpr double IK_SELF_COLLISION_PUSH_CLEARANCE = 0.10;
 
 // The damped IK stops when the norm of the pose error is below this value, or after DAMPED_IK_MAX_ITERATIONS steps.
 constexpr double DAMPED_IK_TOLERANCE = 1e-4;
@@ -224,8 +228,49 @@ Vector7d solve_damped_pose_ik(const Kinematics& kinematics, const Eigen::Ref<con
   return q;
 }
 
+// The point of the move from `from` to `to` farthest along it whose path keeps each checked pair at its floor:
+// IK_SELF_COLLISION_CLEARANCE, or its own clearance at `from` when that is less.
+// Between two checked points a pair's clearance falls at most IK_SELF_COLLISION_PATH_TOLERANCE below its floor:
+// the points are close enough for the rate bound of each joint (fr3_clearance_rate_bounds).
+inline Vector7d stop_before_self_collision(const Vector7d& from, const Vector7d& to) {
+  constexpr int kLeastSamples = 16;
+  constexpr int kBisections = 8;
+  static const Vector7d rate_bounds = fr3_clearance_rate_bounds();
+  // The most a pair's clearance changes over the whole move. Between two points 1 / samples apart that both keep
+  // its floor, the clearance falls at most change_over_move / (2 * samples) below that floor.
+  const double change_over_move = rate_bounds.dot((to - from).cwiseAbs());
+  const int samples =
+      std::max(kLeastSamples, static_cast<int>(std::ceil(change_over_move / (2 * IK_SELF_COLLISION_PATH_TOLERANCE))));
+  std::array<double, FR3_SELF_COLLISION_PAIRS.size()> floors;
+  const auto at_from = self_collision_clearances(from);
+  for (std::size_t k = 0; k < floors.size(); ++k)
+    floors[k] = std::min(IK_SELF_COLLISION_CLEARANCE, at_from[k].clearance);
+  const auto clear = [&](double s) {
+    const auto pairs = self_collision_clearances(from + s * (to - from));
+    for (std::size_t k = 0; k < pairs.size(); ++k)
+      if (pairs[k].clearance < floors[k]) return false;
+    return true;
+  };
+  double safe = 0.0;
+  for (int i = 1; i <= samples; ++i) {
+    const double s = static_cast<double>(i) / samples;
+    if (clear(s)) {
+      safe = s;
+      continue;
+    }
+    double blocked = s;
+    for (int b = 0; b < kBisections; ++b) {
+      const double mid = 0.5 * (safe + blocked);
+      (clear(mid) ? safe : blocked) = mid;
+    }
+    return from + safe * (to - from);
+  }
+  return to;
+}
+
 // Joints that put the tool as close as the bounds allow to `target_pose_wxyz` (tx, ty, tz, qw, qx, qy, qz).
 // Each joint stays within the FR3 limits and within `max_step` of q0; near a singularity the move q - q0 is damped.
+// The move from q0, or from its nearest point within the FR3 limits, keeps the floor of stop_before_self_collision.
 template <typename Kinematics>
 Vector7d solve_pose_ik(const Kinematics& kinematics, const Eigen::Ref<const Vector7d>& target_pose_wxyz,
                        const Eigen::Ref<const Vector7d>& q0, double max_step) {
@@ -253,6 +298,9 @@ Vector7d solve_pose_ik(const Kinematics& kinematics, const Eigen::Ref<const Vect
   const double posture_target = -IK_POSTURE_PULL_PER_COMMAND * null_direction.dot(q0 - posture);
   constexpr double kPostureWeight = 0.1;
   const double w_sq = kPostureWeight * kPostureWeight;
+  // 1 cm inside IK_SELF_COLLISION_PUSH_CLEARANCE costs as much as 20 cm of tool error.
+  constexpr double kCollisionWeight = 20.0;
+  constexpr double kCollisionWeightSq = kCollisionWeight * kCollisionWeight;
 
   Vector7d lower, upper;
   for (int i = 0; i < 7; ++i) {
@@ -263,21 +311,68 @@ Vector7d solve_pose_ik(const Kinematics& kinematics, const Eigen::Ref<const Vect
   // minimize_on_box needs a box that holds a point. NaN fails the comparison too.
   if (!(lower.array() <= upper.array()).all())
     throw std::invalid_argument("no joints are within max_step of q0 and inside the FR3 limits");
-  Vector7d q = q0.cwiseMax(lower).cwiseMin(upper);
+  const Vector7d start = q0.cwiseMax(lower).cwiseMin(upper);
 
-  for (int it = 0; it < kMaxIterations; ++it) {
-    const ToolKinematics k = kinematics(q);
-    const SpatialJacobian& J = k.jacobian;
-    const Vector6d e = pose_error(k.pose, t_tgt, R_tgt);
-    const double posture_residual = null_direction.dot(q - q0) - posture_target;
-    const Matrix7d H = J.transpose() * J + (mu_sq + kLevenberg) * Matrix7d::Identity() +
-                       w_sq * null_direction * null_direction.transpose();
-    const Vector7d g = J.transpose() * e + mu_sq * (q - q0) + w_sq * posture_residual * null_direction;
-    const Vector7d d = minimize_on_box(H, g, lower - q, upper - q);
-    q = (q + d).cwiseMax(lower).cwiseMin(upper);
-    if (d.norm() < kStepTolerance) break;
-  }
-  return q;
+  // One iterate: its kinematics, its pair clearances, and the cost that the Gauss-Newton step models.
+  struct Iterate {
+    Vector7d q;
+    ToolKinematics k;
+    Vector6d e;
+    std::array<SelfCollisionClearance, FR3_SELF_COLLISION_PAIRS.size()> pairs;
+    double posture_residual;
+    double cost;
+  };
+  const auto iterate_at = [&](const Vector7d& q) {
+    Iterate x{q, kinematics(q), Vector6d::Zero(), self_collision_clearances(q), 0.0, 0.0};
+    x.e = pose_error(x.k.pose, t_tgt, R_tgt);
+    x.posture_residual = null_direction.dot(q - q0) - posture_target;
+    x.cost = 0.5 * (x.e.squaredNorm() + mu_sq * (q - q0).squaredNorm() +
+                    w_sq * x.posture_residual * x.posture_residual);
+    for (const SelfCollisionClearance& c : x.pairs) {
+      const double inside = std::min(0.0, c.clearance - IK_SELF_COLLISION_PUSH_CLEARANCE);
+      x.cost += 0.5 * kCollisionWeightSq * inside * inside;
+    }
+    return x;
+  };
+  // A backtracking step lowers the cost by at least kSufficientDecrease of the slope's prediction, in at most
+  // kLineSearchSteps trials.
+  constexpr int kLineSearchSteps = 10;
+  constexpr double kSufficientDecrease = 1e-4;
+  struct Descent {
+    Vector7d q;
+    bool settled;
+  };
+  // Gauss-Newton from the start. With `backtrack`, each step is halved until the cost falls enough.
+  const auto descend = [&](bool backtrack) {
+    Iterate at = iterate_at(start);
+    for (int it = 0; it < kMaxIterations; ++it) {
+      const SpatialJacobian& J = at.k.jacobian;
+      Matrix7d H = J.transpose() * J + (mu_sq + kLevenberg) * Matrix7d::Identity() +
+                   w_sq * null_direction * null_direction.transpose();
+      Vector7d g = J.transpose() * at.e + mu_sq * (at.q - q0) + w_sq * at.posture_residual * null_direction;
+      for (const SelfCollisionClearance& c : at.pairs) {
+        if (c.clearance >= IK_SELF_COLLISION_PUSH_CLEARANCE) continue;
+        H += kCollisionWeightSq * c.gradient * c.gradient.transpose();
+        g += kCollisionWeightSq * (c.clearance - IK_SELF_COLLISION_PUSH_CLEARANCE) * c.gradient;
+      }
+      const Vector7d d = minimize_on_box(H, g, lower - at.q, upper - at.q);
+      if (d.norm() < kStepTolerance) return Descent{(at.q + d).cwiseMax(lower).cwiseMin(upper), true};
+      double part = 1.0;
+      Iterate next = iterate_at((at.q + d).cwiseMax(lower).cwiseMin(upper));
+      const auto too_high = [&] { return backtrack && next.cost > at.cost + kSufficientDecrease * part * g.dot(d); };
+      for (int ls = 1; ls < kLineSearchSteps && too_high(); ++ls) {
+        part *= 0.5;
+        next = iterate_at((at.q + part * d).cwiseMax(lower).cwiseMin(upper));
+      }
+      if (too_high()) return Descent{at.q, true};  // no step lowers the cost
+      at = next;
+    }
+    return Descent{at.q, false};
+  };
+  // Full steps can overshoot the push and cycle without settling; the backtracking descent then gives the answer.
+  Descent answer = descend(false);
+  if (!answer.settled) answer = descend(true);
+  return stop_before_self_collision(start, answer.q);
 }
 
 }  // namespace positronic_franka

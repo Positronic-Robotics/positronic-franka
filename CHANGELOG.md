@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.12.3] - 2026-11-20
+
+### Added
+- `self_collision.hpp`: the FR3 self-collision capsules of franka_description, the arm link pairs that its SRDF checks, and the clearance of each pair with its gradient in the joints. The gripper on the flange has no capsule. `fr3_clearance_rate_bounds` gives, for each joint, the most that the clearance of a checked pair changes per radian of that joint, at any joints. `tests/test_pose_ik.cpp` checks the gradient against central differences and against these bounds, and the link frames against the flange kinematics.
+
+### Changed
+- **Behaviour.** `inverse_kinematics_with_limits` keeps the arm links apart. When two checked links are closer than `IK_SELF_COLLISION_PUSH_CLEARANCE` (0.10 m), the solver pushes them apart: 1 cm inside that clearance costs as much as 20 cm of flange error. Then the answer stops where the straight joint move from q0 first takes a checked pair below its floor. The floor of a pair is `IK_SELF_COLLISION_CLEARANCE` (0.09 m), or its own clearance at q0 when that is less. So a pair that starts closer can move out, and every other pair keeps 0.09 m. The check samples the move at points close enough that, by the rate bounds, a pair's clearance cannot fall more than `IK_SELF_COLLISION_PATH_TOLERANCE` (1 mm) below its floor between two of them. A 0.5 rad step of every joint takes about 1100 points, about 3 ms.
+- In a recorded FR3 episode, the self-collision reflex stopped the arm 183 times, each time with link 2 and link 5 at 0.050 to 0.064 m. A replay of all the commands of that episode through the old IK took those links to -0.050 m. Through the new IK, every answer keeps every checked pair at 0.090 m or more. For a flange target 20 cm in front of the base, the old IK put the links 1 cm apart, and the new IK stops about 2 cm short of the target. On the way, the joints can move far from the start: joint 1 turned 1.5 rad in the replay.
+- `ik_verifier` samples targets near the measured joints. Near a self-collision posture, its Limits IK check can now stop short of a target.
+- Near the push clearance, a full Gauss-Newton step can overshoot the push, and the steps can then cycle between two postures. The answer was the last point of the cycle, so a repeated command got answers that alternated between two postures about 0.1 rad apart. Now, when the full steps do not settle within 60 iterations, `solve_pose_ik` solves again from the start and halves each step until the cost falls. A solve whose full steps settle gives the same answer as before.
+
 ## [0.12.2] - 2026-11-12
 
 ### Added
