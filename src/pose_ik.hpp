@@ -303,26 +303,68 @@ Vector7d solve_pose_ik(const Kinematics& kinematics, const Eigen::Ref<const Vect
   // minimize_on_box needs a box that holds a point. NaN fails the comparison too.
   if (!(lower.array() <= upper.array()).all())
     throw std::invalid_argument("no joints are within max_step of q0 and inside the FR3 limits");
-  Vector7d q = q0.cwiseMax(lower).cwiseMin(upper);
+  const Vector7d start = q0.cwiseMax(lower).cwiseMin(upper);
 
-  for (int it = 0; it < kMaxIterations; ++it) {
-    const ToolKinematics k = kinematics(q);
-    const SpatialJacobian& J = k.jacobian;
-    const Vector6d e = pose_error(k.pose, t_tgt, R_tgt);
-    const double posture_residual = null_direction.dot(q - q0) - posture_target;
-    Matrix7d H = J.transpose() * J + (mu_sq + kLevenberg) * Matrix7d::Identity() +
-                 w_sq * null_direction * null_direction.transpose();
-    Vector7d g = J.transpose() * e + mu_sq * (q - q0) + w_sq * posture_residual * null_direction;
-    for (const SelfCollisionClearance& c : self_collision_clearances(q)) {
-      if (c.clearance >= IK_SELF_COLLISION_PUSH_CLEARANCE) continue;
-      H += kCollisionWeightSq * c.gradient * c.gradient.transpose();
-      g += kCollisionWeightSq * (c.clearance - IK_SELF_COLLISION_PUSH_CLEARANCE) * c.gradient;
+  // One iterate: its kinematics, its pair clearances, and the cost that the Gauss-Newton step models.
+  struct Iterate {
+    Vector7d q;
+    ToolKinematics k;
+    Vector6d e;
+    std::array<SelfCollisionClearance, FR3_SELF_COLLISION_PAIRS.size()> pairs;
+    double posture_residual;
+    double cost;
+  };
+  const auto iterate_at = [&](const Vector7d& q) {
+    Iterate x{q, kinematics(q), Vector6d::Zero(), self_collision_clearances(q), 0.0, 0.0};
+    x.e = pose_error(x.k.pose, t_tgt, R_tgt);
+    x.posture_residual = null_direction.dot(q - q0) - posture_target;
+    x.cost = 0.5 * (x.e.squaredNorm() + mu_sq * (q - q0).squaredNorm() +
+                    w_sq * x.posture_residual * x.posture_residual);
+    for (const SelfCollisionClearance& c : x.pairs) {
+      const double inside = std::min(0.0, c.clearance - IK_SELF_COLLISION_PUSH_CLEARANCE);
+      x.cost += 0.5 * kCollisionWeightSq * inside * inside;
     }
-    const Vector7d d = minimize_on_box(H, g, lower - q, upper - q);
-    q = (q + d).cwiseMax(lower).cwiseMin(upper);
-    if (d.norm() < kStepTolerance) break;
-  }
-  return stop_before_self_collision(q0.cwiseMax(lower).cwiseMin(upper), q);
+    return x;
+  };
+  // A backtracking step lowers the cost by at least kSufficientDecrease of the slope's prediction, in at most
+  // kLineSearchSteps trials.
+  constexpr int kLineSearchSteps = 10;
+  constexpr double kSufficientDecrease = 1e-4;
+  struct Descent {
+    Vector7d q;
+    bool settled;
+  };
+  // Gauss-Newton from the start. With `backtrack`, each step is halved until the cost falls enough.
+  const auto descend = [&](bool backtrack) {
+    Iterate at = iterate_at(start);
+    for (int it = 0; it < kMaxIterations; ++it) {
+      const SpatialJacobian& J = at.k.jacobian;
+      Matrix7d H = J.transpose() * J + (mu_sq + kLevenberg) * Matrix7d::Identity() +
+                   w_sq * null_direction * null_direction.transpose();
+      Vector7d g = J.transpose() * at.e + mu_sq * (at.q - q0) + w_sq * at.posture_residual * null_direction;
+      for (const SelfCollisionClearance& c : at.pairs) {
+        if (c.clearance >= IK_SELF_COLLISION_PUSH_CLEARANCE) continue;
+        H += kCollisionWeightSq * c.gradient * c.gradient.transpose();
+        g += kCollisionWeightSq * (c.clearance - IK_SELF_COLLISION_PUSH_CLEARANCE) * c.gradient;
+      }
+      const Vector7d d = minimize_on_box(H, g, lower - at.q, upper - at.q);
+      if (d.norm() < kStepTolerance) return Descent{(at.q + d).cwiseMax(lower).cwiseMin(upper), true};
+      double part = 1.0;
+      Iterate next = iterate_at((at.q + d).cwiseMax(lower).cwiseMin(upper));
+      const auto too_high = [&] { return backtrack && next.cost > at.cost + kSufficientDecrease * part * g.dot(d); };
+      for (int ls = 1; ls < kLineSearchSteps && too_high(); ++ls) {
+        part *= 0.5;
+        next = iterate_at((at.q + part * d).cwiseMax(lower).cwiseMin(upper));
+      }
+      if (too_high()) return Descent{at.q, true};  // no step lowers the cost
+      at = next;
+    }
+    return Descent{at.q, false};
+  };
+  // Full steps can overshoot the push and cycle without settling; the backtracking descent then gives the answer.
+  Descent answer = descend(false);
+  if (!answer.settled) answer = descend(true);
+  return stop_before_self_collision(start, answer.q);
 }
 
 }  // namespace positronic_franka

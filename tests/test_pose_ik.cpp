@@ -515,6 +515,55 @@ void a_start_inside_the_clearance_moves_out_and_reaches_down_to_the_target() {
   check(miss(q, target).first < 25.0, "the flange stays more than 2.5 cm from the target");
 }
 
+// The same commands from starts up to 0.03 rad away in each joint: each start reaches the target as closely.
+void from_starts_around_the_folded_elbow_the_arm_moves_out_and_reaches_down_to_the_target() {
+  const Vector7d target = flange_target_below_the_folded_elbow();
+  std::mt19937 rng(5);
+  std::uniform_real_distribution<double> u(-0.03, 0.03);
+  for (int trial = 0; trial < 12; ++trial) {
+    Vector7d q = shoulder_back_elbow_folded();
+    for (int i = 0; i < 7; ++i) q(i) += u(rng);
+    for (int command = 0; command < 30; ++command) q = solve_pose_ik(fr3_flange, target, q, IK_MAX_JOINT_STEP);
+    check(miss(q, target).first < 25.0, "a start stays more than 2.5 cm from the target");
+  }
+}
+
+// An FR3 posture of a recorded episode: joint 4 near its lower limit, link 5 0.103 m from link 2.
+Vector7d elbow_at_the_push_clearance() {
+  Vector7d q;
+  q << -1.2091, -0.82226, 0.673168, -2.9921, 0.232892, 2.59085, -0.345722;
+  return q;
+}
+
+// The flange target of that episode at that posture, 4 cm away, where link 5 must come closer to link 2.
+Vector7d flange_target_past_the_push_clearance() {
+  Vector7d target;
+  target << 0.219762598048, -0.191817523923, 0.334007425486, 0.214049269342, 0.947713690896, -0.231792174796,
+      0.047896326427;
+  return target;
+}
+
+// One command again and again. The arm moves half the way to each answer, as a software impedance reference does.
+// Full Gauss-Newton steps there overshoot the push and cycle between two postures.
+void a_static_command_at_the_push_clearance_does_not_alternate_between_two_postures() {
+  const Vector7d target = flange_target_past_the_push_clearance();
+  Vector7d q = elbow_at_the_push_clearance();
+  const double c = clearance(q);
+  check(c > IK_SELF_COLLISION_PUSH_CLEARANCE && c < IK_SELF_COLLISION_PUSH_CLEARANCE + 0.01,
+        "the start is not just outside the push clearance");
+  std::vector<Vector7d> answers;
+  for (int command = 0; command < 30; ++command) {
+    answers.push_back(solve_pose_ik(fr3_flange, target, q, IK_MAX_JOINT_STEP));
+    q += 0.5 * (answers.back() - q);
+  }
+  for (std::size_t k = 2; k < answers.size(); ++k) {
+    const bool back = (answers[k] - answers[k - 2]).cwiseAbs().maxCoeff() < 0.01;
+    const bool away = (answers[k - 1] - answers[k - 2]).cwiseAbs().maxCoeff() > 0.05;
+    check(!(back && away), "answer " + std::to_string(k) + " goes back to the posture of two commands before");
+  }
+  check((answers.back() - answers[answers.size() - 2]).cwiseAbs().maxCoeff() < 1e-3, "the answers do not settle");
+}
+
 }  // namespace
 
 int main() {
@@ -561,6 +610,10 @@ int main() {
        a_pose_whose_joints_are_just_outside_the_push_clearance_is_reached_within_0_1_mm_and_0_1_deg},
       {"a_start_inside_the_clearance_moves_out_and_reaches_down_to_the_target",
        a_start_inside_the_clearance_moves_out_and_reaches_down_to_the_target},
+      {"from_starts_around_the_folded_elbow_the_arm_moves_out_and_reaches_down_to_the_target",
+       from_starts_around_the_folded_elbow_the_arm_moves_out_and_reaches_down_to_the_target},
+      {"a_static_command_at_the_push_clearance_does_not_alternate_between_two_postures",
+       a_static_command_at_the_push_clearance_does_not_alternate_between_two_postures},
   };
   int failed = 0;
   for (const auto& [name, test] : tests) {
