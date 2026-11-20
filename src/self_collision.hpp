@@ -163,10 +163,4 @@ inline Vector7d fr3_clearance_rate_bounds() {
   return bound;
 }
 
-inline SelfCollisionClearance closest_self_collision_pair(const Vector7d& q) {
-  const auto all = self_collision_clearances(q);
-  return *std::min_element(all.begin(), all.end(),
-                           [](const auto& x, const auto& y) { return x.clearance < y.clearance; });
-}
-
 }  // namespace positronic_franka

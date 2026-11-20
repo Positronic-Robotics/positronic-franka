@@ -228,21 +228,29 @@ Vector7d solve_damped_pose_ik(const Kinematics& kinematics, const Eigen::Ref<con
   return q;
 }
 
-// The point of the move from `from` to `to` farthest along it whose path keeps every checked pair at
-// IK_SELF_COLLISION_CLEARANCE, or at the clearance of `from` when `from` is closer than that.
-// Between two checked points the clearance can fall by IK_SELF_COLLISION_PATH_TOLERANCE, and not more:
+// The point of the move from `from` to `to` farthest along it whose path keeps each checked pair at its floor:
+// IK_SELF_COLLISION_CLEARANCE, or its own clearance at `from` when that is less.
+// Between two checked points a pair's clearance falls at most IK_SELF_COLLISION_PATH_TOLERANCE below its floor:
 // the points are close enough for the rate bound of each joint (fr3_clearance_rate_bounds).
 inline Vector7d stop_before_self_collision(const Vector7d& from, const Vector7d& to) {
   constexpr int kLeastSamples = 16;
   constexpr int kBisections = 8;
   static const Vector7d rate_bounds = fr3_clearance_rate_bounds();
-  // The most the clearance changes over the whole move. Between two points 1 / samples apart that both keep
-  // the floor, the clearance falls at most change_over_move / (2 * samples) below the floor.
+  // The most a pair's clearance changes over the whole move. Between two points 1 / samples apart that both keep
+  // its floor, the clearance falls at most change_over_move / (2 * samples) below that floor.
   const double change_over_move = rate_bounds.dot((to - from).cwiseAbs());
   const int samples =
       std::max(kLeastSamples, static_cast<int>(std::ceil(change_over_move / (2 * IK_SELF_COLLISION_PATH_TOLERANCE))));
-  const double least = std::min(IK_SELF_COLLISION_CLEARANCE, closest_self_collision_pair(from).clearance);
-  const auto clear = [&](double s) { return closest_self_collision_pair(from + s * (to - from)).clearance >= least; };
+  std::array<double, FR3_SELF_COLLISION_PAIRS.size()> floors;
+  const auto at_from = self_collision_clearances(from);
+  for (std::size_t k = 0; k < floors.size(); ++k)
+    floors[k] = std::min(IK_SELF_COLLISION_CLEARANCE, at_from[k].clearance);
+  const auto clear = [&](double s) {
+    const auto pairs = self_collision_clearances(from + s * (to - from));
+    for (std::size_t k = 0; k < pairs.size(); ++k)
+      if (pairs[k].clearance < floors[k]) return false;
+    return true;
+  };
   double safe = 0.0;
   for (int i = 1; i <= samples; ++i) {
     const double s = static_cast<double>(i) / samples;

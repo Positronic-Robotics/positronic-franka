@@ -20,12 +20,12 @@
 namespace {
 
 using positronic_franka::closest_points_of_segments;
-using positronic_franka::closest_self_collision_pair;
 using positronic_franka::flange_pose;
 using positronic_franka::fr3_clearance_rate_bounds;
 using positronic_franka::fr3_link_frames;
 using positronic_franka::FR3_JOINT_LOWER_LIMITS;
 using positronic_franka::FR3_JOINT_UPPER_LIMITS;
+using positronic_franka::FR3_SELF_COLLISION_PAIRS;
 using positronic_franka::IK_DAMPING_SINGULAR_VALUE;
 using positronic_franka::IK_MAX_JOINT_STEP;
 using positronic_franka::IK_POSTURE_JOINTS;
@@ -434,7 +434,35 @@ void no_joint_changes_a_clearance_faster_than_its_rate_bound() {
   }
 }
 
-double clearance(const Vector7d& q) { return closest_self_collision_pair(q).clearance; }
+// The index of the checked pair of links `a` and `b` in FR3_SELF_COLLISION_PAIRS.
+std::size_t pair_of(int a, int b) {
+  const auto& pairs = FR3_SELF_COLLISION_PAIRS;
+  return static_cast<std::size_t>(std::find(pairs.begin(), pairs.end(), std::make_pair(a, b)) - pairs.begin());
+}
+
+using PairClearances = std::array<double, FR3_SELF_COLLISION_PAIRS.size()>;
+
+PairClearances pair_clearances(const Vector7d& q) {
+  PairClearances out;
+  const auto pairs = self_collision_clearances(q);
+  for (std::size_t k = 0; k < out.size(); ++k) out[k] = pairs[k].clearance;
+  return out;
+}
+
+// The least clearance of each checked pair at 2000 points of the straight joint move from `from` to `to`.
+PairClearances least_pair_clearances_on_the_move(const Vector7d& from, const Vector7d& to) {
+  PairClearances least = pair_clearances(from);
+  for (int i = 1; i <= 2000; ++i) {
+    const PairClearances at = pair_clearances(from + i / 2000.0 * (to - from));
+    for (std::size_t k = 0; k < least.size(); ++k) least[k] = std::min(least[k], at[k]);
+  }
+  return least;
+}
+
+double clearance(const Vector7d& q) {
+  const PairClearances pairs = pair_clearances(q);
+  return *std::min_element(pairs.begin(), pairs.end());
+}
 
 // The least clearance at 2000 points of the straight joint move from `from` to `to`.
 double least_clearance_on_the_move(const Vector7d& from, const Vector7d& to) {
@@ -497,6 +525,56 @@ void a_pose_whose_joints_are_just_outside_the_push_clearance_is_reached_within_0
   const auto [mm, deg] = miss(solve_pose_ik(fr3_flange, target, towards_the_folded_elbow(0.84), IK_MAX_JOINT_STEP),
                               target);
   check(mm < 0.1 && deg < 0.1, "a pose outside the push clearance is not reached");
+}
+
+// From the folded elbow, a move that takes link 5 away from link 2 and link 7 towards link 2.
+Vector7d link_7_towards_link_2() {
+  Vector7d q;
+  q << 1.384, -1.477, -0.791, -3.032, -0.499, 1.563, 1.542;
+  return q;
+}
+
+// Link 5 starts 0.051 m from link 2 and ends 0.078 m from it. Link 7 starts 0.155 m from link 2 and ends 0.073 m
+// from it. No pair comes closer than link 5 starts.
+void a_move_that_escapes_one_close_pair_does_not_take_another_pair_below_the_floor() {
+  const Vector7d from = shoulder_back_elbow_folded(), to = link_7_towards_link_2();
+  const std::size_t close = pair_of(2, 5), other = pair_of(2, 7);
+  const PairClearances start = pair_clearances(from);
+  check(start[close] < IK_SELF_COLLISION_CLEARANCE, "link 5 does not start inside the clearance");
+  check(start[other] > IK_SELF_COLLISION_PUSH_CLEARANCE, "link 7 does not start clear");
+  check(pair_clearances(to)[close] > start[close], "the move does not take link 5 away from link 2");
+  check(least_clearance_on_the_move(from, to) >= start[close], "a pair comes closer than link 5 starts");
+  check(least_pair_clearances_on_the_move(from, to)[other] < IK_SELF_COLLISION_CLEARANCE - 0.01,
+        "link 7 does not come closer than the floor");
+
+  const Vector7d stop = stop_before_self_collision(from, to);
+  const PairClearances kept = least_pair_clearances_on_the_move(from, stop);
+  for (std::size_t k = 0; k < kept.size(); ++k)
+    check(kept[k] >= std::min(IK_SELF_COLLISION_CLEARANCE, start[k]) - IK_SELF_COLLISION_PATH_TOLERANCE,
+          "pair " + std::to_string(k) + " goes below its floor");
+  check(pair_clearances(stop)[close] > start[close], "the move does not take link 5 away from link 2 at all");
+}
+
+// A pair inside the clearance at the start keeps its own start clearance as its floor. A move that takes link 5
+// away from link 2 plays to its end at 0.087 m. The reverse move, which brings link 5 closer, stops.
+void a_pair_that_starts_inside_the_clearance_keeps_its_start_clearance() {
+  const Vector7d from = shoulder_back_elbow_folded();
+  Vector7d out;
+  out << 1.173, -1.186, -1.034, -2.834, -0.818, 2.141, 1.153;
+  const std::size_t close = pair_of(2, 5);
+  const double start = pair_clearances(from)[close];
+  const PairClearances on_the_way_out = least_pair_clearances_on_the_move(from, out);
+  check(pair_clearances(out)[close] < IK_SELF_COLLISION_CLEARANCE, "link 5 ends outside the clearance");
+  check(on_the_way_out[close] >= start, "link 5 comes closer than it starts");
+  for (std::size_t k = 0; k < on_the_way_out.size(); ++k)
+    check(k == close || on_the_way_out[k] > IK_SELF_COLLISION_CLEARANCE, "another pair comes inside the clearance");
+  check(stop_before_self_collision(from, out) == out, "the move out stops short");
+
+  const Vector7d in = from - (out - from);
+  check(pair_clearances(in)[close] < start, "the reverse move does not bring link 5 closer");
+  const Vector7d stop = stop_before_self_collision(from, in);
+  check(least_pair_clearances_on_the_move(from, stop)[close] >= start - IK_SELF_COLLISION_PATH_TOLERANCE,
+        "the reverse move brings link 5 closer than it starts");
 }
 
 // From a start inside the clearance, each command moves the links apart, and none brings them closer.
@@ -608,6 +686,10 @@ int main() {
        the_move_to_a_pose_whose_joints_are_too_close_keeps_the_self_collision_clearance},
       {"a_pose_whose_joints_are_just_outside_the_push_clearance_is_reached_within_0_1_mm_and_0_1_deg",
        a_pose_whose_joints_are_just_outside_the_push_clearance_is_reached_within_0_1_mm_and_0_1_deg},
+      {"a_move_that_escapes_one_close_pair_does_not_take_another_pair_below_the_floor",
+       a_move_that_escapes_one_close_pair_does_not_take_another_pair_below_the_floor},
+      {"a_pair_that_starts_inside_the_clearance_keeps_its_start_clearance",
+       a_pair_that_starts_inside_the_clearance_keeps_its_start_clearance},
       {"a_start_inside_the_clearance_moves_out_and_reaches_down_to_the_target",
        a_start_inside_the_clearance_moves_out_and_reaches_down_to_the_target},
       {"from_starts_around_the_folded_elbow_the_arm_moves_out_and_reaches_down_to_the_target",
