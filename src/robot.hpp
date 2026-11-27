@@ -30,6 +30,7 @@
 #include "pose_ik.hpp"
 #include "trajectory_generator.hpp"
 #include "arm_guards.hpp"
+#include "plan_check.hpp"
 #include "workspace_bounds.hpp"
 
 namespace positronic_franka {
@@ -245,7 +246,8 @@ struct State {
   std::optional<std::string> bounds_hash;
   // What the guard did since the last set_workspace_bounds, or since the start of the Robot.
   GuardReport guard;
-  // The target of the last joint move, after the guard. Empty before the first move.
+  // The target of the last joint move after the guard, or where a brake before a side stops it. Empty before the
+  // first move.
   std::optional<Vector7d> committed_target;
 };
 
@@ -597,16 +599,18 @@ private:
          elapsed_s = 0.0,
          deadline_s = 0.0,
          stopping = false,
-         box = std::shared_ptr<const sk::Guard>(),
-         box_version = std::uint64_t{0}](const franka::RobotState& st,
-                                         franka::Duration period) mutable -> franka::JointPositions {
+         guard = LoopGuard{},
+         plan_check = PlanCheck{},
+         checked_target = Vector7d(Vector7d::Zero())](const franka::RobotState& st,
+                                                       franka::Duration period) mutable -> franka::JointPositions {
           {
             std::lock_guard<std::mutex> lk(last_state_mutex_);
             last_state_ = std::make_unique<franka::RobotState>(st);
           }
           loop_watch_.tick();
-          refresh_box_guard_(box, box_version);
-          if (box) record_deepest_(*box, Eigen::Map<const Vector7d>(st.q.data()));
+          refresh_loop_guard_(guard);
+          traj.set_phase_synchronization(static_cast<bool>(guard.target));
+          if (guard.box) record_deepest_(*guard.box, Eigen::Map<const Vector7d>(st.q.data()));
 
           if (first) {
             traj.start_at_rest(st.q_d);
@@ -617,6 +621,7 @@ private:
             traj.brake_to_rest();
           }
 
+          std::optional<Vector7d> plan_to_check;
           if (!stopping && has_target_.load()) {
             std::lock_guard<std::mutex> lk(target_mutex_);
             const bool planned = traj.set_target(target_q_);
@@ -633,7 +638,17 @@ private:
               fail_goal_(goal_in_flight, "joint target rejected by the trajectory planner");
               goal_in_flight = 0;
               traj.brake_to_rest();
+            } else if (guard.target) {
+              plan_to_check = target_q_;
             }
+          }
+          if (plan_to_check) {
+            checked_target = *plan_to_check;
+            if (const auto side = plan_check.start(*guard.target, traj))
+              brake_before_a_floor_(*side, traj, goal_in_flight, checked_target);
+          } else if (guard.target && plan_check.pending(traj)) {
+            if (const auto side = plan_check.step(*guard.target, traj))
+              brake_before_a_floor_(*side, traj, goal_in_flight, checked_target);
           }
 
           auto pos = traj.step(period.toSec());
@@ -700,9 +715,7 @@ private:
          stop_ticks = 0,
          ref = Vector7d(Vector7d::Zero()),
          target = Vector7d(Vector7d::Zero()),
-         box = std::shared_ptr<const sk::Guard>(),
-         box_version = std::uint64_t{0}](const franka::RobotState& st,
-                                         franka::Duration period) mutable -> franka::Torques {
+         guard = LoopGuard{}](const franka::RobotState& st, franka::Duration period) mutable -> franka::Torques {
           const Vector7d q = Eigen::Map<const Vector7d>(st.q.data());
           const Vector7d dq = Eigen::Map<const Vector7d>(st.dq.data());
 
@@ -738,8 +751,8 @@ private:
             has_new_gains_.store(false);
           }
 
-          refresh_box_guard_(box, box_version);
-          if (box) record_deepest_(*box, q);
+          refresh_loop_guard_(guard);
+          if (guard.box) record_deepest_(*guard.box, q);
 
           // No trajectory here: the impedance law moves the arm. The speed cap on q_d keeps a large jump in the
           // target from becoming a large spring pull, at any command rate.
@@ -749,7 +762,8 @@ private:
             next_ref = limit_tool_point_speed(ref, next_ref, J_ref.topRows<3>(), *max_tool_point_speed,
                                               period.toSec());
           }
-          if (box && next_ref != ref) next_ref = slow_near_the_box_(*box, ref, next_ref, target, period.toSec());
+          if (guard.box && next_ref != ref)
+            next_ref = slow_near_the_box_(*guard.box, ref, next_ref, target, period.toSec());
           ref = next_ref;
 
           // The position loop's arrival rule: there is no arrival to test while the reference still moves.
@@ -1011,12 +1025,39 @@ private:
     return guards_;
   }
 
-  // Gives a control loop the box guard in force when set_workspace_bounds changed it since `version`.
-  void refresh_box_guard_(std::shared_ptr<const sk::Guard>& box, std::uint64_t& version) {
-    if (guards_version_.load() == version) return;
+  // What a control loop takes from the guards.
+  struct LoopGuard {
+    // The guard of the box; empty with no bounds.
+    std::shared_ptr<const sk::Guard> box;
+    // The guard that clips each joint target on the straight joint line from the reference; empty when none does.
+    std::shared_ptr<const sk::Guard> target;
+    std::uint64_t version = 0;
+  };
+
+  // Gives a control loop the guards in force when set_workspace_bounds changed them since it last looked.
+  void refresh_loop_guard_(LoopGuard& guard) {
+    if (guards_version_.load() == guard.version) return;
     std::lock_guard<std::mutex> lk(guard_mutex_);
-    box = guards_.box;
-    version = guards_version_.load();
+    guard.box = guards_.box;
+    guard.target = guards_.target;
+    guard.version = guards_version_.load();
+  }
+
+  // Brakes the position loop, whose plan to `target` takes a bounded part past its floor at `side`, or two links closer
+  // than the clearance at SELF_COLLISION_KEY. The goal ends BOUNDED, and the committed target becomes the point where
+  // the brake stops. A refused brake stops the loop with an error.
+  void brake_before_a_floor_(const std::string& side, TrajectoryGenerator& traj, std::uint64_t goal,
+                             const Vector7d& target) {
+    if (!traj.brake_to_rest())
+      throw std::runtime_error("the trajectory planner refused the brake before side " + side);
+    {
+      std::lock_guard<std::mutex> lk(goal_mutex_);
+      if (goal_id_ == goal && goal_status_ == GoalStatus::IN_FLIGHT) goal_bounded_ = true;
+    }
+    const std::array<double, 7> stop = traj.position_at(traj.duration());
+    std::lock_guard<std::mutex> lk(guard_mutex_);
+    guard_report_.count_binding(side);
+    if (committed_target_ == target) committed_target_ = Eigen::Map<const Vector7d>(stop.data());
   }
 
   // Keeps, per side, the deepest pass of a bounded part past its floor at the measured joints.

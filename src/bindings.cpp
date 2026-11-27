@@ -237,8 +237,8 @@ PYBIND11_MODULE(_franka, m) {
       .def_property_readonly(
           "bindings",
           [](const positronic_franka::State& s) { return s.guard.bindings; },
-          "Per side, and 'self' for self-collision: how many targets the guard shortened there, since the last "
-          "set_workspace_bounds or the start of the Robot")
+          "Per side, and 'self' for self-collision: how many targets the guard shortened or braked there, since the "
+          "last set_workspace_bounds or the start of the Robot")
       .def_property_readonly(
           "slowed_ticks",
           [](const positronic_franka::State& s) { return s.guard.slowed_ticks; },
@@ -252,7 +252,8 @@ PYBIND11_MODULE(_franka, m) {
       .def_property_readonly(
           "committed_target",
           [](const positronic_franka::State& s) { return s.committed_target; },
-          "The target (7,) of the last joint move after the guard, or None before the first move");
+          "The target (7,) of the last joint move after the guard, or where a brake before a side stops it. None "
+          "before the first move");
 
   py::class_<positronic_franka::Robot>(m, "Robot")
       .def(py::init([](const std::string& ip, franka::RealtimeConfig realtime_config, double relative_dynamics_factor,

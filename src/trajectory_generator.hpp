@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdint>
 #include <iostream>
 #include <optional>
 
@@ -61,9 +62,26 @@ class TrajectoryGenerator {
 
   // Brakes every joint to zero speed, and the arm rests where the brake ends. A plan back to the position
   // at the stop call is refused often, and a refused plan keeps the arm going to the old target.
-  void brake_to_rest() {
+  // Returns whether the brake was planned.
+  bool brake_to_rest() {
     input_.control_interface = ruckig::ControlInterface::Velocity;
-    if (replan_()) playing_plan_target_.reset();
+    if (!replan_()) return false;
+    playing_plan_target_.reset();
+    return true;
+  }
+
+  // With phase synchronization a plan from rest follows the straight joint line to its target. The default is time
+  // synchronization, whose plans can leave that line.
+  void set_phase_synchronization(bool phase) {
+    input_.synchronization = phase ? ruckig::Synchronization::Phase : ruckig::Synchronization::Time;
+  }
+
+  // The position of the playing plan `t` seconds after it was planned.
+  std::array<double, 7> position_at(double t) const {
+    if (!planned_) return input_.current_position;
+    std::array<double, 7> pos;
+    trajectory_.at_time(std::clamp(t, 0.0, duration_), pos);
+    return pos;
   }
 
   // Advances the trajectory by `dt_s` seconds and returns the position. libfranka reports a zero period
@@ -87,6 +105,12 @@ class TrajectoryGenerator {
 
   bool active() const { return active_; }
 
+  // How long the playing plan has played, in seconds.
+  double elapsed() const { return cumulative_time_; }
+
+  // Counts the plans; each accepted plan or brake gets the next number.
+  std::uint64_t plan_number() const { return plan_number_; }
+
   // How long the planned trajectory runs, in seconds. The move deadline adds it to the settle
   // budget, so a slow `relative_dynamics_factor` (down to 0.0001) is not cut off by a flat constant.
   double duration() const { return duration_; }
@@ -106,6 +130,7 @@ class TrajectoryGenerator {
     cumulative_time_ = 0.0;
     duration_ = trajectory_.get_duration();
     active_ = true;
+    ++plan_number_;
     return true;
   }
 
@@ -118,6 +143,7 @@ class TrajectoryGenerator {
   double duration_ = 0.0;
   bool active_ = false;
   bool planned_ = false;
+  std::uint64_t plan_number_ = 0;
 };
 
 }  // namespace positronic_franka

@@ -108,7 +108,7 @@ class WorkspaceBounds {
 
 // What the guard did since the last set_workspace_bounds, or since the start of the Robot.
 struct GuardReport {
-  // Per side, and SELF_COLLISION_KEY for the self-collision clip: how many targets the clip shortened there.
+  // Per side, and SELF_COLLISION_KEY for self-collision: how many targets the guard shortened or braked there.
   std::map<std::string, std::uint64_t> bindings;
   // Per side: how many ticks of the torque loop the speed scale slowed the reference most at that side.
   std::map<std::string, std::uint64_t> slowed_ticks;
