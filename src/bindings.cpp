@@ -240,6 +240,11 @@ PYBIND11_MODULE(_franka, m) {
           "Per side, and 'self' for self-collision: how many targets the guard shortened there, since the last "
           "set_workspace_bounds or the start of the Robot")
       .def_property_readonly(
+          "slowed_ticks",
+          [](const positronic_franka::State& s) { return s.guard.slowed_ticks; },
+          "Per side: how many ticks of the torque loop the speed scale of the box slowed the reference most at "
+          "that side, since the last set_workspace_bounds or the start of the Robot")
+      .def_property_readonly(
           "deepest",
           [](const positronic_franka::State& s) { return s.guard.deepest; },
           "Per side: the deepest that a bounded point went past its floor, from the measured joints, m, since the "

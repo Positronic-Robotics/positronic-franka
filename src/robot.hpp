@@ -52,6 +52,9 @@ constexpr double DEFAULT_MOVE_DEADLINE_S = 15.0;
 // A running control loop with no robot state for this long counts as stuck in libfranka. Far above any
 // normal gap: at the end of a motion, libfranka calls no callback for up to about 1.2 s.
 constexpr double DEFAULT_CONTROL_LINK_TIMEOUT_S = 10.0;
+// Within this distance of its target on every joint, rad, a reference that the speed scale of the box slows takes
+// the target. At 1 m from a joint it is 0.1 mm, inside the 1 mm path tolerance of the clip.
+constexpr double BOX_HOLD_TOLERANCE = 1e-4;
 
 
 // Control modes. InternalImpedance drives the robot's built-in joint impedance controller through the
@@ -339,6 +342,7 @@ class Robot {
     workspace_bounds_ = bounds;
     guards_ = std::move(guards);
     guard_report_ = GuardReport{};
+    ++guards_version_;
   }
 
   std::optional<WorkspaceBounds> workspace_bounds() {
@@ -592,12 +596,17 @@ private:
          goal_in_flight = std::uint64_t{0},
          elapsed_s = 0.0,
          deadline_s = 0.0,
-         stopping = false](const franka::RobotState& st, franka::Duration period) mutable -> franka::JointPositions {
+         stopping = false,
+         box = std::shared_ptr<const sk::Guard>(),
+         box_version = std::uint64_t{0}](const franka::RobotState& st,
+                                         franka::Duration period) mutable -> franka::JointPositions {
           {
             std::lock_guard<std::mutex> lk(last_state_mutex_);
             last_state_ = std::make_unique<franka::RobotState>(st);
           }
           loop_watch_.tick();
+          refresh_box_guard_(box, box_version);
+          if (box) record_deepest_(*box, Eigen::Map<const Vector7d>(st.q.data()));
 
           if (first) {
             traj.start_at_rest(st.q_d);
@@ -690,8 +699,10 @@ private:
          stopping = false,
          stop_ticks = 0,
          ref = Vector7d(Vector7d::Zero()),
-         target = Vector7d(Vector7d::Zero())](const franka::RobotState& st,
-                                              franka::Duration period) mutable -> franka::Torques {
+         target = Vector7d(Vector7d::Zero()),
+         box = std::shared_ptr<const sk::Guard>(),
+         box_version = std::uint64_t{0}](const franka::RobotState& st,
+                                         franka::Duration period) mutable -> franka::Torques {
           const Vector7d q = Eigen::Map<const Vector7d>(st.q.data());
           const Vector7d dq = Eigen::Map<const Vector7d>(st.dq.data());
 
@@ -727,6 +738,9 @@ private:
             has_new_gains_.store(false);
           }
 
+          refresh_box_guard_(box, box_version);
+          if (box) record_deepest_(*box, q);
+
           // No trajectory here: the impedance law moves the arm. The speed cap on q_d keeps a large jump in the
           // target from becoming a large spring pull, at any command rate.
           Vector7d next_ref = move_reference_toward(ref, target, max_reference_speed, period.toSec());
@@ -735,6 +749,7 @@ private:
             next_ref = limit_tool_point_speed(ref, next_ref, J_ref.topRows<3>(), *max_tool_point_speed,
                                               period.toSec());
           }
+          if (box && next_ref != ref) next_ref = slow_near_the_box_(*box, ref, next_ref, target, period.toSec());
           ref = next_ref;
 
           // The position loop's arrival rule: there is no arrival to test while the reference still moves.
@@ -996,6 +1011,37 @@ private:
     return guards_;
   }
 
+  // Gives a control loop the box guard in force when set_workspace_bounds changed it since `version`.
+  void refresh_box_guard_(std::shared_ptr<const sk::Guard>& box, std::uint64_t& version) {
+    if (guards_version_.load() == version) return;
+    std::lock_guard<std::mutex> lk(guard_mutex_);
+    box = guards_.box;
+    version = guards_version_.load();
+  }
+
+  // Keeps, per side, the deepest pass of a bounded part past its floor at the measured joints.
+  void record_deepest_(const sk::Guard& box, const Vector7d& q) {
+    const sk::Distances rows = box.distances(q);
+    std::lock_guard<std::mutex> lk(guard_mutex_);
+    for (const sk::PlaneDistance& row : rows.planes) guard_report_.record_depth(row.side, row.floor - row.distance);
+  }
+
+  // The step of the reference from `ref` to `next`, times the speed scale of the box. It keeps its direction. Near a
+  // floor the scale falls toward 0, so within BOX_HOLD_TOLERANCE of the target, which the clip checked, the reference
+  // takes the target when the caps let `next` reach it.
+  Vector7d slow_near_the_box_(const sk::Guard& box, const Vector7d& ref, const Vector7d& next, const Vector7d& target,
+                              double dt) {
+    if (!(dt > 0.0)) return next;
+    const sk::ScaleResult scale = box.speed_scale(ref, next - ref, dt);
+    if (!(scale.s < 1.0)) return next;
+    {
+      std::lock_guard<std::mutex> lk(guard_mutex_);
+      if (scale.slowest) guard_report_.count_slowed(*scale.slowest);
+    }
+    const Vector7d slowed = ref + scale.s * (next - ref);
+    return next == target && (target - slowed).cwiseAbs().maxCoeff() <= BOX_HOLD_TOLERANCE ? target : slowed;
+  }
+
   // The joints that the control loop moves from: the torque loop's reference, or the position loop's last command.
   // With no loop, the joints that the next loop starts from.
   Vector7d reference_now_() {
@@ -1095,6 +1141,8 @@ private:
   std::mutex guard_mutex_;
   std::optional<WorkspaceBounds> workspace_bounds_;
   ArmGuards guards_;
+  // Counts the changes of guards_, so a control loop takes a new box guard without a lock on each tick.
+  std::atomic<std::uint64_t> guards_version_{1};
   GuardReport guard_report_;
   std::optional<Vector7d> committed_target_;
   // A gains-only SoftwareImpedance change, picked up by the running torque loop mid-session.

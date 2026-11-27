@@ -467,6 +467,107 @@ void the_ik_keeps_the_parts_inside_the_wall_and_moves_toward_the_target() {
   check(after < before - 0.05, "the IK answer does not move the flange toward the target");
 }
 
+// The torque loop slows the reference near the wall, keeps it inside the floors, and brings it close to the committed
+// target, where the clip stopped it.
+void the_torque_loop_slows_the_reference_near_a_side_and_brings_it_to_the_committed_target() {
+  Robot robot = make_bounded_robot(a_front_wall(), SoftwareImpedance{});
+  const Vector7d start = current_q(robot);
+  robot.set_target_joints(leaning_forward(start));
+  const Vector7d committed = *robot.state().committed_target;
+  // Near the floor the scale lets the reference close in at 2/s of its distance, so give it 4 s of loop time.
+  std::vector<Vector7d> refs;
+  check(wait_until([&] {
+          refs.push_back(robot.state().q_d);
+          return robot.state().time >= 4.0;
+        }, milliseconds(60000)),
+        "the loop does not tick for 4 s");
+  const auto st = robot.state();
+  const double gap = (st.q_d - committed).cwiseAbs().maxCoeff();
+  check(gap < 1e-3, "the reference is " + std::to_string(gap) + " rad from the committed target after 4 s");
+  check(st.guard.slowed_ticks.count("front") && st.guard.slowed_ticks.at("front") > 0,
+        "the speed scale did not slow the reference at the wall");
+  for (const Vector7d& ref : refs)
+    check(least_to_floor_on_the_move(a_front_wall(), start, ref) >=
+              -positronic_franka::IK_SELF_COLLISION_PATH_TOLERANCE,
+          "the reference passes a floor at the wall");
+  robot.stop();
+}
+
+// At a slow joint cap near the wall, the reference that takes the committed target keeps to the cap at every tick.
+void near_a_side_the_torque_loop_reference_keeps_to_its_joint_cap() {
+  constexpr double kCap = 0.01;
+  std::array<double, 7> slow;
+  slow.fill(kCap);
+  link().reset();
+  const Vector7d at_start = Eigen::Map<const Vector7d>(link().state().q.data());
+  // A front wall where the part nearest to its floor at the start is 4 mm from it.
+  const auto wall_at = [](double x) {
+    return WorkspaceBounds({{"front", SideKind::kSurface, -Eigen::Vector3d::UnitX(), x, 0.0, -0.005}});
+  };
+  shared_kinematics::ArmModel model = fr3_with_gripper();
+  model.self.pairs.clear();
+  double least = std::numeric_limits<double>::infinity();
+  for (const auto& row : shared_kinematics::Guard(model, wall_at(1.0).sides()).distances(at_start).planes)
+    least = std::min(least, row.distance - row.floor);
+  const WorkspaceBounds wall = wall_at(1.0 - least + 0.004);
+  Robot robot = make_bounded_robot(wall, SoftwareImpedance(positronic_franka::DEFAULT_MAX_SPRING_TORQUE_RATE, slow));
+  const Vector7d start = current_q(robot);
+  Vector7d target = start;
+  target(1) += 0.04;
+  target(3) += 0.02;
+  robot.set_target_joints(target);
+  const Vector7d committed = *robot.state().committed_target;
+  check(committed != target, "the wall does not stop the move");
+  check((committed - start).cwiseAbs().maxCoeff() < 0.04, "the committed target is too far for the slow cap");
+  std::vector<std::pair<double, Vector7d>> refs;
+  const bool arrived = wait_until([&] {
+    const auto st = robot.state();
+    refs.emplace_back(st.time, st.q_d);
+    return st.q_d == committed;
+  }, milliseconds(90000));
+  check(arrived, "the reference is " + std::to_string((refs.back().second - committed).cwiseAbs().maxCoeff()) +
+                     " rad from the committed target after " + std::to_string(refs.back().first) + " s");
+  for (std::size_t i = 1; i < refs.size(); ++i) {
+    const double ticks = std::round((refs[i].first - refs[i - 1].first) * 1000.0);
+    const double step = (refs[i].second - refs[i - 1].second).cwiseAbs().maxCoeff();
+    check(step <= kCap * ticks * 1e-3 + 1e-12,
+          "the reference moves " + std::to_string(step) + " rad in " + std::to_string(ticks) + " ticks");
+  }
+  robot.stop();
+}
+
+// Unconfigured, the torque loop moves the reference at its joint cap and slows nothing.
+void with_no_bounds_the_torque_loop_moves_the_reference_at_its_joint_cap() {
+  Robot robot = make_bounded_robot(std::nullopt, SoftwareImpedance{});
+  const Vector7d start = current_q(robot);
+  robot.set_target_joints(offset_on_joint_1(start, 1.0));
+  check(wait_until([&] { return robot.state().time >= 0.2; }), "the loop ticks for 200 ms");
+  const auto st = robot.state();
+  const double speed = (st.q_d(0) - start(0)) / st.time;
+  check(std::abs(speed - positronic_franka::DEFAULT_MAX_REFERENCE_SPEED[0]) < 0.01,
+        "joint 1 moves at " + std::to_string(speed) + " rad/s, not its 1.5 rad/s cap");
+  check(st.guard.slowed_ticks.empty() && st.guard.deepest.empty(), "the loop reports a guard");
+  robot.stop();
+}
+
+// The state keeps, per side, the deepest pass of a part past its floor at the measured joints.
+void the_state_keeps_the_deepest_pass_past_a_floor() {
+  const WorkspaceBounds wall({{"front", SideKind::kSurface, -Eigen::Vector3d::UnitX(), 0.30, 0.0, -0.005}});
+  Robot robot = make_bounded_robot(wall);
+  const Vector7d start = current_q(robot);
+  shared_kinematics::ArmModel model = fr3_with_gripper();
+  model.self.pairs.clear();
+  double deepest = 0.0;
+  for (const auto& row : shared_kinematics::Guard(model, wall.sides()).distances(start).planes)
+    deepest = std::max(deepest, row.floor - row.distance);
+  check(deepest > 0.01, "the start is not past the wall");
+  robot.set_target_joints(start);
+  check(wait_until([&] { return robot.state().guard.deepest.count("front") > 0; }), "the state keeps no pass");
+  check(std::abs(robot.state().guard.deepest.at("front") - deepest) < 1e-9,
+        "the deepest pass is not the pass at start");
+  robot.stop();
+}
+
 // Moves joint 1 under software impedance with the tool point capped at `max_tool_point_speed` m/s, and returns
 // the joint 1 reference speed, rad/s, over the first 200 ms or more.
 double joint_1_reference_speed_under_tool_point_cap(double max_tool_point_speed) {
@@ -577,6 +678,13 @@ int main() {
       {"with_no_bounds_the_ik_is_the_ik_of_the_fr3_self_pairs", with_no_bounds_the_ik_is_the_ik_of_the_fr3_self_pairs},
       {"the_ik_keeps_the_parts_inside_the_wall_and_moves_toward_the_target",
        the_ik_keeps_the_parts_inside_the_wall_and_moves_toward_the_target},
+      {"the_torque_loop_slows_the_reference_near_a_side_and_brings_it_to_the_committed_target",
+       the_torque_loop_slows_the_reference_near_a_side_and_brings_it_to_the_committed_target},
+      {"near_a_side_the_torque_loop_reference_keeps_to_its_joint_cap",
+       near_a_side_the_torque_loop_reference_keeps_to_its_joint_cap},
+      {"with_no_bounds_the_torque_loop_moves_the_reference_at_its_joint_cap",
+       with_no_bounds_the_torque_loop_moves_the_reference_at_its_joint_cap},
+      {"the_state_keeps_the_deepest_pass_past_a_floor", the_state_keeps_the_deepest_pass_past_a_floor},
       {"the_tool_point_cap_slows_a_reference_that_would_move_the_tool_faster",
        the_tool_point_cap_slows_a_reference_that_would_move_the_tool_faster},
       {"a_tool_point_cap_above_the_joint_cap_leaves_the_joint_cap_in_charge",

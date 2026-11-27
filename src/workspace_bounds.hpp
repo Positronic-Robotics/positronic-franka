@@ -110,11 +110,14 @@ class WorkspaceBounds {
 struct GuardReport {
   // Per side, and SELF_COLLISION_KEY for the self-collision clip: how many targets the clip shortened there.
   std::map<std::string, std::uint64_t> bindings;
-  // Per side: the deepest that a bounded point went past its floor at that side, from the measured joints, m.
-  // A side that no point passed has no entry.
+  // Per side: how many ticks of the torque loop the speed scale slowed the reference most at that side.
+  std::map<std::string, std::uint64_t> slowed_ticks;
+  // Per side: the deepest that a bounded part went past its floor at that side, from the measured joints, m.
+  // A side that no part passed has no entry.
   std::map<std::string, double> deepest;
 
   void count_binding(const std::string& key) { ++bindings[key]; }
+  void count_slowed(const std::string& side) { ++slowed_ticks[side]; }
   void record_depth(const std::string& side, double past_floor) {
     if (!(past_floor > 0.0)) return;
     auto [it, added] = deepest.emplace(side, past_floor);
