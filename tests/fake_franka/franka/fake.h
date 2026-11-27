@@ -2,8 +2,10 @@
 
 // A stand-in for the part of libfranka that src/robot.hpp uses. The control call ticks at 1 ms on a
 // joint model with no dynamics, and a test can pause it inside the call, as a lost link does.
+// The model serves a constant Jacobian by default, and the FR3 flange kinematics when a test asks for them.
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -11,6 +13,8 @@
 #include <mutex>
 #include <string>
 #include <thread>
+
+#include <Eigen/Geometry>
 
 namespace franka {
 
@@ -67,11 +71,64 @@ struct Torques : Finishable {
   std::array<double, 7> tau_J{};
 };
 
+namespace fake {
+
+enum class Kinematics {
+  // pose is the state's O_T_EE, and joint 1 moves every frame 0.5 m/rad along x.
+  kConstant,
+  // pose and zeroJacobian are those of the FR3 flange at the state's q, for every frame.
+  kFr3,
+};
+
+inline std::atomic<Kinematics>& kinematics_setting() {
+  static std::atomic<Kinematics> setting{Kinematics::kConstant};
+  return setting;
+}
+
+inline Kinematics kinematics() { return kinematics_setting().load(); }
+
+// The FR3 flange pose and its zero Jacobian (linear rows first), column-major as libfranka's, from Franka's
+// modified DH parameters.
+struct Fr3Flange {
+  std::array<double, 16> pose;
+  std::array<double, 42> zero_jacobian;
+};
+
+inline Fr3Flange fr3_flange(const std::array<double, 7>& q) {
+  constexpr double kHalfPi = 1.57079632679489661923;
+  constexpr std::array<double, 8> a = {0, 0, 0, 0.0825, -0.0825, 0, 0.088, 0};
+  constexpr std::array<double, 8> d = {0.333, 0, 0.316, 0, 0.384, 0, 0, 0.107};
+  constexpr std::array<double, 8> alpha = {0, -kHalfPi, kHalfPi, kHalfPi, -kHalfPi, kHalfPi, kHalfPi, 0};
+  Eigen::Isometry3d T = Eigen::Isometry3d::Identity();
+  std::array<Eigen::Vector3d, 7> axis, origin;
+  for (int i = 0; i < 8; ++i) {
+    T = T * Eigen::AngleAxisd(alpha[i], Eigen::Vector3d::UnitX()) * Eigen::Translation3d(a[i], 0, 0) *
+        Eigen::AngleAxisd(i < 7 ? q[i] : 0.0, Eigen::Vector3d::UnitZ()) * Eigen::Translation3d(0, 0, d[i]);
+    if (i < 7) {
+      axis[i] = T.linear().col(2);
+      origin[i] = T.translation();
+    }
+  }
+  Fr3Flange out{};
+  Eigen::Map<Eigen::Matrix4d>(out.pose.data()) = T.matrix();
+  Eigen::Map<Eigen::Matrix<double, 6, 7>> J(out.zero_jacobian.data());
+  for (int i = 0; i < 7; ++i) {
+    J.block<3, 1>(0, i) = axis[i].cross(T.translation() - origin[i]);
+    J.block<3, 1>(3, i) = axis[i];
+  }
+  return out;
+}
+
+}  // namespace fake
+
 class Model {
  public:
-  std::array<double, 16> pose(Frame, const RobotState& s) const { return s.O_T_EE; }
-  // Column-major 6x7, as libfranka's: joint 1 moves every frame 0.5 m/rad along x, and no joint turns it.
-  std::array<double, 42> zeroJacobian(Frame, const RobotState&) const {
+  std::array<double, 16> pose(Frame, const RobotState& s) const {
+    return fake::kinematics() == fake::Kinematics::kFr3 ? fake::fr3_flange(s.q).pose : s.O_T_EE;
+  }
+  // Column-major 6x7, as libfranka's. kConstant: joint 1 moves every frame 0.5 m/rad along x, and no joint turns it.
+  std::array<double, 42> zeroJacobian(Frame, const RobotState& s) const {
+    if (fake::kinematics() == fake::Kinematics::kFr3) return fake::fr3_flange(s.q).zero_jacobian;
     std::array<double, 42> J{};
     J[0] = JOINT_1_LEVER_ARM_M;
     return J;
@@ -87,9 +144,16 @@ class Link {
  public:
   void reset() {
     std::lock_guard<std::mutex> lk(mutex_);
+    kinematics_setting().store(Kinematics::kConstant);
     state_ = RobotState{};
     paused_ = false;
     control_returns_ = 0;
+  }
+  // The kinematics of the model, until the next reset. With kFr3, O_T_EE follows q.
+  void use_kinematics(Kinematics kinematics) {
+    std::lock_guard<std::mutex> lk(mutex_);
+    kinematics_setting().store(kinematics);
+    follow_kinematics_();
   }
   void pause() {
     std::lock_guard<std::mutex> lk(mutex_);
@@ -141,6 +205,10 @@ class Link {
       state_.dq[i] = (cmd.q[i] - state_.q[i]) / 1e-3;
       state_.q[i] = state_.q_d[i] = cmd.q[i];
     }
+    follow_kinematics_();
+  }
+  void follow_kinematics_() {
+    if (kinematics() == Kinematics::kFr3) state_.O_T_EE = fr3_flange(state_.q).pose;
   }
   void apply_(const Torques&) {}
 

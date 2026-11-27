@@ -200,6 +200,46 @@ double joint_1_reference_speed_under_tool_point_cap(double max_tool_point_speed)
   return (st.q_d(0) - start(0)) / st.time;
 }
 
+Vector7d sample_joints() {
+  Vector7d q;
+  q << 0.3, -0.5, 0.2, -2.0, 0.4, 1.9, -0.6;
+  return q;
+}
+
+void the_fake_fr3_kinematics_give_the_fr3_flange_and_its_zero_jacobian() {
+  Robot robot = make_robot();
+  link().use_kinematics(franka::fake::Kinematics::kFr3);
+  const Vector7d q = sample_joints();
+  const Eigen::Isometry3d flange = positronic_franka::fr3_link_frames(q)[8];
+  const Vector7d pose = robot.forward_kinematics(q);
+  check((pose.head<3>() - flange.translation()).norm() < 1e-12, "the fake flange position is the FR3 flange");
+  const Eigen::Quaterniond turn(pose(3), pose(4), pose(5), pose(6));
+  check(turn.angularDistance(Eigen::Quaterniond(flange.linear())) < 1e-9, "the fake flange turn is the FR3 flange");
+  const auto J = robot.zero_jacobian(q, positronic_franka::DEFAULT_STIFFNESS_POINT);
+  constexpr double h = 1e-6;
+  for (int i = 0; i < 7; ++i) {
+    Vector7d dq = Vector7d::Zero();
+    dq(i) = h;
+    const Eigen::Vector3d slope =
+        (robot.forward_kinematics(q + dq).head<3>() - robot.forward_kinematics(q - dq).head<3>()) / (2 * h);
+    check((J.block<3, 1>(0, i) - slope).norm() < 1e-6,
+          "joint " + std::to_string(i + 1) + " moves the flange as J says");
+  }
+  const auto st = robot.state();
+  check((st.flange_pose.head<3>() - positronic_franka::fr3_link_frames(st.q)[8].translation()).norm() < 1e-12,
+        "the state flange is the FR3 flange at the measured joints");
+}
+
+void a_reset_gives_the_fake_its_constant_jacobian_again() {
+  make_robot();
+  link().use_kinematics(franka::fake::Kinematics::kFr3);
+  Robot robot = make_robot();
+  const auto J = robot.zero_jacobian(sample_joints(), positronic_franka::DEFAULT_STIFFNESS_POINT);
+  positronic_franka::SpatialJacobian constant = positronic_franka::SpatialJacobian::Zero();
+  constant(0, 0) = franka::Model::JOINT_1_LEVER_ARM_M;
+  check(J == constant, "joint 1 moves every frame 0.5 m/rad along x, and nothing else moves");
+}
+
 void the_tool_point_cap_slows_a_reference_that_would_move_the_tool_faster() {
   // Joint 1 at its 1.5 rad/s cap moves the fake's tool at 0.75 m/s; a 0.7 m/s cap holds joint 1 at 1.4 rad/s.
   const double speed = joint_1_reference_speed_under_tool_point_cap(0.7);
@@ -229,6 +269,9 @@ int main() {
        a_loop_that_resumes_after_state_reported_the_stall_brakes},
       {"a_longer_timeout_does_not_flag_a_shorter_stall", a_longer_timeout_does_not_flag_a_shorter_stall},
       {"a_repeated_target_after_arrival_is_reached_again", a_repeated_target_after_arrival_is_reached_again},
+      {"the_fake_fr3_kinematics_give_the_fr3_flange_and_its_zero_jacobian",
+       the_fake_fr3_kinematics_give_the_fr3_flange_and_its_zero_jacobian},
+      {"a_reset_gives_the_fake_its_constant_jacobian_again", a_reset_gives_the_fake_its_constant_jacobian_again},
       {"the_tool_point_cap_slows_a_reference_that_would_move_the_tool_faster",
        the_tool_point_cap_slows_a_reference_that_would_move_the_tool_faster},
       {"a_tool_point_cap_above_the_joint_cap_leaves_the_joint_cap_in_charge",
