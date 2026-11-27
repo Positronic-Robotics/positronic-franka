@@ -443,6 +443,10 @@ void a_joint_target_past_a_side_stops_at_the_side_and_the_move_ends_bounded() {
   check(st.guard.bindings.size() == 1 && st.guard.bindings.at("front") == 1, "the binding is not counted at the wall");
   check(st.guard.slowed_ticks.count("front") && st.guard.slowed_ticks.at("front") > 0, "the plan does not slow");
   check(arm_comes_to(robot, committed), "the arm does not come to the committed target");
+  const std::uint64_t slowed = robot.state().guard.slowed_ticks.at("front");
+  const double t0 = robot.state().time;
+  check(wait_until([&] { return robot.state().time > t0 + 0.2; }), "the loop does not tick at rest");
+  check(robot.state().guard.slowed_ticks.at("front") == slowed, "the ticks at rest count as slowed");
   robot.stop();
 }
 
@@ -477,6 +481,28 @@ void after_a_box_change_no_tick_counts_at_a_side_of_the_old_box() {
   check(wait_until([&] { return robot.goal().status != GoalStatus::IN_FLIGHT; }, milliseconds(60000)),
         "the move back does not end");
   check(robot.state().guard.slowed_ticks.count("front") == 0, "the new report counts ticks at the old front wall");
+  robot.stop();
+}
+
+// A caller that streams a new target at each tick toward the front wall still gets the velocity steps, and the arm
+// stays inside the floors.
+void a_target_at_each_tick_still_slows_near_a_side() {
+  Robot robot = make_bounded_robot(a_front_wall(), InternalImpedance{}, false, 10.0);
+  const Vector7d start = current_q(robot);
+  robot.set_target_joints(start);
+  check(wait_until([&] { return robot.goal().status == GoalStatus::REACHED; }), "the hold at the start does not end");
+  const Vector7d far = leaning_forward(start);
+  link().tick_by_hand();
+  for (int i = 1; i <= 1500; ++i) {
+    robot.set_target_joints(start + std::min(1.0, i / 300.0) * (far - start));
+    link().tick(1);
+  }
+  const auto st = robot.state();
+  link().tick_freely();
+  check(st.guard.slowed_ticks.count("front") && st.guard.slowed_ticks.at("front") > 0,
+        "the streamed plans do not slow at the wall");
+  check(least_to_floor_on_the_move(a_front_wall(), start, st.q) >= -positronic_franka::IK_SELF_COLLISION_PATH_TOLERANCE,
+        "the arm passes its floor at the wall");
   robot.stop();
 }
 
@@ -846,6 +872,7 @@ int main() {
        a_retarget_whose_plan_brings_two_links_too_close_brakes_and_ends_bounded},
       {"a_retarget_toward_a_side_slows_and_stays_inside", a_retarget_toward_a_side_slows_and_stays_inside},
       {"after_the_bounds_go_a_move_plays_at_full_speed", after_the_bounds_go_a_move_plays_at_full_speed},
+      {"a_target_at_each_tick_still_slows_near_a_side", a_target_at_each_tick_still_slows_near_a_side},
       {"after_a_box_change_no_tick_counts_at_a_side_of_the_old_box",
        after_a_box_change_no_tick_counts_at_a_side_of_the_old_box},
       {"with_bounds_and_no_clip_a_joint_target_is_not_checked_for_self_collision",

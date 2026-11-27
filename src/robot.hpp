@@ -654,9 +654,9 @@ private:
             checked_target = *plan_to_check;
             if (const std::optional<PlanPass> pass = plan_check.start(*guard.target, traj))
               brake_before_a_floor_(pass->side, traj, guard.version, goal_in_flight, checked_target);
-          } else if (guard.target && !stopping) {
-            step_the_plan_check_(guard, traj, plan_check, slowed_by, goal_in_flight, checked_target);
           }
+          if (guard.target && !stopping)
+            step_the_plan_check_(guard, traj, plan_check, slowed_by, goal_in_flight, checked_target);
 
           auto pos = traj.step(period.toSec());
 
@@ -1088,7 +1088,8 @@ private:
   // One tick of the position loop on a plan to `target` that the guard checks. Near the box the velocity scale steps,
   // and a step plans again, so the check starts on the new plan. Then the check goes on. The loop brakes at a point of
   // the plan past a floor, at a step down that the planner refuses, and at the rest of a brake from a later point past
-  // a floor when a brake now comes to rest above each floor. `slowed_by` keeps the side of the last step down.
+  // a floor when a brake now comes to rest above each floor. `slowed_by` keeps the side of the last step down. It runs
+  // on each tick, also on a tick that takes a new target.
   void step_the_plan_check_(const LoopGuard& guard, TrajectoryGenerator& traj, PlanCheck& plan_check,
                             std::optional<std::string>& slowed_by, std::uint64_t goal, const Vector7d& target) {
     if (guard.box) {
@@ -1096,7 +1097,7 @@ private:
       if (step.slowest) slowed_by = step.slowest;
       const std::uint64_t plan = traj.plan_number();
       const bool planned = step.scale == traj.velocity_scale() || traj.set_velocity_scale(step.scale);
-      if (traj.velocity_scale() < 1.0 && slowed_by) {
+      if (traj.active() && traj.velocity_scale() < 1.0 && slowed_by) {
         std::lock_guard<std::mutex> lk(guard_mutex_);
         if (guards_version_.load() == guard.version) guard_report_.count_slowed(*slowed_by);
       }

@@ -189,10 +189,12 @@ class Link {
     cv_.notify_all();
   }
   // From now on the control call ticks only when tick() lets it, until tick_freely() or the next reset.
+  // Waits for a callback in flight, so the next callback is the first that tick() lets run.
   void tick_by_hand() {
-    std::lock_guard<std::mutex> lk(mutex_);
+    std::unique_lock<std::mutex> lk(mutex_);
     by_hand_ = true;
     ticks_left_ = 0;
+    cv_.wait(lk, [this] { return !in_callback_; });
   }
   void tick_freely() {
     {
@@ -232,6 +234,7 @@ class Link {
         cv_.wait(lk, [this] { return !paused_ && (!by_hand_ || ticks_left_ > 0); });
         tick = state_;
         granted = by_hand_;
+        in_callback_ = true;
       }
       const Command cmd = callback(tick, period);
       bool by_hand = false;
@@ -241,8 +244,9 @@ class Link {
         state_.time += Duration(1);
         by_hand = by_hand_;
         if (by_hand && granted) --ticks_left_;
+        in_callback_ = false;
       }
-      if (by_hand) cv_.notify_all();
+      cv_.notify_all();
       if (cmd.motion_finished) break;
       period = Duration(1);
       if (!by_hand) std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -263,6 +267,7 @@ class Link {
       {
         std::lock_guard<std::mutex> lk(link_.mutex_);
         link_.in_control_ = false;
+        link_.in_callback_ = false;
       }
       link_.cv_.notify_all();
     }
@@ -291,6 +296,7 @@ class Link {
   bool by_hand_ = false;
   int ticks_left_ = 0;
   bool in_control_ = false;
+  bool in_callback_ = false;
   int control_returns_ = 0;
 };
 
