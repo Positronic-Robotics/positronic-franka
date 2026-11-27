@@ -298,6 +298,23 @@ Robot make_clipping_robot(const positronic_franka::ControlMode& mode = InternalI
                /*clip_joint_targets_self_collision=*/true);
 }
 
+// With no control loop, an arm that a hand moves is not at rest either.
+void a_bounds_change_while_a_hand_moves_the_arm_is_refused() {
+  Robot robot = make_bounded_robot(std::nullopt);
+  link().guide({0.0, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0});
+  bool raised = false;
+  try {
+    robot.set_workspace_bounds(a_desk());
+  } catch (const std::runtime_error& e) {
+    raised = contains(e.what(), "only at rest");
+  }
+  check(raised, "a change while a hand moves the arm is taken");
+  check(!robot.state().bounds_hash, "a refused change changed the bounds");
+  link().guide({});
+  robot.set_workspace_bounds(a_desk());
+  check(robot.state().bounds_hash == a_desk().hash(), "a change at rest is refused");
+}
+
 // Unconfigured, a joint target is not checked for self-collision.
 void with_no_clip_a_joint_target_into_the_arm_is_reached_as_commanded() {
   Robot robot = make_robot();
@@ -654,6 +671,7 @@ int main() {
       {"bounds_need_an_arm_model_with_bounded_parts", bounds_need_an_arm_model_with_bounded_parts},
       {"bounds_change_at_rest_and_go_with_none", bounds_change_at_rest_and_go_with_none},
       {"a_bounds_change_during_a_move_is_refused", a_bounds_change_during_a_move_is_refused},
+      {"a_bounds_change_while_a_hand_moves_the_arm_is_refused", a_bounds_change_while_a_hand_moves_the_arm_is_refused},
       {"with_no_clip_a_joint_target_into_the_arm_is_reached_as_commanded",
        with_no_clip_a_joint_target_into_the_arm_is_reached_as_commanded},
       {"the_clip_stops_a_joint_target_at_the_self_collision_floor_and_the_move_ends_bounded",

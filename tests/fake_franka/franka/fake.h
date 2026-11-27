@@ -155,6 +155,11 @@ class Link {
     kinematics_setting().store(kinematics);
     follow_kinematics_();
   }
+  // Moves the joints at `dq` with no control call, as a hand guiding the arm does.
+  void guide(const std::array<double, 7>& dq) {
+    std::lock_guard<std::mutex> lk(mutex_);
+    state_.dq = dq;
+  }
   void pause() {
     std::lock_guard<std::mutex> lk(mutex_);
     paused_ = true;

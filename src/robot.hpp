@@ -1092,13 +1092,12 @@ private:
     return Eigen::Map<const Vector7d>(rs.q_d.data());
   }
 
-  // No move in flight, and a running loop measures every joint slower than SETTLE_VELOCITY_TOLERANCE.
+  // No move in flight, and every joint measured slower than SETTLE_VELOCITY_TOLERANCE, with a control loop or without.
   bool at_rest_() {
     {
       std::lock_guard<std::mutex> lk(goal_mutex_);
       if (goal_status_ == GoalStatus::IN_FLIGHT) return false;
     }
-    if (!control_running_.load()) return true;
     const franka::RobotState rs = read_robot_state_();
     return Eigen::Map<const Vector7d>(rs.dq.data()).cwiseAbs().maxCoeff() < SETTLE_VELOCITY_TOLERANCE;
   }
