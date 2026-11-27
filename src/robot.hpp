@@ -1101,11 +1101,11 @@ private:
         std::lock_guard<std::mutex> lk(guard_mutex_);
         if (guards_version_.load() == guard.version) guard_report_.count_slowed(*slowed_by);
       }
-      if (!planned) {
-        if (step.slowest) brake_before_a_floor_(*step.slowest, traj, guard.version, goal, target);
+      if (!planned && step.slowest) {
+        brake_before_a_floor_(*step.slowest, traj, guard.version, goal, target);
         return;
       }
-      if (traj.plan_number() != plan) {
+      if (planned && traj.plan_number() != plan) {
         if (const std::optional<PlanPass> pass = plan_check.start(*guard.target, traj))
           brake_before_a_floor_(pass->side, traj, guard.version, goal, target);
         return;
