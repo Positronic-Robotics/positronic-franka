@@ -194,8 +194,9 @@ struct VelocityStep {
 };
 
 // The velocity scale for the next tick of `traj` near the sides of `box`, in steps of a factor 2 so that the plan
-// changes only on a step. It steps down when a bounded part moves toward a side faster than the approach gain times
-// its distance to the floor, and steps up when four times the scale keeps every part within that speed.
+// changes only on a step. It steps down, to LEAST_VELOCITY_SCALE at the least, when a bounded part moves toward a side
+// faster than the approach gain times its distance to the floor, and steps up when four times the scale keeps every
+// part within that speed.
 inline VelocityStep velocity_step_near(const shared_kinematics::Guard& box, const TrajectoryGenerator& traj,
                                        double dt) {
   const double scale = traj.velocity_scale();

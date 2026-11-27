@@ -225,10 +225,13 @@ class Link {
     InControl in_control(*this);
     while (true) {
       RobotState tick;
+      // Whether tick() let this tick run; a switch to hand ticking during the callback counts no tick.
+      bool granted = false;
       {
         std::unique_lock<std::mutex> lk(mutex_);
         cv_.wait(lk, [this] { return !paused_ && (!by_hand_ || ticks_left_ > 0); });
         tick = state_;
+        granted = by_hand_;
       }
       const Command cmd = callback(tick, period);
       bool by_hand = false;
@@ -237,7 +240,7 @@ class Link {
         apply_(cmd);
         state_.time += Duration(1);
         by_hand = by_hand_;
-        if (by_hand) --ticks_left_;
+        if (by_hand && granted) --ticks_left_;
       }
       if (by_hand) cv_.notify_all();
       if (cmd.motion_finished) break;

@@ -446,6 +446,40 @@ void a_joint_target_past_a_side_stops_at_the_side_and_the_move_ends_bounded() {
   robot.stop();
 }
 
+// A move near a side ends at a low velocity scale. With the bounds removed, the next move plays at full speed.
+void after_the_bounds_go_a_move_plays_at_full_speed() {
+  Robot robot = make_bounded_robot(a_front_wall());
+  const Vector7d start = current_q(robot);
+  robot.set_target_joints(leaning_forward(start));
+  check(wait_until([&] { return robot.goal().status != GoalStatus::IN_FLIGHT; }, milliseconds(60000)),
+        "the move near the wall does not end");
+  check(robot.state().guard.slowed_ticks.count("front"), "the move near the wall does not slow");
+  robot.set_workspace_bounds(std::nullopt);
+  const double t0 = robot.state().time;
+  robot.set_target_joints(start);
+  check(wait_until([&] { return robot.goal().status != GoalStatus::IN_FLIGHT; }, milliseconds(60000)),
+        "the move back does not end");
+  check(robot.goal().status == GoalStatus::REACHED, "the move back does not end REACHED: " + robot.goal().reason);
+  const double took = robot.state().time - t0;
+  check(took < 1.0, "the move back takes " + std::to_string(took) + " s of loop time");
+  robot.stop();
+}
+
+// After a move that slowed at the front wall, a new box starts its report clean: no tick counts at the old side.
+void after_a_box_change_no_tick_counts_at_a_side_of_the_old_box() {
+  Robot robot = make_bounded_robot(a_front_wall());
+  const Vector7d start = current_q(robot);
+  robot.set_target_joints(leaning_forward(start));
+  check(wait_until([&] { return robot.goal().status != GoalStatus::IN_FLIGHT; }, milliseconds(60000)),
+        "the move near the wall does not end");
+  robot.set_workspace_bounds(a_desk(1.0));
+  robot.set_target_joints(start);
+  check(wait_until([&] { return robot.goal().status != GoalStatus::IN_FLIGHT; }, milliseconds(60000)),
+        "the move back does not end");
+  check(robot.state().guard.slowed_ticks.count("front") == 0, "the new report counts ticks at the old front wall");
+  robot.stop();
+}
+
 // A move toward `first`, then after `ticks` a move toward `second`, on the hand-ticked fake, with `bounds` and the
 // self-collision clip when `clip_self`.
 struct Retarget {
@@ -811,6 +845,9 @@ int main() {
       {"a_retarget_whose_plan_brings_two_links_too_close_brakes_and_ends_bounded",
        a_retarget_whose_plan_brings_two_links_too_close_brakes_and_ends_bounded},
       {"a_retarget_toward_a_side_slows_and_stays_inside", a_retarget_toward_a_side_slows_and_stays_inside},
+      {"after_the_bounds_go_a_move_plays_at_full_speed", after_the_bounds_go_a_move_plays_at_full_speed},
+      {"after_a_box_change_no_tick_counts_at_a_side_of_the_old_box",
+       after_a_box_change_no_tick_counts_at_a_side_of_the_old_box},
       {"with_bounds_and_no_clip_a_joint_target_is_not_checked_for_self_collision",
        with_bounds_and_no_clip_a_joint_target_is_not_checked_for_self_collision},
       {"with_no_bounds_the_ik_is_the_ik_of_the_fr3_self_pairs", with_no_bounds_the_ik_is_the_ik_of_the_fr3_self_pairs},

@@ -610,7 +610,13 @@ private:
             last_state_ = std::make_unique<franka::RobotState>(st);
           }
           loop_watch_.tick();
+          const std::uint64_t seen = guard.version;
           refresh_loop_guard_(guard);
+          // New guards start at full speed, with no side that slowed the plan.
+          if (guard.version != seen) {
+            slowed_by.reset();
+            traj.set_velocity_scale(1.0);
+          }
           traj.set_phase_synchronization(static_cast<bool>(guard.target));
           record_deepest_(guard, Eigen::Map<const Vector7d>(st.q.data()));
 
