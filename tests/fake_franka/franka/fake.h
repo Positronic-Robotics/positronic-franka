@@ -1,7 +1,7 @@
 #pragma once
 
 // A stand-in for the part of libfranka that src/robot.hpp uses. The control call ticks at 1 ms on a
-// joint model with no dynamics, and a test can pause it inside the call, as a lost link does.
+// joint model with no dynamics, and a test can pause it inside the call, as a lost link does, or tick it by hand.
 // The model serves a constant Jacobian by default, and the FR3 flange kinematics when a test asks for them.
 
 #include <array>
@@ -148,7 +148,10 @@ class Link {
     state_ = RobotState{};
     paused_ = false;
     drift_ = {};
+    by_hand_ = false;
+    ticks_left_ = 0;
     control_returns_ = 0;
+    cv_.notify_all();
   }
   // The kinematics of the model, until the next reset. With kFr3, O_T_EE follows q.
   void use_kinematics(Kinematics kinematics) {
@@ -185,6 +188,28 @@ class Link {
     }
     cv_.notify_all();
   }
+  // From now on the control call ticks only when tick() lets it, until tick_freely() or the next reset.
+  void tick_by_hand() {
+    std::lock_guard<std::mutex> lk(mutex_);
+    by_hand_ = true;
+    ticks_left_ = 0;
+  }
+  void tick_freely() {
+    {
+      std::lock_guard<std::mutex> lk(mutex_);
+      by_hand_ = false;
+      ticks_left_ = 0;
+    }
+    cv_.notify_all();
+  }
+  // Lets the control call tick `count` times, and returns when it has, or when the call has returned.
+  void tick(int count) {
+    std::unique_lock<std::mutex> lk(mutex_);
+    ticks_left_ += count;
+    cv_.notify_all();
+    cv_.wait(lk, [this] { return ticks_left_ == 0 || !in_control_; });
+    ticks_left_ = 0;
+  }
   RobotState state() {
     std::lock_guard<std::mutex> lk(mutex_);
     return state_;
@@ -197,28 +222,52 @@ class Link {
   template <typename Command>
   void run(const std::function<Command(const RobotState&, Duration)>& callback) {
     Duration period(0);
+    InControl in_control(*this);
     while (true) {
       RobotState tick;
       {
         std::unique_lock<std::mutex> lk(mutex_);
-        cv_.wait(lk, [this] { return !paused_; });
+        cv_.wait(lk, [this] { return !paused_ && (!by_hand_ || ticks_left_ > 0); });
         tick = state_;
       }
       const Command cmd = callback(tick, period);
+      bool by_hand = false;
       {
         std::lock_guard<std::mutex> lk(mutex_);
         apply_(cmd);
         state_.time += Duration(1);
+        by_hand = by_hand_;
+        if (by_hand) --ticks_left_;
       }
+      if (by_hand) cv_.notify_all();
       if (cmd.motion_finished) break;
       period = Duration(1);
-      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      if (!by_hand) std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
     std::lock_guard<std::mutex> lk(mutex_);
     ++control_returns_;
   }
 
  private:
+  // Marks the control call for tick(), also when the callback throws.
+  class InControl {
+   public:
+    explicit InControl(Link& link) : link_(link) {
+      std::lock_guard<std::mutex> lk(link_.mutex_);
+      link_.in_control_ = true;
+    }
+    ~InControl() {
+      {
+        std::lock_guard<std::mutex> lk(link_.mutex_);
+        link_.in_control_ = false;
+      }
+      link_.cv_.notify_all();
+    }
+
+   private:
+    Link& link_;
+  };
+
   void apply_(const JointPositions& cmd) {
     for (size_t i = 0; i < 7; ++i) {
       state_.dq[i] = (cmd.q[i] - state_.q[i]) / 1e-3;
@@ -236,6 +285,9 @@ class Link {
   RobotState state_;
   bool paused_ = false;
   std::array<double, 7> drift_{};
+  bool by_hand_ = false;
+  int ticks_left_ = 0;
+  bool in_control_ = false;
   int control_returns_ = 0;
 };
 
