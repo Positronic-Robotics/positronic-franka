@@ -1087,8 +1087,8 @@ private:
 
   // One tick of the position loop on a plan to `target` that the guard checks. Near the box the velocity scale steps,
   // and a step plans again, so the check starts on the new plan. Then the check goes on. The loop brakes at a point of
-  // the plan past a floor, at a step down that the planner refuses, and at the rest of a brake from a later point past
-  // a floor when a brake now comes to rest above each floor. `slowed_by` keeps the side of the last step down. It runs
+  // the plan past a floor, at a step down that the planner refuses, and on a brake from a later point past a floor
+  // when a brake now stays above each floor. `slowed_by` keeps the side of the last step down. It runs
   // on each tick, also on a tick that takes a new target.
   void step_the_plan_check_(const LoopGuard& guard, TrajectoryGenerator& traj, PlanCheck& plan_check,
                             std::optional<std::string>& slowed_by, std::uint64_t goal, const Vector7d& target) {
@@ -1114,11 +1114,11 @@ private:
     brake_at_a_pass_(plan_check.step(*guard.target, traj), guard, plan_check, traj, goal, target);
   }
 
-  // Brakes the position loop at a pass that the plan check found. At the rest of a brake from a later point, it brakes
-  // only when a brake now comes to rest above each floor.
+  // Brakes the position loop at a pass that the plan check found. On a brake from a later point, it brakes only when a
+  // brake now stays above each floor.
   void brake_at_a_pass_(const std::optional<PlanPass>& pass, const LoopGuard& guard, const PlanCheck& plan_check,
                         TrajectoryGenerator& traj, std::uint64_t goal, const Vector7d& target) {
-    if (pass && (!pass->at_brake_rest || plan_check.brake_now_rests_inside(*guard.target, traj)))
+    if (pass && (!pass->on_a_brake || plan_check.brake_now_stays_inside(*guard.target, traj)))
       brake_before_a_floor_(pass->side, traj, guard.version, goal, target);
   }
 

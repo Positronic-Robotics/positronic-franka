@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <iostream>
 #include <optional>
+#include <vector>
 #include <utility>
 
 #include <ruckig/ruckig.hpp>
@@ -135,9 +136,10 @@ class TrajectoryGenerator {
     return false;
   }
 
-  // Where a brake from the plan `t` seconds after it was planned comes to rest. Empty when the planner refuses it.
-  std::optional<std::array<double, 7>> rest_after_brake_at(double t) const {
-    if (!planned_) return input_.current_position;
+  // The poses of a brake from the plan `t` seconds after it was planned: `spacing` seconds apart, and where it comes to
+  // rest. Empty when the planner refuses it.
+  std::optional<std::vector<std::array<double, 7>>> brake_poses_at(double t, double spacing) const {
+    if (!planned_) return std::vector<std::array<double, 7>>{input_.current_position};
     ruckig::InputParameter<7> brake_input = input_;
     brake_input.control_interface = ruckig::ControlInterface::Velocity;
     trajectory_.at_time(std::clamp(t, 0.0, duration_), brake_input.current_position, brake_input.current_velocity,
@@ -145,9 +147,15 @@ class TrajectoryGenerator {
     ruckig::Ruckig<7> otg{NOMINAL_DT};
     ruckig::Trajectory<7> brake;
     if (otg.calculate(brake_input, brake) < 0) return std::nullopt;
+    std::vector<std::array<double, 7>> poses;
     std::array<double, 7> pos, vel, acc;
+    for (double s = spacing; s < brake.get_duration(); s += spacing) {
+      brake.at_time(s, pos, vel, acc);
+      poses.push_back(pos);
+    }
     brake.at_time(brake.get_duration(), pos, vel, acc);
-    return pos;
+    poses.push_back(pos);
+    return poses;
   }
 
   // Counts the plans; each accepted plan or brake gets the next number.
