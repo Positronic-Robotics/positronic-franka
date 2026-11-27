@@ -1,6 +1,6 @@
-// Checks the workspace box and the guard report in workspace_bounds.hpp. Needs only Eigen:
-//   g++ -std=c++17 -I src $(pkg-config --cflags eigen3) tests/test_workspace_bounds.cpp -o test_workspace_bounds
-//   ./test_workspace_bounds
+// Checks the workspace box and the guard report in workspace_bounds.hpp, and the guards of arm_guards.hpp. Needs
+// Eigen and the headers of the shared kinematics core. The workspace-bounds job of .github/workflows/tests.yaml
+// builds it.
 
 #include <cmath>
 #include <cstdlib>
@@ -13,6 +13,7 @@
 #include <utility>
 #include <vector>
 
+#include "arm_guards.hpp"
 #include "workspace_bounds.hpp"
 
 namespace {
@@ -33,8 +34,8 @@ void check(bool ok, const std::string& what) {
 // A desk 2 cm below the base and a front wall 0.8 m ahead of it.
 std::vector<Side> desk_and_front() {
   return {
-      {"desk", SideKind::SURFACE, Eigen::Vector3d::UnitZ(), 0.02, 0.006, -0.005},
-      {"front", SideKind::SURFACE, -Eigen::Vector3d::UnitX(), 0.8, 0.0, -0.005},
+      {"desk", SideKind::kSurface, Eigen::Vector3d::UnitZ(), 0.02, 0.006, -0.005},
+      {"front", SideKind::kSurface, -Eigen::Vector3d::UnitX(), 0.8, 0.0, -0.005},
   };
 }
 
@@ -65,9 +66,9 @@ void the_hash_of_a_known_box_is_stable() {
 void the_hash_changes_with_every_name_kind_and_number() {
   std::vector<std::function<void(std::vector<Side>&, Eigen::Matrix4d&)>> changes = {
       [](auto& s, auto&) { s[0].name = "table"; },
-      [](auto& s, auto&) { s[0].kind = SideKind::VIRTUAL; },
-      [](auto& s, auto&) { s[0].normal = Eigen::Vector3d(0, std::sin(0.01), std::cos(0.01)); },
-      [](auto& s, auto&) { s[0].offset += 1e-4; },
+      [](auto& s, auto&) { s[0].kind = SideKind::kVirtual; },
+      [](auto& s, auto&) { s[0].n = Eigen::Vector3d(0, std::sin(0.01), std::cos(0.01)); },
+      [](auto& s, auto&) { s[0].d += 1e-4; },
       [](auto& s, auto&) { s[0].pad_allowance += 1e-4; },
       [](auto& s, auto&) { s[0].rigid_allowance += 1e-4; },
       [](auto&, auto& pose) { pose(2, 3) += 1e-4; },
@@ -96,9 +97,9 @@ void a_bad_box_is_refused() {
       {"no name", [](auto& s) { s[0].name = ""; }},
       {"the name self", [](auto& s) { s[0].name = "self"; }},
       {"two sides of one name", [](auto& s) { s[1].name = s[0].name; }},
-      {"a normal not of unit length", [](auto& s) { s[0].normal *= 1.01; }},
-      {"a NaN normal", [nan](auto& s) { s[0].normal(0) = nan; }},
-      {"a NaN offset", [nan](auto& s) { s[0].offset = nan; }},
+      {"a normal not of unit length", [](auto& s) { s[0].n *= 1.01; }},
+      {"a NaN normal", [nan](auto& s) { s[0].n(0) = nan; }},
+      {"a NaN offset", [nan](auto& s) { s[0].d = nan; }},
       {"an infinite pad allowance", [inf](auto& s) { s[0].pad_allowance = inf; }},
       {"an infinite rigid allowance", [inf](auto& s) { s[0].rigid_allowance = -inf; }},
   };
@@ -140,6 +141,52 @@ void the_report_counts_bindings_and_keeps_the_deepest_pass() {
         "the report keeps more than the deepest pass of each side");
 }
 
+shared_kinematics::ArmModel fr3_with_a_gripper_body() {
+  shared_kinematics::ArmModel model = positronic_franka::fr3_arm_model();
+  model.bodies.push_back({{"gripper", positronic_franka::FR3_FLANGE_LINK, {0, 0, 0.01}, {0, 0, 0.11}, 0.045}});
+  return model;
+}
+
+void with_no_bounds_and_no_clip_only_the_ik_has_a_guard_and_it_checks_the_self_pairs() {
+  const auto guards = positronic_franka::make_arm_guards(fr3_with_a_gripper_body(), std::nullopt, false);
+  check(!guards.target && !guards.box, "a guard checks joint targets or the fast loop with nothing configured");
+  check(guards.ik->planes().empty() && guards.ik->model().self.pairs.size() == 8, "the IK guard is not the self pairs");
+}
+
+void the_self_collision_clip_checks_joint_targets_against_the_self_pairs() {
+  const auto guards = positronic_franka::make_arm_guards(fr3_with_a_gripper_body(), std::nullopt, true);
+  check(guards.target && guards.target->planes().empty() && guards.target->model().self.pairs.size() == 8 &&
+            !guards.box,
+        "the joint target guard does not check the self pairs alone");
+}
+
+void bounds_go_to_every_guard_and_only_the_ik_and_the_clip_keep_the_self_pairs() {
+  Eigen::Matrix4d pose = Eigen::Matrix4d::Identity();
+  pose(0, 3) = 0.3;
+  const WorkspaceBounds bounds(desk_and_front(), pose);
+  const auto without_clip = positronic_franka::make_arm_guards(fr3_with_a_gripper_body(), bounds, false);
+  check(without_clip.box->model().self.pairs.empty() && without_clip.target->model().self.pairs.empty(),
+        "the box guard or the joint target guard checks self pairs without the clip");
+  check(without_clip.ik->planes().size() == 2 && without_clip.box->planes().size() == 2 &&
+            without_clip.target->planes().size() == 2,
+        "a guard has no box");
+  check(without_clip.box->model().base_pose.matrix() == pose, "the arm base is not at the base pose of the bounds");
+  const auto with_clip = positronic_franka::make_arm_guards(fr3_with_a_gripper_body(), bounds, true);
+  check(with_clip.target->model().self.pairs.size() == 8 && with_clip.target->planes().size() == 2,
+        "the clip does not check the self pairs and the box");
+}
+
+void bounds_on_a_model_with_no_bounded_part_or_a_model_of_other_joints_are_refused() {
+  const WorkspaceBounds bounds(desk_and_front());
+  check(refused([&] { positronic_franka::make_arm_guards(positronic_franka::fr3_arm_model(), bounds, false); }),
+        "bounds on a model with no bounded part are taken");
+  shared_kinematics::ArmModel six = fr3_with_a_gripper_body();
+  std::vector<shared_kinematics::Link> links = six.chain.links();
+  links[8].joint = -1;
+  six.chain = shared_kinematics::Chain(links);
+  check(refused([&] { positronic_franka::make_arm_guards(six, std::nullopt, false); }), "a 6 joint model is taken");
+}
+
 }  // namespace
 
 int main() {
@@ -151,6 +198,14 @@ int main() {
       {"a_bad_box_is_refused", a_bad_box_is_refused},
       {"a_turned_and_moved_base_pose_is_taken", a_turned_and_moved_base_pose_is_taken},
       {"the_report_counts_bindings_and_keeps_the_deepest_pass", the_report_counts_bindings_and_keeps_the_deepest_pass},
+      {"with_no_bounds_and_no_clip_only_the_ik_has_a_guard_and_it_checks_the_self_pairs",
+       with_no_bounds_and_no_clip_only_the_ik_has_a_guard_and_it_checks_the_self_pairs},
+      {"the_self_collision_clip_checks_joint_targets_against_the_self_pairs",
+       the_self_collision_clip_checks_joint_targets_against_the_self_pairs},
+      {"bounds_go_to_every_guard_and_only_the_ik_and_the_clip_keep_the_self_pairs",
+       bounds_go_to_every_guard_and_only_the_ik_and_the_clip_keep_the_self_pairs},
+      {"bounds_on_a_model_with_no_bounded_part_or_a_model_of_other_joints_are_refused",
+       bounds_on_a_model_with_no_bounded_part_or_a_model_of_other_joints_are_refused},
   };
   int failed = 0;
   for (const auto& [name, test] : tests) {

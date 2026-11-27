@@ -13,25 +13,17 @@
 #include <Eigen/Core>
 #include <Eigen/Geometry>
 
+#include <shared_kinematics/shared_kinematics.hpp>
+
 namespace positronic_franka {
 
-// A real desk or wall, whose calibration touches pass a residual check, or a line that an operator chose.
-enum class SideKind { SURFACE, VIRTUAL };
+// A real desk or wall (kSurface), or a line that an operator chose (kVirtual).
+using SideKind = shared_kinematics::SideKind;
 
-// One plane of the workspace box, in the rig frame. A point p is inside the side when normal . p + offset >= 0.
-// An allowance is how far past the side a point of that role may go, in metres. A negative allowance is a margin
-// that the point keeps inside the side.
-struct Side {
-  std::string name;
-  SideKind kind = SideKind::SURFACE;
-  // Unit length, toward the inside of the box.
-  Eigen::Vector3d normal = Eigen::Vector3d::UnitZ();
-  double offset = 0.0;
-  // For the finger pads, which bend at a press.
-  double pad_allowance = 0.0;
-  // For every rigid part: the palm, the flange, the wrist, the elbow, the gripper body and the wrist cameras.
-  double rigid_allowance = 0.0;
-};
+// One plane of the workspace box, in the rig frame: a point x is inside when n . x + d >= 0, with n of unit length.
+// pad_allowance and rigid_allowance are how far past the side a finger pad and a rigid part may go, in metres; a
+// negative allowance is a margin that the part keeps inside the side.
+using Side = shared_kinematics::Plane;
 
 // The key under which the robot state counts the targets that the self-collision clip shortened. No side takes it.
 inline const std::string SELF_COLLISION_KEY = "self";
@@ -66,10 +58,10 @@ class WorkspaceBounds {
         throw std::invalid_argument("the side name '" + SELF_COLLISION_KEY + "' is reserved for self-collision");
       if (i > 0 && sides_[i - 1].name == side.name)
         throw std::invalid_argument("two sides have the name '" + side.name + "'");
-      if (!side.normal.allFinite() || std::abs(side.normal.norm() - 1.0) > WORKSPACE_BOUNDS_UNIT_TOLERANCE)
-        throw std::invalid_argument("the normal of side '" + side.name + "' must be finite and of unit length");
-      if (!std::isfinite(side.offset) || !std::isfinite(side.pad_allowance) || !std::isfinite(side.rigid_allowance))
-        throw std::invalid_argument("the offset and the allowances of side '" + side.name + "' must be finite");
+      if (!side.n.allFinite() || std::abs(side.n.norm() - 1.0) > WORKSPACE_BOUNDS_UNIT_TOLERANCE)
+        throw std::invalid_argument("the normal n of side '" + side.name + "' must be finite and of unit length");
+      if (!std::isfinite(side.d) || !std::isfinite(side.pad_allowance) || !std::isfinite(side.rigid_allowance))
+        throw std::invalid_argument("the offset d and the allowances of side '" + side.name + "' must be finite");
     }
     const Eigen::Matrix3d R = base_pose_.topLeftCorner<3, 3>();
     const bool rigid = base_pose_.allFinite() && base_pose_.row(3) == Eigen::RowVector4d(0, 0, 0, 1) &&
@@ -95,10 +87,10 @@ class WorkspaceBounds {
       const std::uint64_t length = side.name.size();
       bytes(&length, sizeof length);
       bytes(side.name.data(), side.name.size());
-      const unsigned char kind = side.kind == SideKind::SURFACE ? 0 : 1;
+      const unsigned char kind = side.kind == SideKind::kSurface ? 0 : 1;
       bytes(&kind, 1);
-      for (int i = 0; i < 3; ++i) number(side.normal(i));
-      number(side.offset);
+      for (int i = 0; i < 3; ++i) number(side.n(i));
+      number(side.d);
       number(side.pad_allowance);
       number(side.rigid_allowance);
     }

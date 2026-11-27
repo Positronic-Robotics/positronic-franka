@@ -190,8 +190,25 @@ void a_repeated_target_after_arrival_is_reached_again() {
   robot.stop();
 }
 
+// The FR3 with bounded parts: the self-collision capsules of links 2 .. 7, a gripper body, and a pad point where
+// the closed pads of a 2F-85 meet, 0.155 m along the flange z axis.
+shared_kinematics::ArmModel fr3_with_gripper() {
+  shared_kinematics::ArmModel model = positronic_franka::fr3_arm_model();
+  for (const auto& c : model.self.capsules) model.bodies.push_back({c, shared_kinematics::Role::kRigid, c.link > 2});
+  const int flange = positronic_franka::FR3_FLANGE_LINK;
+  model.bodies.push_back({{"gripper", flange, {0, 0, 0.01}, {0, 0, 0.11}, 0.045}, shared_kinematics::Role::kRigid});
+  model.bodies.push_back({{"pads", flange, {0, 0, 0.155}, {0, 0, 0.155}, 0.0}, shared_kinematics::Role::kPad});
+  return model;
+}
+
+Robot make_bounded_robot(const std::optional<WorkspaceBounds>& bounds,
+                         const positronic_franka::ControlMode& mode = InternalImpedance{}, bool clip_self = false) {
+  link().reset();
+  return Robot("fake", franka::RealtimeConfig::kIgnore, 1.0, mode, TIMEOUT_S, bounds, clip_self, fr3_with_gripper());
+}
+
 WorkspaceBounds a_desk(double offset = 0.02) {
-  return WorkspaceBounds({{"desk", SideKind::SURFACE, Eigen::Vector3d::UnitZ(), offset, 0.006, -0.005}});
+  return WorkspaceBounds({{"desk", SideKind::kSurface, Eigen::Vector3d::UnitZ(), offset, 0.006, -0.005}});
 }
 
 // Unconfigured, the guard reports nothing and passes each target as it is.
@@ -212,14 +229,32 @@ void with_no_bounds_the_state_reports_no_guard_and_the_target_as_commanded() {
 }
 
 void bounds_given_at_the_start_are_in_force() {
-  link().reset();
-  Robot robot("fake", franka::RealtimeConfig::kIgnore, 1.0, InternalImpedance{}, TIMEOUT_S, a_desk());
+  Robot robot = make_bounded_robot(a_desk());
   check(robot.state().bounds_hash == a_desk().hash(), "the state does not report the bounds of the start");
   check(robot.workspace_bounds() && robot.workspace_bounds()->hash() == a_desk().hash(), "the bounds are not kept");
 }
 
-void bounds_change_at_rest_and_go_with_none() {
+void bounds_need_an_arm_model_with_bounded_parts() {
+  bool refused = false;
+  try {
+    link().reset();
+    Robot robot("fake", franka::RealtimeConfig::kIgnore, 1.0, InternalImpedance{}, TIMEOUT_S, a_desk());
+  } catch (const std::invalid_argument& e) {
+    refused = contains(e.what(), "bounded parts");
+  }
+  check(refused, "bounds on the FR3 with no bounded part are taken");
   Robot robot = make_robot();
+  refused = false;
+  try {
+    robot.set_workspace_bounds(a_desk());
+  } catch (const std::invalid_argument&) {
+    refused = true;
+  }
+  check(refused && !robot.workspace_bounds(), "set_workspace_bounds takes bounds on the FR3 with no bounded part");
+}
+
+void bounds_change_at_rest_and_go_with_none() {
+  Robot robot = make_bounded_robot(std::nullopt);
   robot.set_workspace_bounds(a_desk());
   check(robot.state().bounds_hash == a_desk().hash(), "the bounds are not set before the first move");
   robot.set_target_joints(offset_on_joint_1(current_q(robot), 0.3));
@@ -233,7 +268,7 @@ void bounds_change_at_rest_and_go_with_none() {
 }
 
 void a_bounds_change_during_a_move_is_refused() {
-  Robot robot = make_robot();
+  Robot robot = make_bounded_robot(std::nullopt);
   robot.set_workspace_bounds(a_desk());
   robot.set_target_joints(offset_on_joint_1(current_q(robot), 1.0));
   bool raised = false;
@@ -329,6 +364,109 @@ void under_software_impedance_the_reference_stops_at_the_committed_target() {
   robot.stop();
 }
 
+// A front wall 0.42 m ahead of the base. The pad point starts 0.32 m ahead of the base.
+WorkspaceBounds a_front_wall() {
+  return WorkspaceBounds({{"front", SideKind::kSurface, -Eigen::Vector3d::UnitX(), 0.42, 0.0, -0.005}});
+}
+
+// From the fake's start, joints 2 and 4 lean the arm forward and take the pad point 0.48 m ahead of the base.
+Vector7d leaning_forward(const Vector7d& start) {
+  Vector7d q = start;
+  q(1) += 0.8;
+  q(3) += 0.4;
+  return q;
+}
+
+// The least, over the moves from `from` to 1000 points of the way to `to`, of a part's distance past its clip floor
+// at a side: its floor, or its distance at `from` when that is less.
+double least_to_floor_on_the_move(const WorkspaceBounds& bounds, const Vector7d& from, const Vector7d& to) {
+  shared_kinematics::ArmModel model = fr3_with_gripper();
+  model.self.pairs.clear();
+  const shared_kinematics::Guard guard(model, bounds.sides());
+  const auto at_from = guard.distances(from).planes;
+  double least = std::numeric_limits<double>::infinity();
+  for (int i = 0; i <= 1000; ++i) {
+    const auto rows = guard.distances(from + i / 1000.0 * (to - from)).planes;
+    for (std::size_t k = 0; k < rows.size(); ++k)
+      least = std::min(least, rows[k].distance - std::min(rows[k].floor, at_from[k].distance));
+  }
+  return least;
+}
+
+void a_joint_target_past_a_side_stops_at_the_side_and_the_move_ends_bounded() {
+  Robot robot = make_bounded_robot(a_front_wall());
+  const Vector7d start = current_q(robot), target = leaning_forward(start);
+  robot.set_target_joints(target);
+  check(wait_until([&] { return robot.goal().status != GoalStatus::IN_FLIGHT; }), "the move ends");
+  const auto goal = robot.goal();
+  check(goal.status == GoalStatus::BOUNDED, "the move to a target past the wall does not end BOUNDED: " + goal.reason);
+  const auto st = robot.state();
+  const Vector7d committed = *st.committed_target;
+  check(committed != target, "the clip let the target through");
+  check(least_to_floor_on_the_move(a_front_wall(), start, committed) >=
+            -positronic_franka::IK_SELF_COLLISION_PATH_TOLERANCE,
+        "the committed move takes a part past its floor at the wall");
+  check(least_to_floor_on_the_move(a_front_wall(), start, target) < -0.01, "the target is not past the wall");
+  check(st.guard.bindings.size() == 1 && st.guard.bindings.at("front") == 1, "the binding is not counted at the wall");
+  check(arm_comes_to(robot, committed), "the arm does not come to the committed target");
+  robot.stop();
+}
+
+// With bounds but no self-collision clip, a joint target is checked against the box alone.
+void with_bounds_and_no_clip_a_joint_target_is_not_checked_for_self_collision() {
+  Robot robot = make_bounded_robot(a_desk(1.0));
+  const Vector7d target = shoulder_back_elbow_folded();
+  robot.set_target_joints(target);
+  check(wait_until([&] { return robot.goal().status != GoalStatus::IN_FLIGHT; }), "the move ends");
+  check(robot.goal().status == GoalStatus::REACHED, "the move into the arm does not end REACHED");
+  check(*robot.state().committed_target == target && robot.state().guard.bindings.empty(),
+        "the guard checked a self pair");
+  robot.stop();
+}
+
+positronic_franka::ToolKinematics fake_fr3_flange(const Vector7d& q) {
+  std::array<double, 7> joints;
+  Eigen::Map<Vector7d>(joints.data()) = q;
+  const auto flange = franka::fake::fr3_flange(joints);
+  return {Eigen::Map<const Eigen::Matrix4d>(flange.pose.data()),
+          Eigen::Map<const positronic_franka::SpatialJacobian>(flange.zero_jacobian.data())};
+}
+
+Vector7d flange_pose_at(const Vector7d& q) {
+  const Eigen::Matrix4d T = fake_fr3_flange(q).pose;
+  const Eigen::Quaterniond turn(Eigen::Matrix3d(T.topLeftCorner<3, 3>()));
+  Vector7d pose;
+  pose << T.topRightCorner<3, 1>(), turn.w(), turn.x(), turn.y(), turn.z();
+  return pose;
+}
+
+// With no bounds, the IK of the Robot is the IK of the FR3 self pairs.
+void with_no_bounds_the_ik_is_the_ik_of_the_fr3_self_pairs() {
+  Robot robot = make_bounded_robot(std::nullopt);
+  link().use_kinematics(franka::fake::Kinematics::kFr3);
+  const Vector7d start = current_q(robot);
+  for (const Vector7d& q_target : {leaning_forward(start), shoulder_back_elbow_folded()}) {
+    const Vector7d pose = flange_pose_at(q_target);
+    const Vector7d ours = robot.inverse_kinematics_with_limits(pose, start, 1.0);
+    check(ours == positronic_franka::solve_pose_ik(fake_fr3_flange, pose, start, 1.0), "the IK differs");
+  }
+}
+
+// The IK pushes the parts away from the wall and stops the move at its floor.
+void the_ik_keeps_the_parts_inside_the_wall_and_moves_toward_the_target() {
+  Robot robot = make_bounded_robot(a_front_wall());
+  link().use_kinematics(franka::fake::Kinematics::kFr3);
+  const Vector7d start = current_q(robot);
+  const Vector7d pose = flange_pose_at(leaning_forward(start));
+  const Vector7d q = robot.inverse_kinematics_with_limits(pose, start, 1.0);
+  const double kept = least_to_floor_on_the_move(a_front_wall(), start, q);
+  check(kept >= -positronic_franka::IK_SELF_COLLISION_PATH_TOLERANCE, "the IK move takes a part past its floor");
+  check(kept < 0.02, "the IK answer stays " + std::to_string(kept) + " m from the floor, not near it");
+  const double before = (flange_pose_at(start).head<3>() - pose.head<3>()).norm();
+  const double after = (flange_pose_at(q).head<3>() - pose.head<3>()).norm();
+  check(after < before - 0.05, "the IK answer does not move the flange toward the target");
+}
+
 // Moves joint 1 under software impedance with the tool point capped at `max_tool_point_speed` m/s, and returns
 // the joint 1 reference speed, rad/s, over the first 200 ms or more.
 double joint_1_reference_speed_under_tool_point_cap(double max_tool_point_speed) {
@@ -422,6 +560,7 @@ int main() {
       {"with_no_bounds_the_state_reports_no_guard_and_the_target_as_commanded",
        with_no_bounds_the_state_reports_no_guard_and_the_target_as_commanded},
       {"bounds_given_at_the_start_are_in_force", bounds_given_at_the_start_are_in_force},
+      {"bounds_need_an_arm_model_with_bounded_parts", bounds_need_an_arm_model_with_bounded_parts},
       {"bounds_change_at_rest_and_go_with_none", bounds_change_at_rest_and_go_with_none},
       {"a_bounds_change_during_a_move_is_refused", a_bounds_change_during_a_move_is_refused},
       {"with_no_clip_a_joint_target_into_the_arm_is_reached_as_commanded",
@@ -431,6 +570,13 @@ int main() {
       {"a_clear_joint_target_under_the_clip_is_reached", a_clear_joint_target_under_the_clip_is_reached},
       {"under_software_impedance_the_reference_stops_at_the_committed_target",
        under_software_impedance_the_reference_stops_at_the_committed_target},
+      {"a_joint_target_past_a_side_stops_at_the_side_and_the_move_ends_bounded",
+       a_joint_target_past_a_side_stops_at_the_side_and_the_move_ends_bounded},
+      {"with_bounds_and_no_clip_a_joint_target_is_not_checked_for_self_collision",
+       with_bounds_and_no_clip_a_joint_target_is_not_checked_for_self_collision},
+      {"with_no_bounds_the_ik_is_the_ik_of_the_fr3_self_pairs", with_no_bounds_the_ik_is_the_ik_of_the_fr3_self_pairs},
+      {"the_ik_keeps_the_parts_inside_the_wall_and_moves_toward_the_target",
+       the_ik_keeps_the_parts_inside_the_wall_and_moves_toward_the_target},
       {"the_tool_point_cap_slows_a_reference_that_would_move_the_tool_faster",
        the_tool_point_cap_slows_a_reference_that_would_move_the_tool_faster},
       {"a_tool_point_cap_above_the_joint_cap_leaves_the_joint_cap_in_charge",

@@ -97,10 +97,13 @@ jobs:
       - name: Install Eigen
         run: sudo apt-get update && sudo apt-get install -y libeigen3-dev
 
-      # The workspace box needs only Eigen, so this test runs without libfranka.
+      - name: Fetch the shared kinematics core
+        run: .github/scripts/fetch-shared-kinematics.sh
+
+      # The workspace box and its guards need Eigen and the shared kinematics core, so this test runs without libfranka.
       - name: Run the workspace bounds tests
         run: |
-          g++ -std=c++17 -Wall -Wextra -Werror -I src -isystem /usr/include/eigen3 \
+          g++ -std=c++17 -Wall -Wextra -Werror -I src -I shared-kinematics/include -isystem /usr/include/eigen3 \
             tests/test_workspace_bounds.cpp -o test_workspace_bounds
           ./test_workspace_bounds
 

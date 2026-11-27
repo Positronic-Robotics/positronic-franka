@@ -7,6 +7,52 @@
 #include "robot.hpp"
 
 namespace py = pybind11;
+namespace sk = shared_kinematics;
+
+namespace {
+
+// Reads an arm model from any object with the attributes of shared_kinematics.ArmModel, so that this module does not
+// need to share pybind11 type data with the shared_kinematics module.
+sk::ArmModel arm_model_from(const py::handle& model) {
+  const auto pose = [](const py::handle& matrix) {
+    const Eigen::Matrix4d m = matrix.cast<Eigen::Matrix4d>();
+    if (!m.allFinite() || m.row(3) != Eigen::RowVector4d(0, 0, 0, 1))
+      throw std::invalid_argument("an arm model pose must be a finite 4x4 homogeneous transform");
+    Eigen::Isometry3d t;
+    t.matrix() = m;
+    return t;
+  };
+  const auto capsule = [](const py::handle& c) {
+    return sk::Capsule{c.attr("name").cast<std::string>(), c.attr("link").cast<int>(),
+                       c.attr("a").cast<Eigen::Vector3d>(), c.attr("b").cast<Eigen::Vector3d>(),
+                       c.attr("radius").cast<double>()};
+  };
+  std::vector<sk::Link> links;
+  const py::object chain = model.attr("chain");
+  for (const py::handle link : chain.attr("links"))
+    links.push_back({link.attr("name").cast<std::string>(), link.attr("parent").cast<int>(),
+                     pose(link.attr("origin")), link.attr("joint").cast<int>(),
+                     link.attr("axis").cast<Eigen::Vector3d>()});
+  sk::ArmModel out;
+  out.chain = sk::Chain(std::move(links));
+  for (const py::handle body : model.attr("bodies")) {
+    const std::string role = py::str(body.attr("role").attr("name"));
+    if (role != "PAD" && role != "RIGID") throw std::invalid_argument("a body role must be PAD or RIGID");
+    out.bodies.push_back({capsule(body.attr("capsule")), role == "PAD" ? sk::Role::kPad : sk::Role::kRigid,
+                          body.attr("in_planes").cast<bool>()});
+  }
+  const py::object self = model.attr("self_collision");
+  for (const py::handle c : self.attr("capsules")) out.self.capsules.push_back(capsule(c));
+  for (const py::handle pair : self.attr("pairs"))
+    out.self.pairs.push_back({pair.attr("name").cast<std::string>(), pair.attr("a").cast<std::vector<int>>(),
+                              pair.attr("b").cast<std::vector<int>>()});
+  out.self.clearance = self.attr("clearance").cast<double>();
+  out.base_pose = pose(model.attr("base_pose"));
+  out.validate();
+  return out;
+}
+
+}  // namespace
 
 PYBIND11_MODULE(_franka, m) {
   m.doc() = "Franka robot driver";
@@ -73,26 +119,28 @@ PYBIND11_MODULE(_franka, m) {
       .def_readonly("tool_point", &positronic_franka::SoftwareImpedance::tool_point)
       .def(py::self == py::self);
 
-  py::enum_<positronic_franka::SideKind>(m, "SideKind", "What a side of the workspace box stands for")
-      .value("SURFACE", positronic_franka::SideKind::SURFACE,
+  // module_local: the shared_kinematics module binds the same core types.
+  py::enum_<positronic_franka::SideKind>(m, "SideKind", py::module_local(),
+                                         "What a side of the workspace box stands for")
+      .value("SURFACE", positronic_franka::SideKind::kSurface,
              "A real desk or wall, whose calibration touches pass a residual check")
-      .value("VIRTUAL", positronic_franka::SideKind::VIRTUAL, "A line that an operator chose");
+      .value("VIRTUAL", positronic_franka::SideKind::kVirtual, "A line that an operator chose");
 
-  py::class_<positronic_franka::Side>(m, "Side",
-      "One plane of the workspace box, in the rig frame. A point p is inside the side when "
-      "normal . p + offset >= 0. normal (3,) is of unit length and points to the inside. pad_allowance and "
-      "rigid_allowance, m, are how far past the side a finger pad and a rigid part may go; a negative value is "
-      "a margin that the part keeps inside the side")
-      .def(py::init([](std::string name, positronic_franka::SideKind kind, const Eigen::Vector3d& normal,
-                       double offset, double pad_allowance, double rigid_allowance) {
-             return positronic_franka::Side{std::move(name), kind, normal, offset, pad_allowance, rigid_allowance};
+  py::class_<positronic_franka::Side>(m, "Side", py::module_local(),
+      "One plane of the workspace box, in the rig frame. A point x is inside the side when n . x + d >= 0. "
+      "n (3,) is of unit length and points to the inside. pad_allowance and rigid_allowance, m, are how far past "
+      "the side a finger pad and a rigid part may go; a negative value is a margin that the part keeps inside the "
+      "side")
+      .def(py::init([](std::string name, positronic_franka::SideKind kind, const Eigen::Vector3d& n, double d,
+                       double pad_allowance, double rigid_allowance) {
+             return positronic_franka::Side{std::move(name), kind, n, d, pad_allowance, rigid_allowance};
            }),
-           py::arg("name"), py::arg("kind"), py::arg("normal"), py::arg("offset"), py::kw_only(),
-           py::arg("pad_allowance"), py::arg("rigid_allowance"))
+           py::arg("name"), py::arg("kind"), py::arg("n"), py::arg("d"), py::kw_only(), py::arg("pad_allowance"),
+           py::arg("rigid_allowance"))
       .def_readonly("name", &positronic_franka::Side::name)
       .def_readonly("kind", &positronic_franka::Side::kind)
-      .def_readonly("normal", &positronic_franka::Side::normal)
-      .def_readonly("offset", &positronic_franka::Side::offset)
+      .def_readonly("n", &positronic_franka::Side::n)
+      .def_readonly("d", &positronic_franka::Side::d)
       .def_readonly("pad_allowance", &positronic_franka::Side::pad_allowance)
       .def_readonly("rigid_allowance", &positronic_franka::Side::rigid_allowance);
 
@@ -202,22 +250,33 @@ PYBIND11_MODULE(_franka, m) {
           "The target (7,) of the last joint move after the guard, or None before the first move");
 
   py::class_<positronic_franka::Robot>(m, "Robot")
-      .def(py::init<const std::string&, franka::RealtimeConfig, double, positronic_franka::ControlMode, double,
-                    std::optional<positronic_franka::WorkspaceBounds>, bool>(),
+      .def(py::init([](const std::string& ip, franka::RealtimeConfig realtime_config, double relative_dynamics_factor,
+                       const positronic_franka::ControlMode& control_mode, double control_link_timeout_s,
+                       std::optional<positronic_franka::WorkspaceBounds> workspace_bounds,
+                       bool clip_joint_targets_self_collision, const py::object& arm_model) {
+             std::optional<sk::ArmModel> model;
+             if (!arm_model.is_none()) model = arm_model_from(arm_model);
+             return std::make_unique<positronic_franka::Robot>(
+                 ip, realtime_config, relative_dynamics_factor, control_mode, control_link_timeout_s,
+                 std::move(workspace_bounds), clip_joint_targets_self_collision, std::move(model));
+           }),
            py::arg("ip"),
            py::arg("realtime_config") = positronic_franka::DEFAULT_REALTIME_CONFIG,
            py::arg("relative_dynamics_factor") = positronic_franka::DEFAULT_RELATIVE_DYNAMICS_FACTOR,
            py::arg("control_mode") = positronic_franka::DEFAULT_CONTROL_MODE,
            py::arg("control_link_timeout_s") = positronic_franka::DEFAULT_CONTROL_LINK_TIMEOUT_S,
            py::arg("workspace_bounds") = py::none(),
-           py::arg("clip_joint_targets_self_collision") = false,
+           py::arg("clip_joint_targets_self_collision") = false, py::arg("arm_model") = py::none(),
            "control_link_timeout_s: a running control loop with no robot state for this long, in seconds, is "
            "stuck: state() reports an error, goal() aborts the move, and a stop raises RuntimeError. Default 10 s. "
-           "workspace_bounds: the WorkspaceBounds at the start, or None, the default, for no bounds. "
+           "workspace_bounds: the WorkspaceBounds at the start, or None, the default, for no bounds. Bounds need "
+           "arm_model. arm_model: a shared_kinematics.ArmModel of this FR3 with its gripper (shared_kinematics."
+           "load_arm). Its base pose gives way to the base_pose of the bounds. None, the default, is the FR3 with its "
+           "self-collision model and no bounded part. "
            "clip_joint_targets_self_collision: stop each joint move of set_target_joints before two arm links come "
            "closer than 0.09 m, or closer than at the start of the move when that is less, as "
-           "inverse_kinematics_with_limits does; such a move ends BOUNDED. False, the default, passes each joint "
-           "target as it is")
+           "inverse_kinematics_with_limits does; such a move ends BOUNDED. False, the default, checks no self pair "
+           "on a joint target. With bounds, set_target_joints stops each joint move at the sides of the box too")
       .def("set_workspace_bounds", &positronic_franka::Robot::set_workspace_bounds, py::arg("bounds"),
            "Set the WorkspaceBounds, or None for no bounds, and start a new guard report in the state. Only at "
            "rest: raises RuntimeError while a move is in flight or the arm moves")

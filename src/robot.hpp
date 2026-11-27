@@ -29,6 +29,7 @@
 #include "impedance_law.hpp"
 #include "pose_ik.hpp"
 #include "trajectory_generator.hpp"
+#include "arm_guards.hpp"
 #include "workspace_bounds.hpp"
 
 namespace positronic_franka {
@@ -253,13 +254,16 @@ class Robot {
                  ControlMode control_mode = DEFAULT_CONTROL_MODE,
                  double control_link_timeout_s = DEFAULT_CONTROL_LINK_TIMEOUT_S,
                  std::optional<WorkspaceBounds> workspace_bounds = std::nullopt,
-                 bool clip_joint_targets_self_collision = false)
+                 bool clip_joint_targets_self_collision = false,
+                 std::optional<sk::ArmModel> arm_model = std::nullopt)
       : loop_watch_(control_link_timeout_(control_link_timeout_s)),
         control_link_lost_(control_link_lost_message_(control_link_timeout_s)),
         robot_(std::make_unique<franka::Robot>(ip, realtime_config)),
         relative_dynamics_factor_(std::clamp(relative_dynamics_factor, 0.0001, 1.0)),
         clip_joint_targets_self_collision_(clip_joint_targets_self_collision),
-        workspace_bounds_(std::move(workspace_bounds)) {
+        arm_model_(arm_model ? std::move(*arm_model) : fr3_arm_model()),
+        workspace_bounds_(std::move(workspace_bounds)),
+        guards_(make_arm_guards(arm_model_, workspace_bounds_, clip_joint_targets_self_collision_)) {
     model_ = std::make_unique<franka::Model>(robot_->loadModel());
     // Force-apply: the equality guard in set_control_mode must not skip pushing k_theta when the
     // requested mode happens to equal the default — the robot may persist stiffness from past sessions.
@@ -330,8 +334,10 @@ class Robot {
   void set_workspace_bounds(const std::optional<WorkspaceBounds>& bounds) {
     if (!at_rest_())
       throw std::runtime_error("workspace bounds change only at rest: a move is in flight or the arm moves");
+    ArmGuards guards = make_arm_guards(arm_model_, bounds, clip_joint_targets_self_collision_);
     std::lock_guard<std::mutex> lk(guard_mutex_);
     workspace_bounds_ = bounds;
+    guards_ = std::move(guards);
     guard_report_ = GuardReport{};
   }
 
@@ -368,7 +374,7 @@ class Robot {
       throw std::invalid_argument("deadline_s must be finite and strictly positive");
     }
     const GuardedTarget guarded = guard_target_(q_target);
-    const bool bounded = !guarded.bound.empty();
+    const bool bounded = guarded.q != q_target;
     std::uint64_t goal_id = 0;
     if (!control_running_.load()) {
       if (control_thread_.joinable()) {
@@ -538,7 +544,7 @@ class Robot {
       st.q = to_std_array7_(q);
       return ToolKinematics{flange_pose_matrix_(st), flange_jacobian_(st)};
     };
-    return solve_pose_ik(kinematics, flange_pose_wxyz, q0, max_step);
+    return solve_pose_ik(kinematics, flange_pose_wxyz, q0, max_step, *guards_snapshot_().ik);
   }
 
 private:
@@ -972,13 +978,22 @@ private:
     std::vector<std::string> bound;
   };
 
-  // The target that the guard lets through: with the self-collision clip, the joint move from the reference stops
-  // before a checked pair of links comes closer than its floor (stop_before_self_collision).
+  // The target that the guard lets through: the clip of the joint move from the reference at the sides of the box,
+  // and at the self-collision floor when the self-collision clip is on.
   GuardedTarget guard_target_(const Vector7d& q_target) {
-    if (!clip_joint_targets_self_collision_) return {q_target, {}};
-    const Vector7d q = stop_before_self_collision(reference_now_(), q_target);
+    const std::shared_ptr<const sk::Guard> guard = guards_snapshot_().target;
+    if (!guard) return {q_target, {}};
+    const sk::ClipResult clip = guard->clip(reference_now_(), q_target);
+    const Vector7d q = clip.q;
     if (q == q_target) return {q_target, {}};
-    return {q, {SELF_COLLISION_KEY}};
+    GuardedTarget out{q, clip.bound_sides};
+    if (clip.self_bound) out.bound.push_back(SELF_COLLISION_KEY);
+    return out;
+  }
+
+  ArmGuards guards_snapshot_() {
+    std::lock_guard<std::mutex> lk(guard_mutex_);
+    return guards_;
   }
 
   // The joints that the control loop moves from: the torque loop's reference, or the position loop's last command.
@@ -1071,12 +1086,15 @@ private:
   std::uint64_t target_goal_id_ = 0;
   // The deadline the pending target was commanded with, in seconds; taken by the loop with it.
   double target_deadline_s_ = 0.0;
-  // Clip each joint target at the self-collision floor of stop_before_self_collision.
+  // Clip each joint target at the self-collision floor as well as at the box.
   const bool clip_joint_targets_self_collision_;
-  // The guard: the workspace bounds, what it did, and the target it let through. Written only at rest or by the
-  // caller of set_target_joints.
+  // The arm that the guards check: the model given at the start, or fr3_arm_model().
+  const sk::ArmModel arm_model_;
+  // The guard: the workspace bounds, its core guards, what it did, and the target it let through. Written only at
+  // rest or by the caller of set_target_joints.
   std::mutex guard_mutex_;
   std::optional<WorkspaceBounds> workspace_bounds_;
+  ArmGuards guards_;
   GuardReport guard_report_;
   std::optional<Vector7d> committed_target_;
   // A gains-only SoftwareImpedance change, picked up by the running torque loop mid-session.
