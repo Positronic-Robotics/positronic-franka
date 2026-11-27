@@ -9,6 +9,7 @@
 #include <iostream>
 #include <limits>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -94,12 +95,17 @@ double off_the_line(const TrajectoryGenerator& traj, const Vector7d& from, const
   return worst;
 }
 
-// The first side that the whole rest of the plan passes, as the position loop checks it.
-std::optional<std::string> plan_side(const sk::Guard& box, const TrajectoryGenerator& traj) {
+// The first pass that the check of the whole rest of the plan finds, as the position loop checks it.
+std::optional<positronic_franka::PlanPass> first_pass(const sk::Guard& box, const TrajectoryGenerator& traj) {
   positronic_franka::PlanCheck plan_check;
-  std::optional<std::string> side = plan_check.start(box, traj);
-  while (!side && plan_check.pending(traj)) side = plan_check.step(box, traj);
-  return side;
+  std::optional<positronic_franka::PlanPass> pass = plan_check.start(box, traj);
+  while (!pass && plan_check.pending(traj)) pass = plan_check.step(box, traj);
+  return pass;
+}
+
+std::optional<std::string> plan_side(const sk::Guard& box, const TrajectoryGenerator& traj) {
+  const std::optional<positronic_franka::PlanPass> pass = first_pass(box, traj);
+  return pass ? std::optional<std::string>(pass->side) : std::nullopt;
 }
 
 // The least, over the plan points at `times`, of a part's distance past its floor.
@@ -234,9 +240,9 @@ void a_brake_reports_that_it_is_planned() {
   check(traj.elapsed() > 0.0, "the brake does not play");
 }
 
-// The check runs in the 1 kHz loop: PLAN_CHECK_SAMPLES points when a plan starts, then one point at each tick, ahead of
-// the arm. A new plan ends the check of the old one.
-void the_check_of_a_long_plan_reads_its_first_points_then_one_point_a_tick() {
+// The check runs in the 1 kHz loop: PLAN_CHECK_SAMPLES points when a plan starts, then at each tick one more point and
+// the rest of a brake from one point, ahead of the arm. A new plan ends the check of the old one.
+void the_check_of_a_long_plan_reads_its_first_points_then_a_point_and_a_brake_a_tick() {
   TrajectoryGenerator traj = from_rest(true);
   check(traj.set_target(leaning_forward()), "the plan is refused");
   const int points = static_cast<int>(std::ceil(traj.duration() / positronic_franka::PLAN_CHECK_SPACING_S));
@@ -254,9 +260,9 @@ void the_check_of_a_long_plan_reads_its_first_points_then_one_point_a_tick() {
     ++ticks;
   }
   const auto t2 = std::chrono::steady_clock::now();
-  check(ticks == points - positronic_franka::PLAN_CHECK_SAMPLES,
-        "the check reads " + std::to_string(ticks) + " points after the start, not " +
-            std::to_string(points - positronic_franka::PLAN_CHECK_SAMPLES));
+  check(ticks == points,
+        "the check reads the brakes from its points in " + std::to_string(ticks) + " ticks, not " +
+            std::to_string(points));
   std::cout << "  plan check: start " << std::chrono::duration<double, std::micro>(t1 - t0).count() / kRuns
             << " us, tick " << std::chrono::duration<double, std::micro>(t2 - t1).count() / ticks << " us\n";
   TrajectoryGenerator braked = from_rest(true);
@@ -311,6 +317,98 @@ void the_check_of_a_clear_move_reaches_its_target() {
         "with no check, a point is moved");
 }
 
+// A retarget during a move gets a plan whose points stay inside a wall, while a brake from a point 0.21 s on comes to
+// rest past it. The check finds that rest, and a brake from where the plan is now comes to rest inside.
+void a_brake_from_a_later_point_that_rests_past_a_side_is_found() {
+  const Eigen::Vector3d n = Eigen::Vector3d(-0.31894565166092725, -0.91076013913642195, 0.26227779213420205);
+  Vector7d first, second;
+  first << 0.62520429145453038, -0.49309262370878515, -0.70054643723407484, -0.2978195229997187, 0.63361187432811483,
+      -0.7112821776950311, 0.56662463703887034;
+  second << -0.011708323274295364, -0.97876905691563443, 0.16897163302506948, -2.50491550438946,
+      -0.062359280806135273, 1.7664248013955854, 0.85755696103433554;
+  TrajectoryGenerator traj(1.0);
+  traj.set_phase_synchronization(true);
+  traj.start_at_rest(START);
+  traj.step(0.0);
+  check(traj.set_target(start_q() + first), "the first plan is refused");
+  for (int i = 0; i < 62; ++i) traj.step(DT);
+  check(traj.set_target(second), "the retarget is refused");
+  std::vector<double> every_ms;
+  for (double t = 0.0; t <= traj.duration(); t += DT) every_ms.push_back(t);
+  const auto wall_at = [&](double d) { return box_guard(WorkspaceBounds({{"w", SideKind::kSurface, n, d, 0.0, -0.005}})); };
+  // Move the wall to 3 mm below the least distance of the plan to its floor.
+  const double d = 3.0 - least_past_floor(wall_at(3.0), traj, every_ms) + 0.003;
+  const sk::Guard box = wall_at(d);
+  const double tolerance = positronic_franka::fr3_guard_params().path_tolerance;
+  check(least_past_floor(box, traj, every_ms) >= -tolerance, "a point of the plan passes the wall");
+  const std::optional<positronic_franka::PlanPass> pass = first_pass(box, traj);
+  check(pass && pass->side == "w" && pass->at_brake_rest, "the rest of the brake past the wall is not found");
+  positronic_franka::PlanCheck plan_check;
+  check(!plan_check.start(box, traj), "the first points of the plan pass the wall");
+  check(plan_check.brake_now_rests_inside(box, traj), "a brake from where the plan is now comes to rest past the wall");
+  check(!plan_check.brake_now_rests_inside(wall_at(d - 0.03), traj),
+        "a brake from where the plan is now comes to rest inside a wall 3 cm nearer");
+}
+
+// Near a side the plan plays at a velocity scale that steps in halves, down to LEAST_VELOCITY_SCALE, so that no part
+// moves toward a side faster than twice the approach rate while it is more than 5 mm above its floor. The plan still
+// ends at its target.
+void near_a_side_the_velocity_scale_steps_in_halves_and_the_plan_ends_at_its_target() {
+  const sk::Guard box = box_guard(a_front_wall(0.42));
+  const Vector7d target = box.clip(start_q(), leaning_forward()).q;
+  TrajectoryGenerator traj = from_rest(true);
+  check(traj.set_target(target), "the plan is refused");
+  int steps = 0, fast = 0, ticks = 0;
+  while (traj.active() && ticks < 20000) {
+    const positronic_franka::VelocityStep step = positronic_franka::velocity_step_near(box, traj, DT);
+    if (step.scale != traj.velocity_scale()) {
+      ++steps;
+      const double halvings = -std::log2(step.scale);
+      check(halvings >= 0.0 && halvings <= 6.0 && halvings == std::round(halvings),
+            "the scale " + std::to_string(step.scale) + " is not 1 over a power of 2 up to 64");
+      check(step.scale > traj.velocity_scale() || (step.slowest && *step.slowest == "front"),
+            "a step down does not name the front wall");
+      check(traj.set_velocity_scale(step.scale), "the plan at the new scale is refused");
+    }
+    const Vector7d q = as_vector(traj.position());
+    double gap = std::numeric_limits<double>::infinity();
+    for (const auto& row : box.distances(q).planes) gap = std::min(gap, row.distance - row.floor);
+    if (gap > 0.005 && box.speed_scale(q, as_vector(traj.velocity()) * DT, DT).s < 0.5) ++fast;
+    traj.step(DT);
+    ++ticks;
+  }
+  check(steps > 0 && steps <= 8, "the scale changes " + std::to_string(steps) + " times");
+  check(fast == 0, std::to_string(fast) + " ticks move toward the wall faster than twice the approach rate");
+  check((as_vector(traj.position()) - target).cwiseAbs().maxCoeff() < 1e-9, "the plan does not end at its target");
+}
+
+void far_from_the_sides_the_velocity_scale_stays_1() {
+  const sk::Guard box = box_guard(a_front_wall(1.0));
+  TrajectoryGenerator traj = from_rest(true);
+  check(traj.set_target(leaning_forward()), "the plan is refused");
+  while (traj.active()) {
+    const positronic_franka::VelocityStep step = positronic_franka::velocity_step_near(box, traj, DT);
+    check(step.scale == 1.0 && !step.slowest, "the scale steps far from the wall");
+    traj.step(DT);
+  }
+}
+
+// A trajectory whose planner refuses each brake.
+struct RefusesBrakes {
+  bool brake_to_rest() { return false; }
+};
+
+void a_refused_brake_before_a_side_raises() {
+  RefusesBrakes traj;
+  try {
+    positronic_franka::brake_before(traj, "front");
+  } catch (const std::runtime_error& e) {
+    check(std::string(e.what()).find("front") != std::string::npos, "the error does not name the side");
+    return;
+  }
+  check(false, "a refused brake does not raise");
+}
+
 }  // namespace
 
 int main() {
@@ -329,8 +427,14 @@ int main() {
       {"a_retarget_plan_that_brings_two_links_too_close_is_found",
        a_retarget_plan_that_brings_two_links_too_close_is_found},
       {"a_brake_reports_that_it_is_planned", a_brake_reports_that_it_is_planned},
-      {"the_check_of_a_long_plan_reads_its_first_points_then_one_point_a_tick",
-       the_check_of_a_long_plan_reads_its_first_points_then_one_point_a_tick},
+      {"the_check_of_a_long_plan_reads_its_first_points_then_a_point_and_a_brake_a_tick",
+       the_check_of_a_long_plan_reads_its_first_points_then_a_point_and_a_brake_a_tick},
+      {"a_brake_from_a_later_point_that_rests_past_a_side_is_found",
+       a_brake_from_a_later_point_that_rests_past_a_side_is_found},
+      {"near_a_side_the_velocity_scale_steps_in_halves_and_the_plan_ends_at_its_target",
+       near_a_side_the_velocity_scale_steps_in_halves_and_the_plan_ends_at_its_target},
+      {"far_from_the_sides_the_velocity_scale_stays_1", far_from_the_sides_the_velocity_scale_stays_1},
+      {"a_refused_brake_before_a_side_raises", a_refused_brake_before_a_side_raises},
       {"the_check_of_a_move_into_the_arm_ends_it_before_the_clearance",
        the_check_of_a_move_into_the_arm_ends_it_before_the_clearance},
       {"the_check_of_a_clear_move_reaches_its_target", the_check_of_a_clear_move_reaches_its_target},

@@ -242,8 +242,9 @@ PYBIND11_MODULE(_franka, m) {
       .def_property_readonly(
           "slowed_ticks",
           [](const positronic_franka::State& s) { return s.guard.slowed_ticks; },
-          "Per side: how many ticks of the torque loop the speed scale of the box slowed the reference most at "
-          "that side, since the last set_workspace_bounds or the start of the Robot")
+          "Per side: how many control-loop ticks that side slowed, since the last set_workspace_bounds or the "
+          "start of the Robot. The torque loop counts the side that slowed the reference most; the position loop "
+          "counts the side of its last step down while its velocity scale is below 1")
       .def_property_readonly(
           "deepest",
           [](const positronic_franka::State& s) { return s.guard.deepest; },

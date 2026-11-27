@@ -4,6 +4,7 @@
 //       tests/test_robot_control_link.cpp <ruckig objects> -o test_robot_control_link
 //   ./test_robot_control_link
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
@@ -192,9 +193,10 @@ void a_repeated_target_after_arrival_is_reached_again() {
 }
 
 Robot make_bounded_robot(const std::optional<WorkspaceBounds>& bounds,
-                         const positronic_franka::ControlMode& mode = InternalImpedance{}, bool clip_self = false) {
+                         const positronic_franka::ControlMode& mode = InternalImpedance{}, bool clip_self = false,
+                         double timeout_s = TIMEOUT_S) {
   link().reset();
-  return Robot("fake", franka::RealtimeConfig::kIgnore, 1.0, mode, TIMEOUT_S, bounds, clip_self, fr3_with_gripper());
+  return Robot("fake", franka::RealtimeConfig::kIgnore, 1.0, mode, timeout_s, bounds, clip_self, fr3_with_gripper());
 }
 
 WorkspaceBounds a_desk(double offset = 0.02) {
@@ -427,7 +429,8 @@ void a_joint_target_past_a_side_stops_at_the_side_and_the_move_ends_bounded() {
   Robot robot = make_bounded_robot(a_front_wall());
   const Vector7d start = current_q(robot), target = leaning_forward(start);
   robot.set_target_joints(target);
-  check(wait_until([&] { return robot.goal().status != GoalStatus::IN_FLIGHT; }), "the move ends");
+  // Near the wall the plan slows in steps, so give it more time.
+  check(wait_until([&] { return robot.goal().status != GoalStatus::IN_FLIGHT; }, milliseconds(60000)), "the move ends");
   const auto goal = robot.goal();
   check(goal.status == GoalStatus::BOUNDED, "the move to a target past the wall does not end BOUNDED: " + goal.reason);
   const auto st = robot.state();
@@ -438,8 +441,107 @@ void a_joint_target_past_a_side_stops_at_the_side_and_the_move_ends_bounded() {
         "the committed move takes a part past its floor at the wall");
   check(least_to_floor_on_the_move(a_front_wall(), start, target) < -0.01, "the target is not past the wall");
   check(st.guard.bindings.size() == 1 && st.guard.bindings.at("front") == 1, "the binding is not counted at the wall");
+  check(st.guard.slowed_ticks.count("front") && st.guard.slowed_ticks.at("front") > 0, "the plan does not slow");
   check(arm_comes_to(robot, committed), "the arm does not come to the committed target");
   robot.stop();
+}
+
+// A move toward `first`, then after `ticks` a move toward `second`, on the hand-ticked fake, with `bounds` and the
+// self-collision clip when `clip_self`.
+struct Retarget {
+  std::optional<WorkspaceBounds> bounds;
+  bool clip_self = false;
+  Vector7d first, second;
+  int ticks = 0;
+};
+
+// What the position loop did on a retarget.
+struct RetargetRun {
+  positronic_franka::Goal goal;
+  positronic_franka::State state;
+  // The committed target of the second move, as set_target_joints gave it.
+  Vector7d second_committed;
+  // The least, over the ticks, of a check of the guard above its floor: its floor, or its value at the start when
+  // that is less.
+  double least_to_floor = 0.0;
+};
+
+RetargetRun run_retarget(const Retarget& r) {
+  Robot robot = make_bounded_robot(r.bounds, InternalImpedance{}, r.clip_self, 10.0);
+  const Vector7d start = current_q(robot);
+  robot.set_target_joints(start);
+  check(wait_until([&] { return robot.goal().status == GoalStatus::REACHED; }), "the hold at the start does not end");
+  const std::shared_ptr<const shared_kinematics::Guard> guard =
+      positronic_franka::make_arm_guards(fr3_with_gripper(), r.bounds, r.clip_self).target;
+  const shared_kinematics::Distances at_start = guard->distances(start);
+  const double clearance = guard->model().self.clearance;
+  RetargetRun run;
+  run.least_to_floor = std::numeric_limits<double>::infinity();
+  const auto look = [&] {
+    const shared_kinematics::Distances rows = guard->distances(Eigen::Map<const Vector7d>(link().state().q.data()));
+    for (std::size_t k = 0; k < rows.planes.size(); ++k)
+      run.least_to_floor = std::min(
+          run.least_to_floor, rows.planes[k].distance - std::min(rows.planes[k].floor, at_start.planes[k].distance));
+    for (std::size_t k = 0; k < rows.pairs.size(); ++k)
+      run.least_to_floor = std::min(run.least_to_floor,
+                                    rows.pairs[k].clearance - std::min(clearance, at_start.pairs[k].clearance));
+  };
+  link().tick_by_hand();
+  robot.set_target_joints(r.first);
+  for (int i = 0; i < r.ticks; ++i, look()) link().tick(1);
+  robot.set_target_joints(r.second);
+  run.second_committed = *robot.state().committed_target;
+  for (int i = 0; i < 20000 && robot.goal().status == GoalStatus::IN_FLIGHT; ++i, look()) link().tick(1);
+  link().tick(200);
+  look();
+  run.goal = robot.goal();
+  run.state = robot.state();
+  link().tick_freely();
+  robot.stop();
+  return run;
+}
+
+// A retarget during a fast move gets a plan that leaves the clipped joint line and brings two links closer than the
+// clearance. The position loop brakes, the move ends BOUNDED where the brake stops, and the links keep the clearance.
+void a_retarget_whose_plan_brings_two_links_too_close_brakes_and_ends_bounded() {
+  Vector7d first, second;
+  first << 0.085685566353384424, -0.38185236011868895, -0.56080959107845052, -3.0, -0.014548021326547866,
+      1.4355515400008243, 0.86063895399797863;
+  second << 0.82167226687014905, -0.62046024570859526, -0.46798736401990615, -1.9897270822297473, 0.45099503027404242,
+      0.63539928011235092, 1.334850696122557;
+  const RetargetRun run = run_retarget({std::nullopt, true, first, second, 258});
+  check(run.goal.status == GoalStatus::BOUNDED, "the retarget does not end BOUNDED: " + run.goal.reason);
+  check(run.state.guard.bindings.count(positronic_franka::SELF_COLLISION_KEY) &&
+            run.state.guard.bindings.at(positronic_franka::SELF_COLLISION_KEY) >= 1,
+        "the brake is not counted at self-collision");
+  check(*run.state.committed_target != run.second_committed, "the committed target is not where the brake stops");
+  check((run.state.q - *run.state.committed_target).cwiseAbs().maxCoeff() < 1e-9,
+        "the arm does not rest at the committed target");
+  check(run.least_to_floor >= -positronic_franka::IK_SELF_COLLISION_PATH_TOLERANCE,
+        "two links come closer than the clearance by " + std::to_string(-run.least_to_floor) + " m");
+}
+
+// A retarget during a fast move toward a side gets a plan that leaves the clipped joint line. Near the side the plan
+// slows in steps, the arm stays inside the floors, and the move ends at its committed target.
+void a_retarget_toward_a_side_slows_and_stays_inside() {
+  Vector7d first, second;
+  first << -0.11694428198491763, -0.9154997834015185, -0.22095288070423333, -1.6004954784656524, 0.45113354031275749,
+      0.85759909738339068, 0.20763138048818564;
+  second << 0.20149837562135275, -0.85729407229344545, -0.27732921278850781, -1.966872101455079, 0.093063154299875619,
+      1.7234590173810194, 0.63548757751881602;
+  const WorkspaceBounds side({{"cut", SideKind::kSurface,
+                               Eigen::Vector3d(0.68650282745621583, -0.66391871528757074, 0.29652286148882828),
+                               -0.2382481847426457, 0.0, -0.005}});
+  const RetargetRun run = run_retarget({side, false, first, second, 122});
+  check(run.goal.status != GoalStatus::IN_FLIGHT && run.goal.status != GoalStatus::ABORTED,
+        "the retarget does not end: " + run.goal.reason);
+  check(run.state.guard.slowed_ticks.count("cut") && run.state.guard.slowed_ticks.at("cut") > 0,
+        "the plan does not slow at the side");
+  // Ruckig ends each plan at its target within its own precision.
+  check((run.state.q - *run.state.committed_target).cwiseAbs().maxCoeff() < 1e-6,
+        "the arm does not rest at the committed target");
+  check(run.least_to_floor >= -positronic_franka::IK_SELF_COLLISION_PATH_TOLERANCE,
+        "a part passes its floor by " + std::to_string(-run.least_to_floor) + " m");
 }
 
 // With bounds but no self-collision clip, a joint target is checked against the box alone.
@@ -706,6 +808,9 @@ int main() {
        under_software_impedance_the_reference_stops_at_the_committed_target},
       {"a_joint_target_past_a_side_stops_at_the_side_and_the_move_ends_bounded",
        a_joint_target_past_a_side_stops_at_the_side_and_the_move_ends_bounded},
+      {"a_retarget_whose_plan_brings_two_links_too_close_brakes_and_ends_bounded",
+       a_retarget_whose_plan_brings_two_links_too_close_brakes_and_ends_bounded},
+      {"a_retarget_toward_a_side_slows_and_stays_inside", a_retarget_toward_a_side_slows_and_stays_inside},
       {"with_bounds_and_no_clip_a_joint_target_is_not_checked_for_self_collision",
        with_bounds_and_no_clip_a_joint_target_is_not_checked_for_self_collision},
       {"with_no_bounds_the_ik_is_the_ik_of_the_fr3_self_pairs", with_no_bounds_the_ik_is_the_ik_of_the_fr3_self_pairs},

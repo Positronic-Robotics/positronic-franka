@@ -4,7 +4,10 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <cmath>
+#include <limits>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -21,31 +24,67 @@ namespace positronic_franka {
 constexpr double PLAN_CHECK_SPACING_S = 0.01;
 constexpr int PLAN_CHECK_SAMPLES = 16;
 
-// The check of the playing plan against the sides and the self pairs of a guard. The floor of each check is its floor,
-// or its value where the check started when that is less, less the path tolerance. A self pair reports
-// SELF_COLLISION_KEY.
+// Where the plan check finds a bounded part past its floor at a side, or two links closer than the clearance.
+struct PlanPass {
+  // The side, or SELF_COLLISION_KEY.
+  std::string side;
+  // Whether it is where a brake from a point of the plan comes to rest, not at a point of the plan.
+  bool at_brake_rest = false;
+};
+
+// The check of the playing plan against the sides and the self pairs of a guard: its points, and where a brake from
+// each of them comes to rest. The floor of each check is its floor, or its value where the check started when that is
+// less, less the path tolerance.
 class PlanCheck {
  public:
-  // Starts the check of the plan that `traj` plays now, from where it is, and checks its first points. Returns the
-  // first side that a bounded part passes at them.
-  std::optional<std::string> start(const shared_kinematics::Guard& guard, const TrajectoryGenerator& traj) {
+  // Starts the check of the plan that `traj` plays now, from where it is, and checks its first points.
+  std::optional<PlanPass> start(const shared_kinematics::Guard& guard, const TrajectoryGenerator& traj) {
     plan_ = traj.plan_number();
-    next_ = traj.elapsed();
-    start_ = rows_at_(guard, traj, next_);
-    std::optional<std::string> side;
-    for (int i = 0; i < PLAN_CHECK_SAMPLES && !side && pending(traj); ++i) side = step(guard, traj);
-    return side;
+    next_point_ = traj.elapsed();
+    next_brake_ = traj.elapsed();
+    start_ = distances_at_(guard, traj.position_at(next_point_));
+    std::optional<PlanPass> pass;
+    for (int i = 0; i < PLAN_CHECK_SAMPLES && !pass && next_point_ < traj.duration(); ++i)
+      pass = check_next_point_(guard, traj);
+    return pass;
   }
 
-  // Whether points of the plan that the check started on are left to check.
+  // Whether points of the plan that the check started on, or brakes from them, are left to check.
   bool pending(const TrajectoryGenerator& traj) const {
-    return plan_ != 0 && traj.plan_number() == plan_ && next_ < traj.duration();
+    return plan_ != 0 && traj.plan_number() == plan_ &&
+           (next_point_ < traj.duration() || next_brake_ < traj.duration());
   }
 
-  // Checks the next point of the plan. Returns the side that a bounded part passes at it.
-  std::optional<std::string> step(const shared_kinematics::Guard& guard, const TrajectoryGenerator& traj) {
-    next_ = std::min(next_ + PLAN_CHECK_SPACING_S, traj.duration());
-    const shared_kinematics::Distances rows = rows_at_(guard, traj, next_);
+  // Checks the next point of the plan, and the rest of a brake from the next point whose brake is not checked. A brake
+  // that the planner refuses passes the nearest floor.
+  std::optional<PlanPass> step(const shared_kinematics::Guard& guard, const TrajectoryGenerator& traj) {
+    if (next_point_ < traj.duration())
+      if (std::optional<PlanPass> pass = check_next_point_(guard, traj)) return pass;
+    if (next_brake_ >= traj.duration()) return std::nullopt;
+    next_brake_ = std::min(next_brake_ + PLAN_CHECK_SPACING_S, traj.duration());
+    const std::optional<std::array<double, 7>> rest = traj.rest_after_brake_at(next_brake_);
+    if (!rest) return PlanPass{nearest_floor_(guard, distances_at_(guard, traj.position_at(next_brake_))), false};
+    if (std::optional<std::string> side = floor_passed_(guard, distances_at_(guard, *rest)))
+      return PlanPass{*side, true};
+    return std::nullopt;
+  }
+
+  // Whether a brake from where the plan is now comes to rest above each floor.
+  bool brake_now_rests_inside(const shared_kinematics::Guard& guard, const TrajectoryGenerator& traj) const {
+    const std::optional<std::array<double, 7>> rest = traj.rest_after_brake_at(traj.elapsed());
+    return rest && !floor_passed_(guard, distances_at_(guard, *rest));
+  }
+
+ private:
+  std::optional<PlanPass> check_next_point_(const shared_kinematics::Guard& guard, const TrajectoryGenerator& traj) {
+    next_point_ = std::min(next_point_ + PLAN_CHECK_SPACING_S, traj.duration());
+    if (std::optional<std::string> side = floor_passed_(guard, distances_at_(guard, traj.position_at(next_point_))))
+      return PlanPass{*side, false};
+    return std::nullopt;
+  }
+
+  std::optional<std::string> floor_passed_(const shared_kinematics::Guard& guard,
+                                           const shared_kinematics::Distances& rows) const {
     const double tolerance = guard.params().path_tolerance;
     for (std::size_t k = 0; k < rows.planes.size(); ++k)
       if (rows.planes[k].distance < std::min(rows.planes[k].floor, start_.planes[k].distance) - tolerance)
@@ -53,19 +92,34 @@ class PlanCheck {
     const double clearance = guard.model().self.clearance;
     for (std::size_t k = 0; k < rows.pairs.size(); ++k)
       if (rows.pairs[k].clearance < std::min(clearance, start_.pairs[k].clearance) - tolerance)
-        return std::string(SELF_COLLISION_KEY);
+        return SELF_COLLISION_KEY;
     return std::nullopt;
   }
 
- private:
-  static shared_kinematics::Distances rows_at_(const shared_kinematics::Guard& guard, const TrajectoryGenerator& traj,
-                                               double t) {
-    const std::array<double, 7> q = traj.position_at(t);
+  static std::string nearest_floor_(const shared_kinematics::Guard& guard, const shared_kinematics::Distances& rows) {
+    std::string nearest = SELF_COLLISION_KEY;
+    double least = std::numeric_limits<double>::infinity();
+    for (const shared_kinematics::PlaneDistance& row : rows.planes)
+      if (row.distance - row.floor < least) {
+        least = row.distance - row.floor;
+        nearest = row.side;
+      }
+    for (const shared_kinematics::PairDistance& row : rows.pairs)
+      if (row.clearance - guard.model().self.clearance < least) {
+        least = row.clearance - guard.model().self.clearance;
+        nearest = SELF_COLLISION_KEY;
+      }
+    return nearest;
+  }
+
+  static shared_kinematics::Distances distances_at_(const shared_kinematics::Guard& guard,
+                                                    const std::array<double, 7>& q) {
     return guard.distances(Eigen::Map<const Vector7d>(q.data()));
   }
 
   std::uint64_t plan_ = 0;
-  double next_ = 0.0;
+  double next_point_ = 0.0;
+  double next_brake_ = 0.0;
   shared_kinematics::Distances start_;
 };
 
@@ -129,5 +183,47 @@ class LineCheck {
   int end_ = 0;
   std::vector<shared_kinematics::PairDistance> start_;
 };
+
+// Near a side the position loop plays its plan at a velocity scale of 1, 1/2, 1/4 and so on, down to this one.
+constexpr double LEAST_VELOCITY_SCALE = 1.0 / 64.0;
+
+// A velocity scale for the playing plan, and the side that set it when it is lower than the scale in force.
+struct VelocityStep {
+  double scale = 1.0;
+  std::optional<std::string> slowest;
+};
+
+// The velocity scale for the next tick of `traj` near the sides of `box`, in steps of a factor 2 so that the plan
+// changes only on a step. It steps down when a bounded part moves toward a side faster than the approach gain times
+// its distance to the floor, and steps up when four times the scale keeps every part within that speed.
+inline VelocityStep velocity_step_near(const shared_kinematics::Guard& box, const TrajectoryGenerator& traj,
+                                       double dt) {
+  const double scale = traj.velocity_scale();
+  if (!traj.active()) return {scale, std::nullopt};
+  const Vector7d q = Eigen::Map<const Vector7d>(traj.position().data());
+  const Vector7d v = Eigen::Map<const Vector7d>(traj.velocity().data());
+  // The share of its velocity limit at which the plan moves now.
+  double share = 0.0;
+  for (int j = 0; j < 7; ++j) share = std::max(share, std::abs(v[j]) / traj.velocity_limit()[j]);
+  if (!(share > 0.0)) return {scale, std::nullopt};
+  const shared_kinematics::ScaleResult now = box.speed_scale(q, v * dt, dt);
+  if (now.s < 1.0) {
+    double step = scale;
+    while (step > LEAST_VELOCITY_SCALE && step > share * now.s) step /= 2.0;
+    return step < scale ? VelocityStep{step, now.slowest} : VelocityStep{scale, std::nullopt};
+  }
+  if (scale < 1.0) {
+    const double up = std::min(1.0, 2.0 * scale);
+    if (!(box.speed_scale(q, v * (2.0 * up / share) * dt, dt).s < 1.0)) return {up, std::nullopt};
+  }
+  return {scale, std::nullopt};
+}
+
+// Brakes `traj` before `side`. A brake that the planner refuses leaves the arm on a plan past the side, so it raises
+// std::runtime_error, which stops the control loop.
+template <typename Trajectory>
+void brake_before(Trajectory& traj, const std::string& side) {
+  if (!traj.brake_to_rest()) throw std::runtime_error("the trajectory planner refused the brake before side " + side);
+}
 
 }  // namespace positronic_franka
