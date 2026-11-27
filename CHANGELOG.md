@@ -1,5 +1,18 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+- `WorkspaceBounds` and `Side` in `workspace_bounds.hpp`: the sides of a workspace box in the rig frame, each a plane with a kind (`SURFACE` or `VIRTUAL`) and an allowance for the finger pads and for the rigid parts, and the pose of the arm base in the rig frame. A bad box raises `ValueError`. `hash` is 16 hex digits of a 64-bit FNV-1a over every name, kind and number, in the order of the side names.
+- `Robot(workspace_bounds=...)` and `Robot.set_workspace_bounds(bounds | None)`. A change is taken only at rest: with a move in flight or a moving arm, it raises `RuntimeError`. The bounds do not limit a move yet.
+- `State.bounds_enabled`, `State.bounds_hash`, `State.bindings`, `State.deepest` and `State.committed_target`. `bindings` counts per side the targets that the guard shortened, and `deepest` keeps per side the deepest pass of a bounded point past its floor. Both count from the last `set_workspace_bounds`, or from the start of the Robot. `committed_target` is the target of the last joint move after the guard.
+- `Robot(clip_joint_targets_self_collision=True)` stops each joint move of `set_target_joints` before two checked arm links come closer than `IK_SELF_COLLISION_CLEARANCE`, or closer than at the reference when that is less, as `inverse_kinematics_with_limits` does. The move starts at the reference that the control loop moves from. `False`, the default, passes each joint target as it is.
+- `GoalStatus.BOUNDED`: the arm settled at a committed target that the guard shortened. Such a move ends `BOUNDED` where it would end `REACHED`.
+- `franka::fake::Link::use_kinematics(Kinematics::kFr3)` gives the fake libfranka the FR3 flange pose and its zero Jacobian. `reset()` restores the constant Jacobian.
+
+### Unchanged
+- With no `workspace_bounds` and no `clip_joint_targets_self_collision`, the defaults, every move goes to its target as before, and `tests/test_robot_control_link.cpp` checks it.
+
 ## [0.12.3] - 2026-11-20
 
 ### Added
