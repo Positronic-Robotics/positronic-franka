@@ -1,5 +1,24 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+- `WorkspaceBounds` and `Side` in `workspace_bounds.hpp`: the sides of a workspace box in the rig frame, each a plane where a point `x` is inside when `n . x + d >= 0`, with a kind (`SURFACE` or `VIRTUAL`) and an allowance for the finger pads and for the rigid parts, and the pose of the arm base in the rig frame. A bad box raises `ValueError`. `hash` is 16 hex digits of a 64-bit FNV-1a over every name, kind and number, in the order of the side names.
+- `Robot(workspace_bounds=...)` and `Robot.set_workspace_bounds(bounds | None)`. A change is taken only at rest: with a move in flight or a moving arm, also an arm that a hand moves with no control loop, it raises `RuntimeError`. Bounds need `Robot(arm_model=...)`, a `shared_kinematics.ArmModel` of the FR3 with its gripper whose bounded parts the sides check. Without such a model, bounds raise `ValueError`.
+- With bounds, `set_target_joints` stops each joint move where a bounded part reaches its floor at a side: the plane less the allowance of the part, or the distance at the start of the move when that is less. `inverse_kinematics_with_limits` pushes the bounded parts away from a side within 1 cm of their floor and stops its answer at the floors. The torque loop slows the reference so that a bounded part moves toward a side at most 2.0/s times its distance to the floor, and takes the committed target when the reference is within 1e-4 rad of it. The position loop checks each plan at points 10 ms apart, 16 of them when the plan starts and one more at each tick, and brakes when the plan takes a part past its floor; such a move ends `BOUNDED`. A brake that the planner refuses stops the control loop with an error.
+- `State.bounds_enabled`, `State.bounds_hash`, `State.bindings`, `State.slowed_ticks`, `State.deepest` and `State.committed_target`. `bindings` counts per side the targets that the guard shortened or braked, `slowed_ticks` counts per side the torque-loop ticks that the side slowed, and `deepest` keeps per side the deepest pass of a bounded point past its floor. Both count from the last `set_workspace_bounds`, or from the start of the Robot. `committed_target` is the target of the last joint move after the guard, or the point where a brake before a side stops it.
+- `Robot(clip_joint_targets_self_collision=True)` stops each joint move of `set_target_joints` before two checked arm links come closer than `IK_SELF_COLLISION_CLEARANCE`, or closer than at the reference when that is less, as `inverse_kinematics_with_limits` does. The move starts at the reference that the control loop moves from. When the torque-loop reference moves on while `set_target_joints` checks the move, the torque loop checks the self pairs of the move again from where its reference is, and ends it before the floor; such a move ends `BOUNDED`. `False`, the default, passes each joint target as it is.
+- With bounds or the self-collision clip, the position loop plans a move from rest on the straight joint line that the guard checked (Ruckig phase synchronization). Otherwise it keeps time synchronization. A plan from a moving arm can leave that line, so the position loop checks each plan against the sides and the self pairs that clip its targets, and brakes before a floor.
+- `GoalStatus.BOUNDED`: the arm settled at a committed target that the guard shortened. Such a move ends `BOUNDED` where it would end `REACHED`.
+- `franka::fake::Link::use_kinematics(Kinematics::kFr3)` gives the fake libfranka the FR3 flange pose and its zero Jacobian. `reset()` restores the constant Jacobian.
+
+### Changed
+- The build fetches the [shared kinematics core](https://github.com/Positronic-Robotics/shared-kinematics) at the commit in `shared_kinematics.ref`. `FETCHCONTENT_SOURCE_DIR_SHARED_KINEMATICS` builds against a local checkout.
+- `inverse_kinematics_with_limits` and `stop_before_self_collision` run on the core. With no bounds, their answers are those of the previous release within 1e-7 rad: the core takes the link frames from the URDF joint origins.
+
+### Unchanged
+- With no `workspace_bounds` and no `clip_joint_targets_self_collision`, the defaults, every move goes to its target as before, and `tests/test_robot_control_link.cpp` checks it.
+
 ## [0.12.3] - 2026-11-20
 
 ### Added

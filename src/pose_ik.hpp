@@ -4,12 +4,14 @@
 #include <array>
 #include <cmath>
 #include <stdexcept>
+#include <vector>
 
 #include <Eigen/Core>
 #include <Eigen/Geometry>
 #include <Eigen/Eigenvalues>
 #include <Eigen/SVD>
 
+#include "fr3_arm.hpp"
 #include "impedance_law.hpp"
 #include "self_collision.hpp"
 
@@ -37,6 +39,8 @@ constexpr double IK_POSTURE_PULL_PER_COMMAND = 0.02;
 // Below this clearance between two checked links, the IK pushes them apart. It is above
 // IK_SELF_COLLISION_CLEARANCE, so the soft push holds the answer clear of the hard floor.
 constexpr double IK_SELF_COLLISION_PUSH_CLEARANCE = 0.10;
+// Within this distance above its floor at a side, the IK pushes a bounded part away from the side.
+constexpr double IK_PLANE_PUSH_BAND = 0.01;
 
 // The damped IK stops when the norm of the pose error is below this value, or after DAMPED_IK_MAX_ITERATIONS steps.
 constexpr double DAMPED_IK_TOLERANCE = 1e-4;
@@ -230,50 +234,19 @@ Vector7d solve_damped_pose_ik(const Kinematics& kinematics, const Eigen::Ref<con
 
 // The point of the move from `from` to `to` farthest along it whose path keeps each checked pair at its floor:
 // IK_SELF_COLLISION_CLEARANCE, or its own clearance at `from` when that is less.
-// Between two checked points a pair's clearance falls at most IK_SELF_COLLISION_PATH_TOLERANCE below its floor:
-// the points are close enough for the rate bound of each joint (fr3_clearance_rate_bounds).
+// Between two checked points a pair's clearance falls at most IK_SELF_COLLISION_PATH_TOLERANCE below its floor.
+// The walk is the clip of the shared core on the FR3 self pairs (fr3_self_guard).
 inline Vector7d stop_before_self_collision(const Vector7d& from, const Vector7d& to) {
-  constexpr int kLeastSamples = 16;
-  constexpr int kBisections = 8;
-  static const Vector7d rate_bounds = fr3_clearance_rate_bounds();
-  // The most a pair's clearance changes over the whole move. Between two points 1 / samples apart that both keep
-  // its floor, the clearance falls at most change_over_move / (2 * samples) below that floor.
-  const double change_over_move = rate_bounds.dot((to - from).cwiseAbs());
-  const int samples =
-      std::max(kLeastSamples, static_cast<int>(std::ceil(change_over_move / (2 * IK_SELF_COLLISION_PATH_TOLERANCE))));
-  std::array<double, FR3_SELF_COLLISION_PAIRS.size()> floors;
-  const auto at_from = self_collision_clearances(from);
-  for (std::size_t k = 0; k < floors.size(); ++k)
-    floors[k] = std::min(IK_SELF_COLLISION_CLEARANCE, at_from[k].clearance);
-  const auto clear = [&](double s) {
-    const auto pairs = self_collision_clearances(from + s * (to - from));
-    for (std::size_t k = 0; k < pairs.size(); ++k)
-      if (pairs[k].clearance < floors[k]) return false;
-    return true;
-  };
-  double safe = 0.0;
-  for (int i = 1; i <= samples; ++i) {
-    const double s = static_cast<double>(i) / samples;
-    if (clear(s)) {
-      safe = s;
-      continue;
-    }
-    double blocked = s;
-    for (int b = 0; b < kBisections; ++b) {
-      const double mid = 0.5 * (safe + blocked);
-      (clear(mid) ? safe : blocked) = mid;
-    }
-    return from + safe * (to - from);
-  }
-  return to;
+  return fr3_self_guard().clip(from, to).q;
 }
 
 // Joints that put the tool as close as the bounds allow to `target_pose_wxyz` (tx, ty, tz, qw, qx, qy, qz).
 // Each joint stays within the FR3 limits and within `max_step` of q0; near a singularity the move q - q0 is damped.
-// The move from q0, or from its nearest point within the FR3 limits, keeps the floor of stop_before_self_collision.
+// The solve pushes the self pairs and the bounded parts of `guard` away from their floors. Then the move from q0, or
+// from its nearest point within the FR3 limits, stops at the clip of `guard`.
 template <typename Kinematics>
 Vector7d solve_pose_ik(const Kinematics& kinematics, const Eigen::Ref<const Vector7d>& target_pose_wxyz,
-                       const Eigen::Ref<const Vector7d>& q0, double max_step) {
+                       const Eigen::Ref<const Vector7d>& q0, double max_step, const sk::Guard& guard) {
   constexpr int kMaxIterations = 60;
   constexpr double kStepTolerance = 1e-9;  // rad
   // Keeps each Gauss-Newton step finite at an exact singularity; it vanishes at the fixed point.
@@ -313,25 +286,38 @@ Vector7d solve_pose_ik(const Kinematics& kinematics, const Eigen::Ref<const Vect
     throw std::invalid_argument("no joints are within max_step of q0 and inside the FR3 limits");
   const Vector7d start = q0.cwiseMax(lower).cwiseMin(upper);
 
-  // One iterate: its kinematics, its pair clearances, and the cost that the Gauss-Newton step models.
+  // One push term: how far a check is inside its push band (negative) and its gradient in the joints.
+  struct Push {
+    double inside;
+    Vector7d gradient;
+  };
+  // One iterate: its kinematics, its push terms, and the cost that the Gauss-Newton step models.
   struct Iterate {
     Vector7d q;
     ToolKinematics k;
     Vector6d e;
-    std::array<SelfCollisionClearance, FR3_SELF_COLLISION_PAIRS.size()> pairs;
+    std::vector<Push> pushes;
     double posture_residual;
     double cost;
   };
+  const auto pushes_at = [&](const Vector7d& q) {
+    const sk::Distances rows = guard.distances(q);
+    std::vector<Push> pushes;
+    for (const sk::PairDistance& pair : rows.pairs)
+      if (pair.clearance < IK_SELF_COLLISION_PUSH_CLEARANCE)
+        pushes.push_back({pair.clearance - IK_SELF_COLLISION_PUSH_CLEARANCE, pair.gradient});
+    for (const sk::PlaneDistance& plane : rows.planes)
+      if (plane.distance < plane.floor + IK_PLANE_PUSH_BAND)
+        pushes.push_back({plane.distance - plane.floor - IK_PLANE_PUSH_BAND, plane.gradient});
+    return pushes;
+  };
   const auto iterate_at = [&](const Vector7d& q) {
-    Iterate x{q, kinematics(q), Vector6d::Zero(), self_collision_clearances(q), 0.0, 0.0};
+    Iterate x{q, kinematics(q), Vector6d::Zero(), pushes_at(q), 0.0, 0.0};
     x.e = pose_error(x.k.pose, t_tgt, R_tgt);
     x.posture_residual = null_direction.dot(q - q0) - posture_target;
     x.cost = 0.5 * (x.e.squaredNorm() + mu_sq * (q - q0).squaredNorm() +
                     w_sq * x.posture_residual * x.posture_residual);
-    for (const SelfCollisionClearance& c : x.pairs) {
-      const double inside = std::min(0.0, c.clearance - IK_SELF_COLLISION_PUSH_CLEARANCE);
-      x.cost += 0.5 * kCollisionWeightSq * inside * inside;
-    }
+    for (const Push& push : x.pushes) x.cost += 0.5 * kCollisionWeightSq * push.inside * push.inside;
     return x;
   };
   // A backtracking step lowers the cost by at least kSufficientDecrease of the slope's prediction, in at most
@@ -350,10 +336,9 @@ Vector7d solve_pose_ik(const Kinematics& kinematics, const Eigen::Ref<const Vect
       Matrix7d H = J.transpose() * J + (mu_sq + kLevenberg) * Matrix7d::Identity() +
                    w_sq * null_direction * null_direction.transpose();
       Vector7d g = J.transpose() * at.e + mu_sq * (at.q - q0) + w_sq * at.posture_residual * null_direction;
-      for (const SelfCollisionClearance& c : at.pairs) {
-        if (c.clearance >= IK_SELF_COLLISION_PUSH_CLEARANCE) continue;
-        H += kCollisionWeightSq * c.gradient * c.gradient.transpose();
-        g += kCollisionWeightSq * (c.clearance - IK_SELF_COLLISION_PUSH_CLEARANCE) * c.gradient;
+      for (const Push& push : at.pushes) {
+        H += kCollisionWeightSq * push.gradient * push.gradient.transpose();
+        g += kCollisionWeightSq * push.inside * push.gradient;
       }
       const Vector7d d = minimize_on_box(H, g, lower - at.q, upper - at.q);
       if (d.norm() < kStepTolerance) return Descent{(at.q + d).cwiseMax(lower).cwiseMin(upper), true};
@@ -372,7 +357,14 @@ Vector7d solve_pose_ik(const Kinematics& kinematics, const Eigen::Ref<const Vect
   // Full steps can overshoot the push and cycle without settling; the backtracking descent then gives the answer.
   Descent answer = descend(false);
   if (!answer.settled) answer = descend(true);
-  return stop_before_self_collision(start, answer.q);
+  return guard.clip(start, answer.q).q;
+}
+
+// solve_pose_ik on the FR3 self pairs, with no box.
+template <typename Kinematics>
+Vector7d solve_pose_ik(const Kinematics& kinematics, const Eigen::Ref<const Vector7d>& target_pose_wxyz,
+                       const Eigen::Ref<const Vector7d>& q0, double max_step) {
+  return solve_pose_ik(kinematics, target_pose_wxyz, q0, max_step, fr3_self_guard());
 }
 
 }  // namespace positronic_franka

@@ -7,6 +7,52 @@
 #include "robot.hpp"
 
 namespace py = pybind11;
+namespace sk = shared_kinematics;
+
+namespace {
+
+// Reads an arm model from any object with the attributes of shared_kinematics.ArmModel, so that this module does not
+// need to share pybind11 type data with the shared_kinematics module.
+sk::ArmModel arm_model_from(const py::handle& model) {
+  const auto pose = [](const py::handle& matrix) {
+    const Eigen::Matrix4d m = matrix.cast<Eigen::Matrix4d>();
+    if (!m.allFinite() || m.row(3) != Eigen::RowVector4d(0, 0, 0, 1))
+      throw std::invalid_argument("an arm model pose must be a finite 4x4 homogeneous transform");
+    Eigen::Isometry3d t;
+    t.matrix() = m;
+    return t;
+  };
+  const auto capsule = [](const py::handle& c) {
+    return sk::Capsule{c.attr("name").cast<std::string>(), c.attr("link").cast<int>(),
+                       c.attr("a").cast<Eigen::Vector3d>(), c.attr("b").cast<Eigen::Vector3d>(),
+                       c.attr("radius").cast<double>()};
+  };
+  std::vector<sk::Link> links;
+  const py::object chain = model.attr("chain");
+  for (const py::handle link : chain.attr("links"))
+    links.push_back({link.attr("name").cast<std::string>(), link.attr("parent").cast<int>(),
+                     pose(link.attr("origin")), link.attr("joint").cast<int>(),
+                     link.attr("axis").cast<Eigen::Vector3d>()});
+  sk::ArmModel out;
+  out.chain = sk::Chain(std::move(links));
+  for (const py::handle body : model.attr("bodies")) {
+    const std::string role = py::str(body.attr("role").attr("name"));
+    if (role != "PAD" && role != "RIGID") throw std::invalid_argument("a body role must be PAD or RIGID");
+    out.bodies.push_back({capsule(body.attr("capsule")), role == "PAD" ? sk::Role::kPad : sk::Role::kRigid,
+                          body.attr("in_planes").cast<bool>()});
+  }
+  const py::object self = model.attr("self_collision");
+  for (const py::handle c : self.attr("capsules")) out.self.capsules.push_back(capsule(c));
+  for (const py::handle pair : self.attr("pairs"))
+    out.self.pairs.push_back({pair.attr("name").cast<std::string>(), pair.attr("a").cast<std::vector<int>>(),
+                              pair.attr("b").cast<std::vector<int>>()});
+  out.self.clearance = self.attr("clearance").cast<double>();
+  out.base_pose = pose(model.attr("base_pose"));
+  out.validate();
+  return out;
+}
+
+}  // namespace
 
 PYBIND11_MODULE(_franka, m) {
   m.doc() = "Franka robot driver";
@@ -73,6 +119,42 @@ PYBIND11_MODULE(_franka, m) {
       .def_readonly("tool_point", &positronic_franka::SoftwareImpedance::tool_point)
       .def(py::self == py::self);
 
+  // module_local: the shared_kinematics module binds the same core types.
+  py::enum_<positronic_franka::SideKind>(m, "SideKind", py::module_local(),
+                                         "What a side of the workspace box stands for")
+      .value("SURFACE", positronic_franka::SideKind::kSurface,
+             "A real desk or wall, whose calibration touches pass a residual check")
+      .value("VIRTUAL", positronic_franka::SideKind::kVirtual, "A line that an operator chose");
+
+  py::class_<positronic_franka::Side>(m, "Side", py::module_local(),
+      "One plane of the workspace box, in the rig frame. A point x is inside the side when n . x + d >= 0. "
+      "n (3,) is of unit length and points to the inside. pad_allowance and rigid_allowance, m, are how far past "
+      "the side a finger pad and a rigid part may go; a negative value is a margin that the part keeps inside the "
+      "side")
+      .def(py::init([](std::string name, positronic_franka::SideKind kind, const Eigen::Vector3d& n, double d,
+                       double pad_allowance, double rigid_allowance) {
+             return positronic_franka::Side{std::move(name), kind, n, d, pad_allowance, rigid_allowance};
+           }),
+           py::arg("name"), py::arg("kind"), py::arg("n"), py::arg("d"), py::kw_only(), py::arg("pad_allowance"),
+           py::arg("rigid_allowance"))
+      .def_readonly("name", &positronic_franka::Side::name)
+      .def_readonly("kind", &positronic_franka::Side::kind)
+      .def_readonly("n", &positronic_franka::Side::n)
+      .def_readonly("d", &positronic_franka::Side::d)
+      .def_readonly("pad_allowance", &positronic_franka::Side::pad_allowance)
+      .def_readonly("rigid_allowance", &positronic_franka::Side::rigid_allowance);
+
+  py::class_<positronic_franka::WorkspaceBounds>(m, "WorkspaceBounds",
+      "The sides of the workspace box, and base_pose (4x4), the arm base in the rig frame. Raises ValueError for "
+      "no side, a side without a name or named 'self', two sides of one name, a normal not of unit length, a "
+      "number that is not finite, or a base_pose that is not a rigid transform")
+      .def(py::init<std::vector<positronic_franka::Side>, const Eigen::Matrix4d&>(), py::arg("sides"),
+           py::arg("base_pose") = Eigen::Matrix4d::Identity().eval())
+      .def_property_readonly("sides", &positronic_franka::WorkspaceBounds::sides, "The sides, in the order of names")
+      .def_property_readonly("base_pose", &positronic_franka::WorkspaceBounds::base_pose)
+      .def_property_readonly("hash", &positronic_franka::WorkspaceBounds::hash,
+                             "16 hex digits that change with any name, kind or number of the box");
+
   py::enum_<positronic_franka::GoalStatus>(m, "GoalStatus",
       "The joint move in flight. Every set_target_joints starts one; a newer target replaces an "
       "older one, and only the move in flight has a status")
@@ -82,7 +164,10 @@ PYBIND11_MODULE(_franka, m) {
              "The arm settled at the target — within tolerance and no longer moving")
       .value("ABORTED", positronic_franka::GoalStatus::ABORTED,
              "Stopped short — reflex, rejected plan, lost connection, expired deadline; see "
-             "Goal.reason. The arm may still be braking when this appears");
+             "Goal.reason. The arm may still be braking when this appears")
+      .value("BOUNDED", positronic_franka::GoalStatus::BOUNDED,
+             "The arm settled at the committed target (State.committed_target), which the guard shortened from "
+             "the commanded target; State.bindings names where");
 
   py::class_<positronic_franka::Goal>(m, "Goal")
       // Constructible so tests can stand one in; only the driver produces a real one.
@@ -140,17 +225,69 @@ PYBIND11_MODULE(_franka, m) {
       .def_property_readonly(
           "ee_wrench",
           [](const positronic_franka::State& s) { return s.end_effector_wrench; },
-          "External wrench on stiffness frame (Fx,Fy,Fz,Mx,My,Mz)");
+          "External wrench on stiffness frame (Fx,Fy,Fz,Mx,My,Mz)")
+      .def_property_readonly(
+          "bounds_enabled",
+          [](const positronic_franka::State& s) { return s.bounds_hash.has_value(); },
+          "True when workspace bounds are set")
+      .def_property_readonly(
+          "bounds_hash",
+          [](const positronic_franka::State& s) { return s.bounds_hash; },
+          "The hash of the workspace bounds in force, or None")
+      .def_property_readonly(
+          "bindings",
+          [](const positronic_franka::State& s) { return s.guard.bindings; },
+          "Per side, and 'self' for self-collision: how many targets the guard shortened or braked there, since the "
+          "last set_workspace_bounds or the start of the Robot")
+      .def_property_readonly(
+          "slowed_ticks",
+          [](const positronic_franka::State& s) { return s.guard.slowed_ticks; },
+          "Per side: how many ticks of the torque loop the speed scale of the box slowed the reference most at "
+          "that side, since the last set_workspace_bounds or the start of the Robot")
+      .def_property_readonly(
+          "deepest",
+          [](const positronic_franka::State& s) { return s.guard.deepest; },
+          "Per side: the deepest that a bounded point went past its floor, from the measured joints, m, since the "
+          "last set_workspace_bounds or the start of the Robot. A side that no point passed has no entry")
+      .def_property_readonly(
+          "committed_target",
+          [](const positronic_franka::State& s) { return s.committed_target; },
+          "The target (7,) of the last joint move after the guard, or where a brake before a side stops it. None "
+          "before the first move");
 
   py::class_<positronic_franka::Robot>(m, "Robot")
-      .def(py::init<const std::string&, franka::RealtimeConfig, double, positronic_franka::ControlMode, double>(),
+      .def(py::init([](const std::string& ip, franka::RealtimeConfig realtime_config, double relative_dynamics_factor,
+                       const positronic_franka::ControlMode& control_mode, double control_link_timeout_s,
+                       std::optional<positronic_franka::WorkspaceBounds> workspace_bounds,
+                       bool clip_joint_targets_self_collision, const py::object& arm_model) {
+             std::optional<sk::ArmModel> model;
+             if (!arm_model.is_none()) model = arm_model_from(arm_model);
+             return std::make_unique<positronic_franka::Robot>(
+                 ip, realtime_config, relative_dynamics_factor, control_mode, control_link_timeout_s,
+                 std::move(workspace_bounds), clip_joint_targets_self_collision, std::move(model));
+           }),
            py::arg("ip"),
            py::arg("realtime_config") = positronic_franka::DEFAULT_REALTIME_CONFIG,
            py::arg("relative_dynamics_factor") = positronic_franka::DEFAULT_RELATIVE_DYNAMICS_FACTOR,
            py::arg("control_mode") = positronic_franka::DEFAULT_CONTROL_MODE,
            py::arg("control_link_timeout_s") = positronic_franka::DEFAULT_CONTROL_LINK_TIMEOUT_S,
+           py::arg("workspace_bounds") = py::none(),
+           py::arg("clip_joint_targets_self_collision") = false, py::arg("arm_model") = py::none(),
            "control_link_timeout_s: a running control loop with no robot state for this long, in seconds, is "
-           "stuck: state() reports an error, goal() aborts the move, and a stop raises RuntimeError. Default 10 s")
+           "stuck: state() reports an error, goal() aborts the move, and a stop raises RuntimeError. Default 10 s. "
+           "workspace_bounds: the WorkspaceBounds at the start, or None, the default, for no bounds. Bounds need "
+           "arm_model. arm_model: a shared_kinematics.ArmModel of this FR3 with its gripper (shared_kinematics."
+           "load_arm). Its base pose gives way to the base_pose of the bounds. None, the default, is the FR3 with its "
+           "self-collision model and no bounded part. "
+           "clip_joint_targets_self_collision: stop each joint move of set_target_joints before two arm links come "
+           "closer than 0.09 m, or closer than at the start of the move when that is less, as "
+           "inverse_kinematics_with_limits does; such a move ends BOUNDED. False, the default, checks no self pair "
+           "on a joint target. With bounds, set_target_joints stops each joint move at the sides of the box too")
+      .def("set_workspace_bounds", &positronic_franka::Robot::set_workspace_bounds, py::arg("bounds"),
+           "Set the WorkspaceBounds, or None for no bounds, and start a new guard report in the state. Only at "
+           "rest: raises RuntimeError while a move is in flight or the arm moves")
+      .def_property_readonly("workspace_bounds", &positronic_franka::Robot::workspace_bounds,
+                             "The WorkspaceBounds in force, or None")
       .def("set_control_mode", &positronic_franka::Robot::set_control_mode,
            py::arg("mode"),
            "Apply a control mode (InternalImpedance | SoftwareImpedance): an equal mode is a no-op; a "
@@ -223,7 +360,8 @@ PYBIND11_MODULE(_franka, m) {
           "1 mm; returns q (7,)")
       .def("set_target_joints", &positronic_franka::Robot::set_target_joints,
            py::arg("q_target"), py::arg("deadline_s") = positronic_franka::DEFAULT_MOVE_DEADLINE_S,
-           "Command a joint move to target (7,) and return immediately; poll goal() for the outcome. "
+           "Command a joint move to target (7,) and return immediately; poll goal() for the outcome. The guard "
+           "can shorten the target: state().committed_target is the target that the arm moves to. "
            "Never blocks — waiting inside the library would stop the caller's own loop from clearing "
            "robot errors, so a reflex mid-move would never be cleared. deadline_s bounds the move: "
            "the goal ABORTS if the arm has not settled by then; pass your own where reach, gains or "

@@ -35,6 +35,14 @@ git submodule update --init --recursive
 pip install .
 ```
 
+The build fetches the [shared kinematics core](https://github.com/Positronic-Robotics/shared-kinematics) at the
+commit in `shared_kinematics.ref`. To build against a local checkout of the core, set
+`FETCHCONTENT_SOURCE_DIR_SHARED_KINEMATICS`:
+
+```
+pip install . --config-settings=cmake.define.FETCHCONTENT_SOURCE_DIR_SHARED_KINEMATICS=/path/to/shared-kinematics
+```
+
 ## Installing libfranka on Ubuntu 24.04 (recommended)
 As said, you must have [`libfranka`](https://github.com/frankarobotics/libfranka) installed locally before installing `positronic-franka` (wheels are not provided).
 

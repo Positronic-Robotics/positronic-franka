@@ -29,6 +29,9 @@
 #include "impedance_law.hpp"
 #include "pose_ik.hpp"
 #include "trajectory_generator.hpp"
+#include "arm_guards.hpp"
+#include "plan_check.hpp"
+#include "workspace_bounds.hpp"
 
 namespace positronic_franka {
 
@@ -50,6 +53,9 @@ constexpr double DEFAULT_MOVE_DEADLINE_S = 15.0;
 // A running control loop with no robot state for this long counts as stuck in libfranka. Far above any
 // normal gap: at the end of a motion, libfranka calls no callback for up to about 1.2 s.
 constexpr double DEFAULT_CONTROL_LINK_TIMEOUT_S = 10.0;
+// Within this distance of its target on every joint, rad, a reference that the speed scale of the box slows takes
+// the target. At 1 m from a joint it is 0.1 mm, inside the 1 mm path tolerance of the clip.
+constexpr double BOX_HOLD_TOLERANCE = 1e-4;
 
 
 // Control modes. InternalImpedance drives the robot's built-in joint impedance controller through the
@@ -209,6 +215,8 @@ enum class GoalStatus {
   // `Goal::reason` says which. The arm may still be braking when this appears; read `state()` if
   // that matters.
   ABORTED,
+  // The arm settled at the committed target, which the guard shortened from the commanded target.
+  BOUNDED,
 };
 
 struct Goal {
@@ -234,6 +242,13 @@ struct State {
   std::string error_message;
   // External wrench (force, torque) on end-effector frame expressed in K frame.
   Vector6d end_effector_wrench = Vector6d::Zero();
+  // The hash of the workspace bounds in force; empty when no bounds are set.
+  std::optional<std::string> bounds_hash;
+  // What the guard did since the last set_workspace_bounds, or since the start of the Robot.
+  GuardReport guard;
+  // The target of the last joint move after the guard, or where a brake before a side stops it. Empty before the
+  // first move.
+  std::optional<Vector7d> committed_target;
 };
 
 class Robot {
@@ -242,11 +257,18 @@ class Robot {
                  franka::RealtimeConfig realtime_config = DEFAULT_REALTIME_CONFIG,
                  double relative_dynamics_factor = DEFAULT_RELATIVE_DYNAMICS_FACTOR,
                  ControlMode control_mode = DEFAULT_CONTROL_MODE,
-                 double control_link_timeout_s = DEFAULT_CONTROL_LINK_TIMEOUT_S)
+                 double control_link_timeout_s = DEFAULT_CONTROL_LINK_TIMEOUT_S,
+                 std::optional<WorkspaceBounds> workspace_bounds = std::nullopt,
+                 bool clip_joint_targets_self_collision = false,
+                 std::optional<sk::ArmModel> arm_model = std::nullopt)
       : loop_watch_(control_link_timeout_(control_link_timeout_s)),
         control_link_lost_(control_link_lost_message_(control_link_timeout_s)),
         robot_(std::make_unique<franka::Robot>(ip, realtime_config)),
-        relative_dynamics_factor_(std::clamp(relative_dynamics_factor, 0.0001, 1.0)) {
+        relative_dynamics_factor_(std::clamp(relative_dynamics_factor, 0.0001, 1.0)),
+        clip_joint_targets_self_collision_(clip_joint_targets_self_collision),
+        arm_model_(arm_model ? std::move(*arm_model) : fr3_arm_model()),
+        workspace_bounds_(std::move(workspace_bounds)),
+        guards_(make_arm_guards(arm_model_, workspace_bounds_, clip_joint_targets_self_collision_)) {
     model_ = std::make_unique<franka::Model>(robot_->loadModel());
     // Force-apply: the equality guard in set_control_mode must not skip pushing k_theta when the
     // requested mode happens to equal the default — the robot may persist stiffness from past sessions.
@@ -287,6 +309,12 @@ class Robot {
     }
     // NOTE: This relies on the fact that we don't configure EE_T_K frame.
     st.end_effector_wrench = Eigen::Map<const Vector6d>(rs.K_F_ext_hat_K.data());
+    {
+      std::lock_guard<std::mutex> lk(guard_mutex_);
+      if (workspace_bounds_) st.bounds_hash = workspace_bounds_->hash();
+      st.guard = guard_report_;
+      st.committed_target = committed_target_;
+    }
     // A stuck loop serves the same cached state for good, so no robot error can appear in it.
     if (end_stuck_loop_()) {
       st.error = 1;
@@ -306,6 +334,24 @@ class Robot {
 
   ControlMode control_mode() const { return control_mode_; }
 
+  // Set the workspace bounds, or remove them with nullopt, and start a new guard report. Only at rest: raises
+  // std::runtime_error while a move is in flight or the arm moves.
+  void set_workspace_bounds(const std::optional<WorkspaceBounds>& bounds) {
+    if (!at_rest_())
+      throw std::runtime_error("workspace bounds change only at rest: a move is in flight or the arm moves");
+    ArmGuards guards = make_arm_guards(arm_model_, bounds, clip_joint_targets_self_collision_);
+    std::lock_guard<std::mutex> lk(guard_mutex_);
+    workspace_bounds_ = bounds;
+    guards_ = std::move(guards);
+    guard_report_ = GuardReport{};
+    ++guards_version_;
+  }
+
+  std::optional<WorkspaceBounds> workspace_bounds() {
+    std::lock_guard<std::mutex> lk(guard_mutex_);
+    return workspace_bounds_;
+  }
+
   // The move in flight, read without blocking.
   Goal goal() {
     // A stuck loop never reaches its deadline check, so end its move here.
@@ -314,7 +360,7 @@ class Robot {
     return Goal{goal_status_, goal_error_};
   }
 
-  // Command a joint move and return immediately. Poll `goal()` for IN_FLIGHT / REACHED / ABORTED.
+  // Command a joint move and return immediately. Poll `goal()` for IN_FLIGHT / REACHED / BOUNDED / ABORTED.
   //
   // Starts the control loop if it is not running, then publishes the target to it. Both control
   // modes report the same way; how the arm gets there is the mode's business.
@@ -333,6 +379,8 @@ class Robot {
     if (!std::isfinite(deadline_s) || deadline_s <= 0.0) {
       throw std::invalid_argument("deadline_s must be finite and strictly positive");
     }
+    const GuardedTarget guarded = guard_target_(q_target);
+    const bool bounded = guarded.q != q_target;
     std::uint64_t goal_id = 0;
     if (!control_running_.load()) {
       if (control_thread_.joinable()) {
@@ -341,7 +389,7 @@ class Robot {
       // Arm between the join and the launch, so exactly one loop can settle this goal. Later, and a
       // loop dying before the goal exists leaves it armed on a dead thread, IN_FLIGHT forever.
       // Earlier, and the outgoing loop can abort the move its successor is about to run.
-      goal_id = arm_goal_();
+      goal_id = arm_goal_(bounded);
       // Starting a loop issues a Move command, which the robot refuses while it holds an error
       // ("command not possible in the current mode"), so the fresh thread would die on its first
       // tick. Report the robot's own error instead. Clearing is the caller's call: a reflex means
@@ -401,11 +449,17 @@ class Robot {
       // Loop already running (every move after the first): no join to order against, so arming
       // immediately before the publish below is enough. If it dies in the window,
       // `finish_control_thread_` aborts this goal with the loop's own reason.
-      goal_id = arm_goal_();
+      goal_id = arm_goal_(bounded);
+    }
+    {
+      std::lock_guard<std::mutex> lk(guard_mutex_);
+      committed_target_ = guarded.q;
+      for (const std::string& key : guarded.bound) guard_report_.count_binding(key);
     }
     {
       std::lock_guard<std::mutex> lk(target_mutex_);
-      target_q_ = q_target;
+      target_q_ = guarded.q;
+      target_from_ = guarded.from;
       target_goal_id_ = goal_id;
       // Carried with the target, so a later call cannot retroactively change this move's deadline.
       target_deadline_s_ = deadline_s;
@@ -497,7 +551,7 @@ class Robot {
       st.q = to_std_array7_(q);
       return ToolKinematics{flange_pose_matrix_(st), flange_jacobian_(st)};
     };
-    return solve_pose_ik(kinematics, flange_pose_wxyz, q0, max_step);
+    return solve_pose_ik(kinematics, flange_pose_wxyz, q0, max_step, *guards_snapshot_().ik);
   }
 
 private:
@@ -545,12 +599,19 @@ private:
          goal_in_flight = std::uint64_t{0},
          elapsed_s = 0.0,
          deadline_s = 0.0,
-         stopping = false](const franka::RobotState& st, franka::Duration period) mutable -> franka::JointPositions {
+         stopping = false,
+         guard = LoopGuard{},
+         plan_check = PlanCheck{},
+         checked_target = Vector7d(Vector7d::Zero())](const franka::RobotState& st,
+                                                       franka::Duration period) mutable -> franka::JointPositions {
           {
             std::lock_guard<std::mutex> lk(last_state_mutex_);
             last_state_ = std::make_unique<franka::RobotState>(st);
           }
           loop_watch_.tick();
+          refresh_loop_guard_(guard);
+          traj.set_phase_synchronization(static_cast<bool>(guard.target));
+          record_deepest_(guard, Eigen::Map<const Vector7d>(st.q.data()));
 
           if (first) {
             traj.start_at_rest(st.q_d);
@@ -561,6 +622,7 @@ private:
             traj.brake_to_rest();
           }
 
+          std::optional<Vector7d> plan_to_check;
           if (!stopping && has_target_.load()) {
             std::lock_guard<std::mutex> lk(target_mutex_);
             const bool planned = traj.set_target(target_q_);
@@ -577,7 +639,17 @@ private:
               fail_goal_(goal_in_flight, "joint target rejected by the trajectory planner");
               goal_in_flight = 0;
               traj.brake_to_rest();
+            } else if (guard.target) {
+              plan_to_check = target_q_;
             }
+          }
+          if (plan_to_check) {
+            checked_target = *plan_to_check;
+            if (const auto side = plan_check.start(*guard.target, traj))
+              brake_before_a_floor_(*side, traj, guard.version, goal_in_flight, checked_target);
+          } else if (guard.target && plan_check.pending(traj)) {
+            if (const auto side = plan_check.step(*guard.target, traj))
+              brake_before_a_floor_(*side, traj, guard.version, goal_in_flight, checked_target);
           }
 
           auto pos = traj.step(period.toSec());
@@ -643,8 +715,9 @@ private:
          stopping = false,
          stop_ticks = 0,
          ref = Vector7d(Vector7d::Zero()),
-         target = Vector7d(Vector7d::Zero())](const franka::RobotState& st,
-                                              franka::Duration period) mutable -> franka::Torques {
+         target = Vector7d(Vector7d::Zero()),
+         guard = LoopGuard{},
+         line_check = LineCheck{}](const franka::RobotState& st, franka::Duration period) mutable -> franka::Torques {
           const Vector7d q = Eigen::Map<const Vector7d>(st.q.data());
           const Vector7d dq = Eigen::Map<const Vector7d>(st.dq.data());
 
@@ -657,14 +730,27 @@ private:
             ref = target = q;
           }
 
+          refresh_loop_guard_(guard);
+          std::optional<Vector7d> checked_from;
           if (!stopping && has_target_.load()) {
             std::lock_guard<std::mutex> lk(target_mutex_);
             target = target_q_;
+            checked_from = target_from_;
             goal_in_flight = std::exchange(target_goal_id_, 0);
             elapsed_s = 0.0;
             deadline_s = std::exchange(target_deadline_s_, 0.0);
             has_target_.store(false);
+            line_check = LineCheck{};
+          } else if (stopping) {
+            line_check = LineCheck{};
           }
+          // The guard checked the move from where the reference was then. From where it is now, check its self pairs
+          // again.
+          if (checked_from && guard.target && *checked_from != ref && !guard.target->model().self.pairs.empty())
+            line_check.start(*guard.target, ref, target);
+          if (guard.target && line_check.pending() && line_check.step(*guard.target, PLAN_CHECK_SAMPLES))
+            target = end_the_torque_move_short_(SELF_COLLISION_KEY, line_check.checked_point(), guard.version,
+                                                goal_in_flight, target);
 
           if (has_new_gains_.load()) {
             std::lock_guard<std::mutex> lk(target_mutex_);
@@ -680,6 +766,8 @@ private:
             has_new_gains_.store(false);
           }
 
+          record_deepest_(guard, q);
+
           // No trajectory here: the impedance law moves the arm. The speed cap on q_d keeps a large jump in the
           // target from becoming a large spring pull, at any command rate.
           Vector7d next_ref = move_reference_toward(ref, target, max_reference_speed, period.toSec());
@@ -688,7 +776,9 @@ private:
             next_ref = limit_tool_point_speed(ref, next_ref, J_ref.topRows<3>(), *max_tool_point_speed,
                                               period.toSec());
           }
-          ref = next_ref;
+          if (guard.box && next_ref != ref)
+            next_ref = slow_near_the_box_(*guard.box, guard.version, ref, next_ref, target, period.toSec());
+          ref = line_check.within_checked(next_ref);
 
           // The position loop's arrival rule: there is no arrival to test while the reference still moves.
           if (goal_in_flight != 0) {
@@ -698,7 +788,10 @@ private:
               goal_in_flight = 0;
               // As above: hold position rather than keep pulling toward a target already reported
               // as not reached.
-              if (outcome == Arrival::Stalled) ref = target = q;
+              if (outcome == Arrival::Stalled) {
+                ref = target = q;
+                line_check = LineCheck{};
+              }
             }
           }
 
@@ -742,11 +835,12 @@ private:
   }
 
   // Arm a move and return the id that names it, so an outcome from whatever ran before can be told
-  // apart from the move now in flight.
-  std::uint64_t arm_goal_() {
+  // apart from the move now in flight. A `bounded` move settles BOUNDED where it would settle REACHED.
+  std::uint64_t arm_goal_(bool bounded) {
     std::lock_guard<std::mutex> lk(goal_mutex_);
     goal_status_ = GoalStatus::IN_FLIGHT;
     goal_error_.clear();
+    goal_bounded_ = bounded;
     return ++goal_id_;
   }
 
@@ -756,7 +850,7 @@ private:
   void settle_goal_(std::uint64_t id, GoalStatus status, std::string reason = {}) {
     std::lock_guard<std::mutex> lk(goal_mutex_);
     if (goal_status_ != GoalStatus::IN_FLIGHT || goal_id_ != id) return;
-    goal_status_ = status;
+    goal_status_ = status == GoalStatus::REACHED && goal_bounded_ ? GoalStatus::BOUNDED : status;
     goal_error_ = std::move(reason);
   }
 
@@ -924,6 +1018,128 @@ private:
  private:
   franka::RobotState read_robot_state_() { return read_state_snapshot_().first; }
 
+  struct GuardedTarget {
+    Vector7d q;
+    // The sides, and SELF_COLLISION_KEY, at which the guard shortened the target.
+    std::vector<std::string> bound;
+    // The reference that the guard checked the move from; empty with no guard.
+    std::optional<Vector7d> from;
+  };
+
+  // The target that the guard lets through: the clip of the joint move from the reference at the sides of the box,
+  // and at the self-collision floor when the self-collision clip is on.
+  GuardedTarget guard_target_(const Vector7d& q_target) {
+    const std::shared_ptr<const sk::Guard> guard = guards_snapshot_().target;
+    if (!guard) return {q_target, {}, std::nullopt};
+    const Vector7d from = reference_now_();
+    const sk::ClipResult clip = guard->clip(from, q_target);
+    const Vector7d q = clip.q;
+    if (q == q_target) return {q_target, {}, from};
+    GuardedTarget out{q, clip.bound_sides, from};
+    if (clip.self_bound) out.bound.push_back(SELF_COLLISION_KEY);
+    return out;
+  }
+
+  ArmGuards guards_snapshot_() {
+    std::lock_guard<std::mutex> lk(guard_mutex_);
+    return guards_;
+  }
+
+  // What a control loop takes from the guards.
+  struct LoopGuard {
+    // The guard of the box; empty with no bounds.
+    std::shared_ptr<const sk::Guard> box;
+    // The guard that clips each joint target on the straight joint line from the reference; empty when none does.
+    std::shared_ptr<const sk::Guard> target;
+    // The generation of these guards. The loop writes to the guard report only while it is the generation in force.
+    std::uint64_t version = 0;
+  };
+
+  // Gives a control loop the guards in force when set_workspace_bounds changed them since it last looked.
+  void refresh_loop_guard_(LoopGuard& guard) {
+    if (guards_version_.load() == guard.version) return;
+    std::lock_guard<std::mutex> lk(guard_mutex_);
+    guard.box = guards_.box;
+    guard.target = guards_.target;
+    guard.version = guards_version_.load();
+  }
+
+  // Ends the torque-loop move to `target` at `stop`, the last point before a bounded part passes its floor at `side`, or
+  // two links come closer than the clearance at SELF_COLLISION_KEY. The goal ends BOUNDED, and the committed target
+  // becomes `stop`. Returns `stop`.
+  Vector7d end_the_torque_move_short_(const std::string& side, const Vector7d& stop, std::uint64_t version,
+                                      std::uint64_t goal, const Vector7d& target) {
+    {
+      std::lock_guard<std::mutex> lk(goal_mutex_);
+      if (goal_id_ == goal && goal_status_ == GoalStatus::IN_FLIGHT) goal_bounded_ = true;
+    }
+    std::lock_guard<std::mutex> lk(guard_mutex_);
+    if (guards_version_.load() == version) guard_report_.count_binding(side);
+    if (committed_target_ == target) committed_target_ = stop;
+    return stop;
+  }
+
+  // Brakes the position loop, whose plan to `target` takes a bounded part past its floor at `side`, or two links closer
+  // than the clearance at SELF_COLLISION_KEY. The goal ends BOUNDED, and the committed target becomes the point where
+  // the brake stops. A refused brake stops the loop with an error.
+  void brake_before_a_floor_(const std::string& side, TrajectoryGenerator& traj, std::uint64_t version,
+                             std::uint64_t goal, const Vector7d& target) {
+    if (!traj.brake_to_rest())
+      throw std::runtime_error("the trajectory planner refused the brake before side " + side);
+    {
+      std::lock_guard<std::mutex> lk(goal_mutex_);
+      if (goal_id_ == goal && goal_status_ == GoalStatus::IN_FLIGHT) goal_bounded_ = true;
+    }
+    const std::array<double, 7> stop = traj.position_at(traj.duration());
+    std::lock_guard<std::mutex> lk(guard_mutex_);
+    if (guards_version_.load() == version) guard_report_.count_binding(side);
+    if (committed_target_ == target) committed_target_ = Eigen::Map<const Vector7d>(stop.data());
+  }
+
+  // Keeps, per side, the deepest pass of a bounded part past its floor at the measured joints.
+  void record_deepest_(const LoopGuard& guard, const Vector7d& q) {
+    if (!guard.box) return;
+    const sk::Distances rows = guard.box->distances(q);
+    std::lock_guard<std::mutex> lk(guard_mutex_);
+    if (guards_version_.load() != guard.version) return;
+    for (const sk::PlaneDistance& row : rows.planes) guard_report_.record_depth(row.side, row.floor - row.distance);
+  }
+
+  // The step of the reference from `ref` to `next`, times the speed scale of the box. It keeps its direction. Near a
+  // floor the scale falls toward 0, so within BOX_HOLD_TOLERANCE of the target, which the clip checked, the reference
+  // takes the target when the caps let `next` reach it.
+  Vector7d slow_near_the_box_(const sk::Guard& box, std::uint64_t version, const Vector7d& ref, const Vector7d& next,
+                              const Vector7d& target, double dt) {
+    if (!(dt > 0.0)) return next;
+    const sk::ScaleResult scale = box.speed_scale(ref, next - ref, dt);
+    if (!(scale.s < 1.0)) return next;
+    {
+      std::lock_guard<std::mutex> lk(guard_mutex_);
+      if (scale.slowest && guards_version_.load() == version) guard_report_.count_slowed(*scale.slowest);
+    }
+    const Vector7d slowed = ref + scale.s * (next - ref);
+    return next == target && (target - slowed).cwiseAbs().maxCoeff() <= BOX_HOLD_TOLERANCE ? target : slowed;
+  }
+
+  // The joints that the control loop moves from: the torque loop's reference, or the position loop's last command.
+  // With no loop, the joints that the next loop starts from.
+  Vector7d reference_now_() {
+    const auto [rs, software_ref] = read_state_snapshot_();
+    if (software_ref) return *software_ref;
+    if (std::holds_alternative<SoftwareImpedance>(control_mode_)) return Eigen::Map<const Vector7d>(rs.q.data());
+    return Eigen::Map<const Vector7d>(rs.q_d.data());
+  }
+
+  // No move in flight, and every joint measured slower than SETTLE_VELOCITY_TOLERANCE, with a control loop or without.
+  bool at_rest_() {
+    {
+      std::lock_guard<std::mutex> lk(goal_mutex_);
+      if (goal_status_ == GoalStatus::IN_FLIGHT) return false;
+    }
+    const franka::RobotState rs = read_robot_state_();
+    return Eigen::Map<const Vector7d>(rs.dq.data()).cwiseAbs().maxCoeff() < SETTLE_VELOCITY_TOLERANCE;
+  }
+
   // Returns whether the running loop is stuck. A stuck loop's move is aborted, so the loop must brake
   // if it ever ticks again: the caller acts as if the move ended.
   bool end_stuck_loop_() {
@@ -974,6 +1190,8 @@ private:
   std::string goal_error_;
   // Names the move `goal_status_` describes. Ids start at 1; 0 names no move.
   std::uint64_t goal_id_ = 0;
+  // The guard shortened the target of that move.
+  bool goal_bounded_ = false;
 
   std::mutex last_state_mutex_;
   std::unique_ptr<franka::RobotState> last_state_;
@@ -987,11 +1205,26 @@ private:
   ControlMode control_mode_;
   std::mutex target_mutex_;
   Vector7d target_q_ = Vector7d::Zero();
+  // The reference that the guard checked the move to `target_q_` from; empty with no guard.
+  std::optional<Vector7d> target_from_;
   // The move `target_q_` belongs to, handed to the loop in the same critical section as the target;
   // 0 for a streamed target, which has none.
   std::uint64_t target_goal_id_ = 0;
   // The deadline the pending target was commanded with, in seconds; taken by the loop with it.
   double target_deadline_s_ = 0.0;
+  // Clip each joint target at the self-collision floor as well as at the box.
+  const bool clip_joint_targets_self_collision_;
+  // The arm that the guards check: the model given at the start, or fr3_arm_model().
+  const sk::ArmModel arm_model_;
+  // The guard: the workspace bounds, its core guards, what it did, and the target it let through. Written only at
+  // rest or by the caller of set_target_joints.
+  std::mutex guard_mutex_;
+  std::optional<WorkspaceBounds> workspace_bounds_;
+  ArmGuards guards_;
+  // Counts the changes of guards_, so a control loop takes a new box guard without a lock on each tick.
+  std::atomic<std::uint64_t> guards_version_{1};
+  GuardReport guard_report_;
+  std::optional<Vector7d> committed_target_;
   // A gains-only SoftwareImpedance change, picked up by the running torque loop mid-session.
   SoftwareImpedance new_gains_;
   std::atomic<bool> has_new_gains_{false};
