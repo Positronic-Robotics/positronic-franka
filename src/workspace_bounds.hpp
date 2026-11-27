@@ -110,7 +110,8 @@ class WorkspaceBounds {
 struct GuardReport {
   // Per side, and SELF_COLLISION_KEY for self-collision: how many targets the guard shortened or braked there.
   std::map<std::string, std::uint64_t> bindings;
-  // Per side: how many ticks of the torque loop the speed scale slowed the reference most at that side.
+  // Per side: how many control-loop ticks that side slowed. The torque loop counts the side that slowed the reference
+  // most; the position loop counts the side of its last step down while its velocity scale is below 1.
   std::map<std::string, std::uint64_t> slowed_ticks;
   // Per side: the deepest that a bounded part went past its floor at that side, from the measured joints, m.
   // A side that no part passed has no entry.

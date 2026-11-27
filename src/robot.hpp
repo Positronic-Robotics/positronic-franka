@@ -602,6 +602,7 @@ private:
          stopping = false,
          guard = LoopGuard{},
          plan_check = PlanCheck{},
+         slowed_by = std::optional<std::string>{},
          checked_target = Vector7d(Vector7d::Zero())](const franka::RobotState& st,
                                                        franka::Duration period) mutable -> franka::JointPositions {
           {
@@ -609,7 +610,13 @@ private:
             last_state_ = std::make_unique<franka::RobotState>(st);
           }
           loop_watch_.tick();
+          const std::uint64_t seen = guard.version;
           refresh_loop_guard_(guard);
+          // New guards start at full speed, with no side that slowed the plan.
+          if (guard.version != seen) {
+            slowed_by.reset();
+            traj.set_velocity_scale(1.0);
+          }
           traj.set_phase_synchronization(static_cast<bool>(guard.target));
           record_deepest_(guard, Eigen::Map<const Vector7d>(st.q.data()));
 
@@ -645,12 +652,11 @@ private:
           }
           if (plan_to_check) {
             checked_target = *plan_to_check;
-            if (const auto side = plan_check.start(*guard.target, traj))
-              brake_before_a_floor_(*side, traj, guard.version, goal_in_flight, checked_target);
-          } else if (guard.target && plan_check.pending(traj)) {
-            if (const auto side = plan_check.step(*guard.target, traj))
-              brake_before_a_floor_(*side, traj, guard.version, goal_in_flight, checked_target);
+            brake_at_a_pass_(plan_check.start(*guard.target, traj), guard, plan_check, traj, goal_in_flight,
+                             checked_target);
           }
+          if (guard.target && !stopping)
+            step_the_plan_check_(guard, traj, plan_check, slowed_by, goal_in_flight, checked_target);
 
           auto pos = traj.step(period.toSec());
 
@@ -1079,13 +1085,49 @@ private:
     return stop;
   }
 
+  // One tick of the position loop on a plan to `target` that the guard checks. Near the box the velocity scale steps,
+  // and a step plans again, so the check starts on the new plan. Then the check goes on. The loop brakes at a point of
+  // the plan past a floor, at a step down that the planner refuses, and on a brake from a later point past a floor
+  // when a brake now stays above each floor. `slowed_by` keeps the side of the last step down. It runs
+  // on each tick, also on a tick that takes a new target.
+  void step_the_plan_check_(const LoopGuard& guard, TrajectoryGenerator& traj, PlanCheck& plan_check,
+                            std::optional<std::string>& slowed_by, std::uint64_t goal, const Vector7d& target) {
+    if (guard.box) {
+      const VelocityStep step = velocity_step_near(*guard.box, traj, TrajectoryGenerator::NOMINAL_DT);
+      if (step.slowest) slowed_by = step.slowest;
+      const std::uint64_t plan = traj.plan_number();
+      const bool planned = step.scale == traj.velocity_scale() || traj.set_velocity_scale(step.scale);
+      if (traj.active() && traj.velocity_scale() < 1.0 && slowed_by) {
+        std::lock_guard<std::mutex> lk(guard_mutex_);
+        if (guards_version_.load() == guard.version) guard_report_.count_slowed(*slowed_by);
+      }
+      if (!planned && step.slowest) {
+        brake_before_a_floor_(*step.slowest, traj, guard.version, goal, target);
+        return;
+      }
+      if (planned && traj.plan_number() != plan) {
+        brake_at_a_pass_(plan_check.start(*guard.target, traj), guard, plan_check, traj, goal, target);
+        return;
+      }
+    }
+    if (!plan_check.pending(traj)) return;
+    brake_at_a_pass_(plan_check.step(*guard.target, traj), guard, plan_check, traj, goal, target);
+  }
+
+  // Brakes the position loop at a pass that the plan check found. On a brake from a later point, it brakes only when a
+  // brake now stays above each floor.
+  void brake_at_a_pass_(const std::optional<PlanPass>& pass, const LoopGuard& guard, const PlanCheck& plan_check,
+                        TrajectoryGenerator& traj, std::uint64_t goal, const Vector7d& target) {
+    if (pass && (!pass->on_a_brake || plan_check.brake_now_stays_inside(*guard.target, traj)))
+      brake_before_a_floor_(pass->side, traj, guard.version, goal, target);
+  }
+
   // Brakes the position loop, whose plan to `target` takes a bounded part past its floor at `side`, or two links closer
   // than the clearance at SELF_COLLISION_KEY. The goal ends BOUNDED, and the committed target becomes the point where
   // the brake stops. A refused brake stops the loop with an error.
   void brake_before_a_floor_(const std::string& side, TrajectoryGenerator& traj, std::uint64_t version,
                              std::uint64_t goal, const Vector7d& target) {
-    if (!traj.brake_to_rest())
-      throw std::runtime_error("the trajectory planner refused the brake before side " + side);
+    brake_before(traj, side);
     {
       std::lock_guard<std::mutex> lk(goal_mutex_);
       if (goal_id_ == goal && goal_status_ == GoalStatus::IN_FLIGHT) goal_bounded_ = true;

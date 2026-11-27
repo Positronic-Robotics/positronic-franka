@@ -5,6 +5,8 @@
 #include <cstdint>
 #include <iostream>
 #include <optional>
+#include <vector>
+#include <utility>
 
 #include <ruckig/ruckig.hpp>
 
@@ -28,7 +30,8 @@ class TrajectoryGenerator {
     input_.target_velocity.fill(0.0);
     input_.target_acceleration.fill(0.0);
     for (size_t i = 0; i < 7; ++i) {
-      input_.max_velocity[i] = PANDA_BASE_VELOCITY_LIMITS[i] * dynamics_factor;
+      velocity_limit_[i] = PANDA_BASE_VELOCITY_LIMITS[i] * dynamics_factor;
+      input_.max_velocity[i] = velocity_limit_[i];
       input_.max_acceleration[i] = PANDA_BASE_ACCELERATION_LIMITS[i] * dynamics_factor;
       input_.max_jerk[i] = PANDA_BASE_JERK_LIMITS[i] * dynamics_factor;
     }
@@ -108,6 +111,53 @@ class TrajectoryGenerator {
   // How long the playing plan has played, in seconds.
   double elapsed() const { return cumulative_time_; }
 
+  // Where the plan is now, and how fast it moves, rad/s.
+  const std::array<double, 7>& position() const { return input_.current_position; }
+  const std::array<double, 7>& velocity() const { return input_.current_velocity; }
+
+  // The velocity limit of each joint at a velocity scale of 1, rad/s.
+  const std::array<double, 7>& velocity_limit() const { return velocity_limit_; }
+
+  // The share of velocity_limit() that the plans keep to, in (0, 1].
+  double velocity_scale() const { return velocity_scale_; }
+
+  // Sets the velocity scale, and plans again to the target of the playing plan with it. Returns whether that plan was
+  // accepted; on a refusal the old plan and the old scale stay. With no plan to a target playing, the next plan takes
+  // the scale.
+  bool set_velocity_scale(double scale) {
+    const double old_scale = std::exchange(velocity_scale_, scale);
+    set_max_velocity_();
+    if (!playing_plan_target_ || !active_) return true;
+    input_.control_interface = ruckig::ControlInterface::Position;
+    input_.target_position = *playing_plan_target_;
+    if (replan_()) return true;
+    velocity_scale_ = old_scale;
+    set_max_velocity_();
+    return false;
+  }
+
+  // The poses of a brake from the plan `t` seconds after it was planned: `spacing` seconds apart, and where it comes to
+  // rest. Empty when the planner refuses it.
+  std::optional<std::vector<std::array<double, 7>>> brake_poses_at(double t, double spacing) const {
+    if (!planned_) return std::vector<std::array<double, 7>>{input_.current_position};
+    ruckig::InputParameter<7> brake_input = input_;
+    brake_input.control_interface = ruckig::ControlInterface::Velocity;
+    trajectory_.at_time(std::clamp(t, 0.0, duration_), brake_input.current_position, brake_input.current_velocity,
+                        brake_input.current_acceleration);
+    ruckig::Ruckig<7> otg{NOMINAL_DT};
+    ruckig::Trajectory<7> brake;
+    if (otg.calculate(brake_input, brake) < 0) return std::nullopt;
+    std::vector<std::array<double, 7>> poses;
+    std::array<double, 7> pos, vel, acc;
+    for (double s = spacing; s < brake.get_duration(); s += spacing) {
+      brake.at_time(s, pos, vel, acc);
+      poses.push_back(pos);
+    }
+    brake.at_time(brake.get_duration(), pos, vel, acc);
+    poses.push_back(pos);
+    return poses;
+  }
+
   // Counts the plans; each accepted plan or brake gets the next number.
   std::uint64_t plan_number() const { return plan_number_; }
 
@@ -116,6 +166,10 @@ class TrajectoryGenerator {
   double duration() const { return duration_; }
 
  private:
+  void set_max_velocity_() {
+    for (size_t i = 0; i < 7; ++i) input_.max_velocity[i] = velocity_limit_[i] * velocity_scale_;
+  }
+
   bool replan_() {
     // Swap only on success: evaluating a default-constructed trajectory feeds NaN into libfranka and
     // kills the control thread. On failure the previous plan keeps playing.
@@ -144,6 +198,8 @@ class TrajectoryGenerator {
   bool active_ = false;
   bool planned_ = false;
   std::uint64_t plan_number_ = 0;
+  std::array<double, 7> velocity_limit_{};
+  double velocity_scale_ = 1.0;
 };
 
 }  // namespace positronic_franka
