@@ -73,6 +73,40 @@ PYBIND11_MODULE(_franka, m) {
       .def_readonly("tool_point", &positronic_franka::SoftwareImpedance::tool_point)
       .def(py::self == py::self);
 
+  py::enum_<positronic_franka::SideKind>(m, "SideKind", "What a side of the workspace box stands for")
+      .value("SURFACE", positronic_franka::SideKind::SURFACE,
+             "A real desk or wall, whose calibration touches pass a residual check")
+      .value("VIRTUAL", positronic_franka::SideKind::VIRTUAL, "A line that an operator chose");
+
+  py::class_<positronic_franka::Side>(m, "Side",
+      "One plane of the workspace box, in the rig frame. A point p is inside the side when "
+      "normal . p + offset >= 0. normal (3,) is of unit length and points to the inside. pad_allowance and "
+      "rigid_allowance, m, are how far past the side a finger pad and a rigid part may go; a negative value is "
+      "a margin that the part keeps inside the side")
+      .def(py::init([](std::string name, positronic_franka::SideKind kind, const Eigen::Vector3d& normal,
+                       double offset, double pad_allowance, double rigid_allowance) {
+             return positronic_franka::Side{std::move(name), kind, normal, offset, pad_allowance, rigid_allowance};
+           }),
+           py::arg("name"), py::arg("kind"), py::arg("normal"), py::arg("offset"), py::kw_only(),
+           py::arg("pad_allowance"), py::arg("rigid_allowance"))
+      .def_readonly("name", &positronic_franka::Side::name)
+      .def_readonly("kind", &positronic_franka::Side::kind)
+      .def_readonly("normal", &positronic_franka::Side::normal)
+      .def_readonly("offset", &positronic_franka::Side::offset)
+      .def_readonly("pad_allowance", &positronic_franka::Side::pad_allowance)
+      .def_readonly("rigid_allowance", &positronic_franka::Side::rigid_allowance);
+
+  py::class_<positronic_franka::WorkspaceBounds>(m, "WorkspaceBounds",
+      "The sides of the workspace box, and base_pose (4x4), the arm base in the rig frame. Raises ValueError for "
+      "no side, a side without a name or named 'self', two sides of one name, a normal not of unit length, a "
+      "number that is not finite, or a base_pose that is not a rigid transform")
+      .def(py::init<std::vector<positronic_franka::Side>, const Eigen::Matrix4d&>(), py::arg("sides"),
+           py::arg("base_pose") = Eigen::Matrix4d::Identity().eval())
+      .def_property_readonly("sides", &positronic_franka::WorkspaceBounds::sides, "The sides, in the order of names")
+      .def_property_readonly("base_pose", &positronic_franka::WorkspaceBounds::base_pose)
+      .def_property_readonly("hash", &positronic_franka::WorkspaceBounds::hash,
+                             "16 hex digits that change with any name, kind or number of the box");
+
   py::enum_<positronic_franka::GoalStatus>(m, "GoalStatus",
       "The joint move in flight. Every set_target_joints starts one; a newer target replaces an "
       "older one, and only the move in flight has a status")
@@ -140,17 +174,47 @@ PYBIND11_MODULE(_franka, m) {
       .def_property_readonly(
           "ee_wrench",
           [](const positronic_franka::State& s) { return s.end_effector_wrench; },
-          "External wrench on stiffness frame (Fx,Fy,Fz,Mx,My,Mz)");
+          "External wrench on stiffness frame (Fx,Fy,Fz,Mx,My,Mz)")
+      .def_property_readonly(
+          "bounds_enabled",
+          [](const positronic_franka::State& s) { return s.bounds_hash.has_value(); },
+          "True when workspace bounds are set")
+      .def_property_readonly(
+          "bounds_hash",
+          [](const positronic_franka::State& s) { return s.bounds_hash; },
+          "The hash of the workspace bounds in force, or None")
+      .def_property_readonly(
+          "bindings",
+          [](const positronic_franka::State& s) { return s.guard.bindings; },
+          "Per side, and 'self' for self-collision: how many targets the guard shortened there, since the last "
+          "set_workspace_bounds or the start of the Robot")
+      .def_property_readonly(
+          "deepest",
+          [](const positronic_franka::State& s) { return s.guard.deepest; },
+          "Per side: the deepest that a bounded point went past its floor, from the measured joints, m, since the "
+          "last set_workspace_bounds or the start of the Robot. A side that no point passed has no entry")
+      .def_property_readonly(
+          "committed_target",
+          [](const positronic_franka::State& s) { return s.committed_target; },
+          "The target (7,) of the last joint move after the guard, or None before the first move");
 
   py::class_<positronic_franka::Robot>(m, "Robot")
-      .def(py::init<const std::string&, franka::RealtimeConfig, double, positronic_franka::ControlMode, double>(),
+      .def(py::init<const std::string&, franka::RealtimeConfig, double, positronic_franka::ControlMode, double,
+                    std::optional<positronic_franka::WorkspaceBounds>>(),
            py::arg("ip"),
            py::arg("realtime_config") = positronic_franka::DEFAULT_REALTIME_CONFIG,
            py::arg("relative_dynamics_factor") = positronic_franka::DEFAULT_RELATIVE_DYNAMICS_FACTOR,
            py::arg("control_mode") = positronic_franka::DEFAULT_CONTROL_MODE,
            py::arg("control_link_timeout_s") = positronic_franka::DEFAULT_CONTROL_LINK_TIMEOUT_S,
+           py::arg("workspace_bounds") = py::none(),
            "control_link_timeout_s: a running control loop with no robot state for this long, in seconds, is "
-           "stuck: state() reports an error, goal() aborts the move, and a stop raises RuntimeError. Default 10 s")
+           "stuck: state() reports an error, goal() aborts the move, and a stop raises RuntimeError. Default 10 s. "
+           "workspace_bounds: the WorkspaceBounds at the start, or None, the default, for no bounds")
+      .def("set_workspace_bounds", &positronic_franka::Robot::set_workspace_bounds, py::arg("bounds"),
+           "Set the WorkspaceBounds, or None for no bounds, and start a new guard report in the state. Only at "
+           "rest: raises RuntimeError while a move is in flight or the arm moves")
+      .def_property_readonly("workspace_bounds", &positronic_franka::Robot::workspace_bounds,
+                             "The WorkspaceBounds in force, or None")
       .def("set_control_mode", &positronic_franka::Robot::set_control_mode,
            py::arg("mode"),
            "Apply a control mode (InternalImpedance | SoftwareImpedance): an equal mode is a no-op; a "

@@ -24,8 +24,11 @@ namespace {
 using positronic_franka::GoalStatus;
 using positronic_franka::InternalImpedance;
 using positronic_franka::Robot;
+using positronic_franka::Side;
+using positronic_franka::SideKind;
 using positronic_franka::SoftwareImpedance;
 using positronic_franka::Vector7d;
+using positronic_franka::WorkspaceBounds;
 using Clock = std::chrono::steady_clock;
 using std::chrono::milliseconds;
 
@@ -66,6 +69,11 @@ Vector7d offset_on_joint_1(const Vector7d& q, double rad) {
 }
 
 bool contains(const std::string& text, const std::string& part) { return text.find(part) != std::string::npos; }
+
+// The state can lag the goal by one tick, so wait for the arm to get there.
+bool arm_comes_to(Robot& robot, const Vector7d& q) {
+  return wait_until([&] { return (robot.state().q - q).cwiseAbs().maxCoeff() < 1e-9; });
+}
 
 void the_default_control_link_timeout_is_10_s() {
   check(positronic_franka::DEFAULT_CONTROL_LINK_TIMEOUT_S == 10.0, "the default timeout is 10 s");
@@ -182,6 +190,63 @@ void a_repeated_target_after_arrival_is_reached_again() {
   robot.stop();
 }
 
+WorkspaceBounds a_desk(double offset = 0.02) {
+  return WorkspaceBounds({{"desk", SideKind::SURFACE, Eigen::Vector3d::UnitZ(), offset, 0.006, -0.005}});
+}
+
+// Unconfigured, the guard reports nothing and passes each target as it is.
+void with_no_bounds_the_state_reports_no_guard_and_the_target_as_commanded() {
+  Robot robot = make_robot();
+  const auto before = robot.state();
+  check(!robot.workspace_bounds() && !before.bounds_hash, "a new Robot has bounds");
+  check(before.guard.bindings.empty() && before.guard.deepest.empty(), "a new Robot reports a guard");
+  check(!before.committed_target, "a new Robot reports a committed target");
+  const Vector7d target = offset_on_joint_1(current_q(robot), 0.3);
+  robot.set_target_joints(target);
+  check(wait_until([&] { return robot.goal().status == GoalStatus::REACHED; }), "the move is reached");
+  check(arm_comes_to(robot, target), "the arm does not come to the target");
+  const auto after = robot.state();
+  check(after.committed_target && *after.committed_target == target, "the committed target is not the target");
+  check(after.guard.bindings.empty() && !after.bounds_hash, "the guard reports a binding");
+  robot.stop();
+}
+
+void bounds_given_at_the_start_are_in_force() {
+  link().reset();
+  Robot robot("fake", franka::RealtimeConfig::kIgnore, 1.0, InternalImpedance{}, TIMEOUT_S, a_desk());
+  check(robot.state().bounds_hash == a_desk().hash(), "the state does not report the bounds of the start");
+  check(robot.workspace_bounds() && robot.workspace_bounds()->hash() == a_desk().hash(), "the bounds are not kept");
+}
+
+void bounds_change_at_rest_and_go_with_none() {
+  Robot robot = make_robot();
+  robot.set_workspace_bounds(a_desk());
+  check(robot.state().bounds_hash == a_desk().hash(), "the bounds are not set before the first move");
+  robot.set_target_joints(offset_on_joint_1(current_q(robot), 0.3));
+  check(wait_until([&] { return robot.goal().status == GoalStatus::REACHED; }), "the move is reached");
+  check(wait_until([&] { return robot.state().dq.cwiseAbs().maxCoeff() == 0.0; }), "the arm comes to rest");
+  robot.set_workspace_bounds(a_desk(0.03));
+  check(robot.state().bounds_hash == a_desk(0.03).hash(), "the bounds are not set at rest in a running loop");
+  robot.set_workspace_bounds(std::nullopt);
+  check(!robot.state().bounds_hash && !robot.workspace_bounds(), "None does not remove the bounds");
+  robot.stop();
+}
+
+void a_bounds_change_during_a_move_is_refused() {
+  Robot robot = make_robot();
+  robot.set_workspace_bounds(a_desk());
+  robot.set_target_joints(offset_on_joint_1(current_q(robot), 1.0));
+  bool raised = false;
+  try {
+    robot.set_workspace_bounds(std::nullopt);
+  } catch (const std::runtime_error& e) {
+    raised = contains(e.what(), "only at rest");
+  }
+  check(raised, "a change during a move is taken");
+  check(robot.state().bounds_hash == a_desk().hash(), "a refused change changed the bounds");
+  robot.stop();
+}
+
 // Moves joint 1 under software impedance with the tool point capped at `max_tool_point_speed` m/s, and returns
 // the joint 1 reference speed, rad/s, over the first 200 ms or more.
 double joint_1_reference_speed_under_tool_point_cap(double max_tool_point_speed) {
@@ -272,6 +337,11 @@ int main() {
       {"the_fake_fr3_kinematics_give_the_fr3_flange_and_its_zero_jacobian",
        the_fake_fr3_kinematics_give_the_fr3_flange_and_its_zero_jacobian},
       {"a_reset_gives_the_fake_its_constant_jacobian_again", a_reset_gives_the_fake_its_constant_jacobian_again},
+      {"with_no_bounds_the_state_reports_no_guard_and_the_target_as_commanded",
+       with_no_bounds_the_state_reports_no_guard_and_the_target_as_commanded},
+      {"bounds_given_at_the_start_are_in_force", bounds_given_at_the_start_are_in_force},
+      {"bounds_change_at_rest_and_go_with_none", bounds_change_at_rest_and_go_with_none},
+      {"a_bounds_change_during_a_move_is_refused", a_bounds_change_during_a_move_is_refused},
       {"the_tool_point_cap_slows_a_reference_that_would_move_the_tool_faster",
        the_tool_point_cap_slows_a_reference_that_would_move_the_tool_faster},
       {"a_tool_point_cap_above_the_joint_cap_leaves_the_joint_cap_in_charge",

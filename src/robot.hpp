@@ -29,6 +29,7 @@
 #include "impedance_law.hpp"
 #include "pose_ik.hpp"
 #include "trajectory_generator.hpp"
+#include "workspace_bounds.hpp"
 
 namespace positronic_franka {
 
@@ -234,6 +235,12 @@ struct State {
   std::string error_message;
   // External wrench (force, torque) on end-effector frame expressed in K frame.
   Vector6d end_effector_wrench = Vector6d::Zero();
+  // The hash of the workspace bounds in force; empty when no bounds are set.
+  std::optional<std::string> bounds_hash;
+  // What the guard did since the last set_workspace_bounds, or since the start of the Robot.
+  GuardReport guard;
+  // The target of the last joint move, after the guard. Empty before the first move.
+  std::optional<Vector7d> committed_target;
 };
 
 class Robot {
@@ -242,11 +249,13 @@ class Robot {
                  franka::RealtimeConfig realtime_config = DEFAULT_REALTIME_CONFIG,
                  double relative_dynamics_factor = DEFAULT_RELATIVE_DYNAMICS_FACTOR,
                  ControlMode control_mode = DEFAULT_CONTROL_MODE,
-                 double control_link_timeout_s = DEFAULT_CONTROL_LINK_TIMEOUT_S)
+                 double control_link_timeout_s = DEFAULT_CONTROL_LINK_TIMEOUT_S,
+                 std::optional<WorkspaceBounds> workspace_bounds = std::nullopt)
       : loop_watch_(control_link_timeout_(control_link_timeout_s)),
         control_link_lost_(control_link_lost_message_(control_link_timeout_s)),
         robot_(std::make_unique<franka::Robot>(ip, realtime_config)),
-        relative_dynamics_factor_(std::clamp(relative_dynamics_factor, 0.0001, 1.0)) {
+        relative_dynamics_factor_(std::clamp(relative_dynamics_factor, 0.0001, 1.0)),
+        workspace_bounds_(std::move(workspace_bounds)) {
     model_ = std::make_unique<franka::Model>(robot_->loadModel());
     // Force-apply: the equality guard in set_control_mode must not skip pushing k_theta when the
     // requested mode happens to equal the default — the robot may persist stiffness from past sessions.
@@ -287,6 +296,12 @@ class Robot {
     }
     // NOTE: This relies on the fact that we don't configure EE_T_K frame.
     st.end_effector_wrench = Eigen::Map<const Vector6d>(rs.K_F_ext_hat_K.data());
+    {
+      std::lock_guard<std::mutex> lk(guard_mutex_);
+      if (workspace_bounds_) st.bounds_hash = workspace_bounds_->hash();
+      st.guard = guard_report_;
+      st.committed_target = committed_target_;
+    }
     // A stuck loop serves the same cached state for good, so no robot error can appear in it.
     if (end_stuck_loop_()) {
       st.error = 1;
@@ -305,6 +320,21 @@ class Robot {
   }
 
   ControlMode control_mode() const { return control_mode_; }
+
+  // Set the workspace bounds, or remove them with nullopt, and start a new guard report. Only at rest: raises
+  // std::runtime_error while a move is in flight or the arm moves.
+  void set_workspace_bounds(const std::optional<WorkspaceBounds>& bounds) {
+    if (!at_rest_())
+      throw std::runtime_error("workspace bounds change only at rest: a move is in flight or the arm moves");
+    std::lock_guard<std::mutex> lk(guard_mutex_);
+    workspace_bounds_ = bounds;
+    guard_report_ = GuardReport{};
+  }
+
+  std::optional<WorkspaceBounds> workspace_bounds() {
+    std::lock_guard<std::mutex> lk(guard_mutex_);
+    return workspace_bounds_;
+  }
 
   // The move in flight, read without blocking.
   Goal goal() {
@@ -402,6 +432,10 @@ class Robot {
       // immediately before the publish below is enough. If it dies in the window,
       // `finish_control_thread_` aborts this goal with the loop's own reason.
       goal_id = arm_goal_();
+    }
+    {
+      std::lock_guard<std::mutex> lk(guard_mutex_);
+      committed_target_ = q_target;
     }
     {
       std::lock_guard<std::mutex> lk(target_mutex_);
@@ -924,6 +958,17 @@ private:
  private:
   franka::RobotState read_robot_state_() { return read_state_snapshot_().first; }
 
+  // No move in flight, and a running loop measures every joint slower than SETTLE_VELOCITY_TOLERANCE.
+  bool at_rest_() {
+    {
+      std::lock_guard<std::mutex> lk(goal_mutex_);
+      if (goal_status_ == GoalStatus::IN_FLIGHT) return false;
+    }
+    if (!control_running_.load()) return true;
+    const franka::RobotState rs = read_robot_state_();
+    return Eigen::Map<const Vector7d>(rs.dq.data()).cwiseAbs().maxCoeff() < SETTLE_VELOCITY_TOLERANCE;
+  }
+
   // Returns whether the running loop is stuck. A stuck loop's move is aborted, so the loop must brake
   // if it ever ticks again: the caller acts as if the move ended.
   bool end_stuck_loop_() {
@@ -992,6 +1037,12 @@ private:
   std::uint64_t target_goal_id_ = 0;
   // The deadline the pending target was commanded with, in seconds; taken by the loop with it.
   double target_deadline_s_ = 0.0;
+  // The guard: the workspace bounds, what it did, and the target it let through. Written only at rest or by the
+  // caller of set_target_joints.
+  std::mutex guard_mutex_;
+  std::optional<WorkspaceBounds> workspace_bounds_;
+  GuardReport guard_report_;
+  std::optional<Vector7d> committed_target_;
   // A gains-only SoftwareImpedance change, picked up by the running torque loop mid-session.
   SoftwareImpedance new_gains_;
   std::atomic<bool> has_new_gains_{false};

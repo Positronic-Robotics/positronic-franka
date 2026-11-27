@@ -85,6 +85,21 @@ jobs:
           g++ -std=c++17 -pthread -Wall -Wextra -Werror -I src tests/test_control_loop_watch.cpp -o test_control_loop_watch
           ./test_control_loop_watch
 
+  workspace-bounds:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Eigen
+        run: sudo apt-get update && sudo apt-get install -y libeigen3-dev
+
+      # The workspace box needs only Eigen, so this test runs without libfranka.
+      - name: Run the workspace bounds tests
+        run: |
+          g++ -std=c++17 -Wall -Wextra -Werror -I src -isystem /usr/include/eigen3 \
+            tests/test_workspace_bounds.cpp -o test_workspace_bounds
+          ./test_workspace_bounds
+
   robot-control-link:
     runs-on: ubuntu-latest
     steps:
