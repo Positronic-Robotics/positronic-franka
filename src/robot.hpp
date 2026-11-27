@@ -652,8 +652,8 @@ private:
           }
           if (plan_to_check) {
             checked_target = *plan_to_check;
-            if (const std::optional<PlanPass> pass = plan_check.start(*guard.target, traj))
-              brake_before_a_floor_(pass->side, traj, guard.version, goal_in_flight, checked_target);
+            brake_at_a_pass_(plan_check.start(*guard.target, traj), guard, plan_check, traj, goal_in_flight,
+                             checked_target);
           }
           if (guard.target && !stopping)
             step_the_plan_check_(guard, traj, plan_check, slowed_by, goal_in_flight, checked_target);
@@ -1106,13 +1106,18 @@ private:
         return;
       }
       if (planned && traj.plan_number() != plan) {
-        if (const std::optional<PlanPass> pass = plan_check.start(*guard.target, traj))
-          brake_before_a_floor_(pass->side, traj, guard.version, goal, target);
+        brake_at_a_pass_(plan_check.start(*guard.target, traj), guard, plan_check, traj, goal, target);
         return;
       }
     }
     if (!plan_check.pending(traj)) return;
-    const std::optional<PlanPass> pass = plan_check.step(*guard.target, traj);
+    brake_at_a_pass_(plan_check.step(*guard.target, traj), guard, plan_check, traj, goal, target);
+  }
+
+  // Brakes the position loop at a pass that the plan check found. At the rest of a brake from a later point, it brakes
+  // only when a brake now comes to rest above each floor.
+  void brake_at_a_pass_(const std::optional<PlanPass>& pass, const LoopGuard& guard, const PlanCheck& plan_check,
+                        TrajectoryGenerator& traj, std::uint64_t goal, const Vector7d& target) {
     if (pass && (!pass->at_brake_rest || plan_check.brake_now_rests_inside(*guard.target, traj)))
       brake_before_a_floor_(pass->side, traj, guard.version, goal, target);
   }

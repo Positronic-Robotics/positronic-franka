@@ -19,8 +19,8 @@
 
 namespace positronic_franka {
 
-// The position loop checks a plan at points this far apart in time: PLAN_CHECK_SAMPLES of them when the plan starts,
-// then one more at each tick, so the check stays ahead of the arm.
+// The position loop checks a plan at points this far apart in time, and the brakes from them: PLAN_CHECK_SAMPLES of
+// each when the plan starts, then one more of each at each tick, so the check stays ahead of the arm.
 constexpr double PLAN_CHECK_SPACING_S = 0.01;
 constexpr int PLAN_CHECK_SAMPLES = 16;
 
@@ -37,7 +37,7 @@ struct PlanPass {
 // less, less the path tolerance.
 class PlanCheck {
  public:
-  // Starts the check of the plan that `traj` plays now, from where it is, and checks its first points.
+  // Starts the check of the plan that `traj` plays now, from where it is, and checks its first points and brakes.
   std::optional<PlanPass> start(const shared_kinematics::Guard& guard, const TrajectoryGenerator& traj) {
     plan_ = traj.plan_number();
     next_point_ = traj.elapsed();
@@ -46,6 +46,8 @@ class PlanCheck {
     std::optional<PlanPass> pass;
     for (int i = 0; i < PLAN_CHECK_SAMPLES && !pass && next_point_ < traj.duration(); ++i)
       pass = check_next_point_(guard, traj);
+    for (int i = 0; i < PLAN_CHECK_SAMPLES && !pass && next_brake_ < traj.duration(); ++i)
+      pass = check_next_brake_(guard, traj);
     return pass;
   }
 
@@ -61,12 +63,7 @@ class PlanCheck {
     if (next_point_ < traj.duration())
       if (std::optional<PlanPass> pass = check_next_point_(guard, traj)) return pass;
     if (next_brake_ >= traj.duration()) return std::nullopt;
-    next_brake_ = std::min(next_brake_ + PLAN_CHECK_SPACING_S, traj.duration());
-    const std::optional<std::array<double, 7>> rest = traj.rest_after_brake_at(next_brake_);
-    if (!rest) return PlanPass{nearest_floor_(guard, distances_at_(guard, traj.position_at(next_brake_))), false};
-    if (std::optional<std::string> side = floor_passed_(guard, distances_at_(guard, *rest)))
-      return PlanPass{*side, true};
-    return std::nullopt;
+    return check_next_brake_(guard, traj);
   }
 
   // Whether a brake from where the plan is now comes to rest above each floor.
@@ -76,6 +73,16 @@ class PlanCheck {
   }
 
  private:
+  // Checks the rest of a brake from the next point after the brake last checked, and not before where the plan is now.
+  std::optional<PlanPass> check_next_brake_(const shared_kinematics::Guard& guard, const TrajectoryGenerator& traj) {
+    next_brake_ = std::min(std::max(next_brake_, traj.elapsed()) + PLAN_CHECK_SPACING_S, traj.duration());
+    const std::optional<std::array<double, 7>> rest = traj.rest_after_brake_at(next_brake_);
+    if (!rest) return PlanPass{nearest_floor_(guard, distances_at_(guard, traj.position_at(next_brake_))), false};
+    if (std::optional<std::string> side = floor_passed_(guard, distances_at_(guard, *rest)))
+      return PlanPass{*side, true};
+    return std::nullopt;
+  }
+
   std::optional<PlanPass> check_next_point_(const shared_kinematics::Guard& guard, const TrajectoryGenerator& traj) {
     next_point_ = std::min(next_point_ + PLAN_CHECK_SPACING_S, traj.duration());
     if (std::optional<std::string> side = floor_passed_(guard, distances_at_(guard, traj.position_at(next_point_))))
