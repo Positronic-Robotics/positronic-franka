@@ -409,20 +409,27 @@ Vector7d leaning_forward(const Vector7d& start) {
   return q;
 }
 
-// The least, over the moves from `from` to 1000 points of the way to `to`, of a part's distance past its clip floor
-// at a side: its floor, or its distance at `from` when that is less.
-double least_to_floor_on_the_move(const WorkspaceBounds& bounds, const Vector7d& from, const Vector7d& to) {
+// The least, over `poses`, of a part's distance past its clip floor at a side: its floor, or its distance at `from`
+// when that is less.
+double least_to_floor_at(const WorkspaceBounds& bounds, const Vector7d& from, const std::vector<Vector7d>& poses) {
   shared_kinematics::ArmModel model = fr3_with_gripper();
   model.self.pairs.clear();
   const shared_kinematics::Guard guard(model, bounds.sides());
   const auto at_from = guard.distances(from).planes;
   double least = std::numeric_limits<double>::infinity();
-  for (int i = 0; i <= 1000; ++i) {
-    const auto rows = guard.distances(from + i / 1000.0 * (to - from)).planes;
+  for (const Vector7d& q : poses) {
+    const auto rows = guard.distances(q).planes;
     for (std::size_t k = 0; k < rows.size(); ++k)
       least = std::min(least, rows[k].distance - std::min(rows[k].floor, at_from[k].distance));
   }
   return least;
+}
+
+// least_to_floor_at() over the move from `from` to 1000 points of the way to `to`.
+double least_to_floor_on_the_move(const WorkspaceBounds& bounds, const Vector7d& from, const Vector7d& to) {
+  std::vector<Vector7d> poses;
+  for (int i = 0; i <= 1000; ++i) poses.push_back(from + i / 1000.0 * (to - from));
+  return least_to_floor_at(bounds, from, poses);
 }
 
 void a_joint_target_past_a_side_stops_at_the_side_and_the_move_ends_bounded() {
@@ -485,24 +492,27 @@ void after_a_box_change_no_tick_counts_at_a_side_of_the_old_box() {
 }
 
 // A caller that streams a new target at each tick toward the front wall still gets the velocity steps, and the arm
-// stays inside the floors.
+// stays inside the floors at each tick.
 void a_target_at_each_tick_still_slows_near_a_side() {
   Robot robot = make_bounded_robot(a_front_wall(), InternalImpedance{}, false, 10.0);
   const Vector7d start = current_q(robot);
   robot.set_target_joints(start);
   check(wait_until([&] { return robot.goal().status == GoalStatus::REACHED; }), "the hold at the start does not end");
   const Vector7d far = leaning_forward(start);
+  std::vector<Vector7d> visited;
   link().tick_by_hand();
   for (int i = 1; i <= 1500; ++i) {
     robot.set_target_joints(start + std::min(1.0, i / 300.0) * (far - start));
     link().tick(1);
+    visited.push_back(robot.state().q);
   }
   const auto st = robot.state();
   link().tick_freely();
   check(st.guard.slowed_ticks.count("front") && st.guard.slowed_ticks.at("front") > 0,
         "the streamed plans do not slow at the wall");
-  check(least_to_floor_on_the_move(a_front_wall(), start, st.q) >= -positronic_franka::IK_SELF_COLLISION_PATH_TOLERANCE,
-        "the arm passes its floor at the wall");
+  check(least_to_floor_at(a_front_wall(), start, visited) >= -positronic_franka::IK_SELF_COLLISION_PATH_TOLERANCE,
+        "the arm passes its floor at the wall at a tick");
+  check(least_to_floor_on_the_move(a_front_wall(), start, far) < -0.01, "the streamed targets do not go past the wall");
   robot.stop();
 }
 
