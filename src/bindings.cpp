@@ -116,7 +116,10 @@ PYBIND11_MODULE(_franka, m) {
              "The arm settled at the target — within tolerance and no longer moving")
       .value("ABORTED", positronic_franka::GoalStatus::ABORTED,
              "Stopped short — reflex, rejected plan, lost connection, expired deadline; see "
-             "Goal.reason. The arm may still be braking when this appears");
+             "Goal.reason. The arm may still be braking when this appears")
+      .value("BOUNDED", positronic_franka::GoalStatus::BOUNDED,
+             "The arm settled at the committed target (State.committed_target), which the guard shortened from "
+             "the commanded target; State.bindings names where");
 
   py::class_<positronic_franka::Goal>(m, "Goal")
       // Constructible so tests can stand one in; only the driver produces a real one.
@@ -200,16 +203,21 @@ PYBIND11_MODULE(_franka, m) {
 
   py::class_<positronic_franka::Robot>(m, "Robot")
       .def(py::init<const std::string&, franka::RealtimeConfig, double, positronic_franka::ControlMode, double,
-                    std::optional<positronic_franka::WorkspaceBounds>>(),
+                    std::optional<positronic_franka::WorkspaceBounds>, bool>(),
            py::arg("ip"),
            py::arg("realtime_config") = positronic_franka::DEFAULT_REALTIME_CONFIG,
            py::arg("relative_dynamics_factor") = positronic_franka::DEFAULT_RELATIVE_DYNAMICS_FACTOR,
            py::arg("control_mode") = positronic_franka::DEFAULT_CONTROL_MODE,
            py::arg("control_link_timeout_s") = positronic_franka::DEFAULT_CONTROL_LINK_TIMEOUT_S,
            py::arg("workspace_bounds") = py::none(),
+           py::arg("clip_joint_targets_self_collision") = false,
            "control_link_timeout_s: a running control loop with no robot state for this long, in seconds, is "
            "stuck: state() reports an error, goal() aborts the move, and a stop raises RuntimeError. Default 10 s. "
-           "workspace_bounds: the WorkspaceBounds at the start, or None, the default, for no bounds")
+           "workspace_bounds: the WorkspaceBounds at the start, or None, the default, for no bounds. "
+           "clip_joint_targets_self_collision: stop each joint move of set_target_joints before two arm links come "
+           "closer than 0.09 m, or closer than at the start of the move when that is less, as "
+           "inverse_kinematics_with_limits does; such a move ends BOUNDED. False, the default, passes each joint "
+           "target as it is")
       .def("set_workspace_bounds", &positronic_franka::Robot::set_workspace_bounds, py::arg("bounds"),
            "Set the WorkspaceBounds, or None for no bounds, and start a new guard report in the state. Only at "
            "rest: raises RuntimeError while a move is in flight or the arm moves")
@@ -287,7 +295,8 @@ PYBIND11_MODULE(_franka, m) {
           "1 mm; returns q (7,)")
       .def("set_target_joints", &positronic_franka::Robot::set_target_joints,
            py::arg("q_target"), py::arg("deadline_s") = positronic_franka::DEFAULT_MOVE_DEADLINE_S,
-           "Command a joint move to target (7,) and return immediately; poll goal() for the outcome. "
+           "Command a joint move to target (7,) and return immediately; poll goal() for the outcome. The guard "
+           "can shorten the target: state().committed_target is the target that the arm moves to. "
            "Never blocks — waiting inside the library would stop the caller's own loop from clearing "
            "robot errors, so a reflex mid-move would never be cleared. deadline_s bounds the move: "
            "the goal ABORTS if the arm has not settled by then; pass your own where reach, gains or "

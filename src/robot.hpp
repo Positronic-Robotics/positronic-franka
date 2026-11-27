@@ -210,6 +210,8 @@ enum class GoalStatus {
   // `Goal::reason` says which. The arm may still be braking when this appears; read `state()` if
   // that matters.
   ABORTED,
+  // The arm settled at the committed target, which the guard shortened from the commanded target.
+  BOUNDED,
 };
 
 struct Goal {
@@ -250,11 +252,13 @@ class Robot {
                  double relative_dynamics_factor = DEFAULT_RELATIVE_DYNAMICS_FACTOR,
                  ControlMode control_mode = DEFAULT_CONTROL_MODE,
                  double control_link_timeout_s = DEFAULT_CONTROL_LINK_TIMEOUT_S,
-                 std::optional<WorkspaceBounds> workspace_bounds = std::nullopt)
+                 std::optional<WorkspaceBounds> workspace_bounds = std::nullopt,
+                 bool clip_joint_targets_self_collision = false)
       : loop_watch_(control_link_timeout_(control_link_timeout_s)),
         control_link_lost_(control_link_lost_message_(control_link_timeout_s)),
         robot_(std::make_unique<franka::Robot>(ip, realtime_config)),
         relative_dynamics_factor_(std::clamp(relative_dynamics_factor, 0.0001, 1.0)),
+        clip_joint_targets_self_collision_(clip_joint_targets_self_collision),
         workspace_bounds_(std::move(workspace_bounds)) {
     model_ = std::make_unique<franka::Model>(robot_->loadModel());
     // Force-apply: the equality guard in set_control_mode must not skip pushing k_theta when the
@@ -344,7 +348,7 @@ class Robot {
     return Goal{goal_status_, goal_error_};
   }
 
-  // Command a joint move and return immediately. Poll `goal()` for IN_FLIGHT / REACHED / ABORTED.
+  // Command a joint move and return immediately. Poll `goal()` for IN_FLIGHT / REACHED / BOUNDED / ABORTED.
   //
   // Starts the control loop if it is not running, then publishes the target to it. Both control
   // modes report the same way; how the arm gets there is the mode's business.
@@ -363,6 +367,8 @@ class Robot {
     if (!std::isfinite(deadline_s) || deadline_s <= 0.0) {
       throw std::invalid_argument("deadline_s must be finite and strictly positive");
     }
+    const GuardedTarget guarded = guard_target_(q_target);
+    const bool bounded = !guarded.bound.empty();
     std::uint64_t goal_id = 0;
     if (!control_running_.load()) {
       if (control_thread_.joinable()) {
@@ -371,7 +377,7 @@ class Robot {
       // Arm between the join and the launch, so exactly one loop can settle this goal. Later, and a
       // loop dying before the goal exists leaves it armed on a dead thread, IN_FLIGHT forever.
       // Earlier, and the outgoing loop can abort the move its successor is about to run.
-      goal_id = arm_goal_();
+      goal_id = arm_goal_(bounded);
       // Starting a loop issues a Move command, which the robot refuses while it holds an error
       // ("command not possible in the current mode"), so the fresh thread would die on its first
       // tick. Report the robot's own error instead. Clearing is the caller's call: a reflex means
@@ -431,15 +437,16 @@ class Robot {
       // Loop already running (every move after the first): no join to order against, so arming
       // immediately before the publish below is enough. If it dies in the window,
       // `finish_control_thread_` aborts this goal with the loop's own reason.
-      goal_id = arm_goal_();
+      goal_id = arm_goal_(bounded);
     }
     {
       std::lock_guard<std::mutex> lk(guard_mutex_);
-      committed_target_ = q_target;
+      committed_target_ = guarded.q;
+      for (const std::string& key : guarded.bound) guard_report_.count_binding(key);
     }
     {
       std::lock_guard<std::mutex> lk(target_mutex_);
-      target_q_ = q_target;
+      target_q_ = guarded.q;
       target_goal_id_ = goal_id;
       // Carried with the target, so a later call cannot retroactively change this move's deadline.
       target_deadline_s_ = deadline_s;
@@ -776,11 +783,12 @@ private:
   }
 
   // Arm a move and return the id that names it, so an outcome from whatever ran before can be told
-  // apart from the move now in flight.
-  std::uint64_t arm_goal_() {
+  // apart from the move now in flight. A `bounded` move settles BOUNDED where it would settle REACHED.
+  std::uint64_t arm_goal_(bool bounded) {
     std::lock_guard<std::mutex> lk(goal_mutex_);
     goal_status_ = GoalStatus::IN_FLIGHT;
     goal_error_.clear();
+    goal_bounded_ = bounded;
     return ++goal_id_;
   }
 
@@ -790,7 +798,7 @@ private:
   void settle_goal_(std::uint64_t id, GoalStatus status, std::string reason = {}) {
     std::lock_guard<std::mutex> lk(goal_mutex_);
     if (goal_status_ != GoalStatus::IN_FLIGHT || goal_id_ != id) return;
-    goal_status_ = status;
+    goal_status_ = status == GoalStatus::REACHED && goal_bounded_ ? GoalStatus::BOUNDED : status;
     goal_error_ = std::move(reason);
   }
 
@@ -958,6 +966,30 @@ private:
  private:
   franka::RobotState read_robot_state_() { return read_state_snapshot_().first; }
 
+  struct GuardedTarget {
+    Vector7d q;
+    // The sides, and SELF_COLLISION_KEY, at which the guard shortened the target.
+    std::vector<std::string> bound;
+  };
+
+  // The target that the guard lets through: with the self-collision clip, the joint move from the reference stops
+  // before a checked pair of links comes closer than its floor (stop_before_self_collision).
+  GuardedTarget guard_target_(const Vector7d& q_target) {
+    if (!clip_joint_targets_self_collision_) return {q_target, {}};
+    const Vector7d q = stop_before_self_collision(reference_now_(), q_target);
+    if (q == q_target) return {q_target, {}};
+    return {q, {SELF_COLLISION_KEY}};
+  }
+
+  // The joints that the control loop moves from: the torque loop's reference, or the position loop's last command.
+  // With no loop, the joints that the next loop starts from.
+  Vector7d reference_now_() {
+    const auto [rs, software_ref] = read_state_snapshot_();
+    if (software_ref) return *software_ref;
+    if (std::holds_alternative<SoftwareImpedance>(control_mode_)) return Eigen::Map<const Vector7d>(rs.q.data());
+    return Eigen::Map<const Vector7d>(rs.q_d.data());
+  }
+
   // No move in flight, and a running loop measures every joint slower than SETTLE_VELOCITY_TOLERANCE.
   bool at_rest_() {
     {
@@ -1019,6 +1051,8 @@ private:
   std::string goal_error_;
   // Names the move `goal_status_` describes. Ids start at 1; 0 names no move.
   std::uint64_t goal_id_ = 0;
+  // The guard shortened the target of that move.
+  bool goal_bounded_ = false;
 
   std::mutex last_state_mutex_;
   std::unique_ptr<franka::RobotState> last_state_;
@@ -1037,6 +1071,8 @@ private:
   std::uint64_t target_goal_id_ = 0;
   // The deadline the pending target was commanded with, in seconds; taken by the loop with it.
   double target_deadline_s_ = 0.0;
+  // Clip each joint target at the self-collision floor of stop_before_self_collision.
+  const bool clip_joint_targets_self_collision_;
   // The guard: the workspace bounds, what it did, and the target it let through. Written only at rest or by the
   // caller of set_target_joints.
   std::mutex guard_mutex_;

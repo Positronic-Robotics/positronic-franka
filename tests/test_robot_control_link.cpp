@@ -247,6 +247,88 @@ void a_bounds_change_during_a_move_is_refused() {
   robot.stop();
 }
 
+// An FR3 posture with the shoulder back and the elbow folded: link 5 is 5.1 cm from link 2. The straight joint move
+// to it from the fake's start passes 0.09 m at 87 % of the way.
+Vector7d shoulder_back_elbow_folded() {
+  Vector7d q;
+  q << 0.98877418, -1.15661502, -0.96312511, -2.93868756, -0.990777671, 2.05664039, 1.14565432;
+  return q;
+}
+
+double least_clearance(const Vector7d& q) {
+  double least = std::numeric_limits<double>::infinity();
+  for (const auto& pair : positronic_franka::self_collision_clearances(q)) least = std::min(least, pair.clearance);
+  return least;
+}
+
+double least_clearance_on_the_move(const Vector7d& from, const Vector7d& to) {
+  double least = least_clearance(from);
+  for (int i = 1; i <= 1000; ++i) least = std::min(least, least_clearance(from + i / 1000.0 * (to - from)));
+  return least;
+}
+
+Robot make_clipping_robot(const positronic_franka::ControlMode& mode = InternalImpedance{}) {
+  link().reset();
+  return Robot("fake", franka::RealtimeConfig::kIgnore, 1.0, mode, TIMEOUT_S, std::nullopt,
+               /*clip_joint_targets_self_collision=*/true);
+}
+
+// Unconfigured, a joint target is not checked for self-collision.
+void with_no_clip_a_joint_target_into_the_arm_is_reached_as_commanded() {
+  Robot robot = make_robot();
+  const Vector7d target = shoulder_back_elbow_folded();
+  robot.set_target_joints(target);
+  check(wait_until([&] { return robot.goal().status != GoalStatus::IN_FLIGHT; }), "the move ends");
+  check(robot.goal().status == GoalStatus::REACHED, "the move is not reached");
+  check(arm_comes_to(robot, target), "the arm does not come to the target");
+  const auto st = robot.state();
+  check(*st.committed_target == target, "the committed target is not the target");
+  check(st.guard.bindings.empty(), "the guard reports a binding");
+  robot.stop();
+}
+
+void the_clip_stops_a_joint_target_at_the_self_collision_floor_and_the_move_ends_bounded() {
+  Robot robot = make_clipping_robot();
+  const Vector7d start = current_q(robot), target = shoulder_back_elbow_folded();
+  robot.set_target_joints(target);
+  check(wait_until([&] { return robot.goal().status != GoalStatus::IN_FLIGHT; }), "the move ends");
+  const auto goal = robot.goal();
+  check(goal.status == GoalStatus::BOUNDED, "the shortened move does not end BOUNDED: " + goal.reason);
+  const auto st = robot.state();
+  const Vector7d committed = *st.committed_target;
+  const double part = (committed - start).norm() / (target - start).norm();
+  check(part > 0.8 && part < 0.9, "the committed target is at " + std::to_string(part) + " of the move, not 0.87");
+  check(least_clearance_on_the_move(start, committed) >= positronic_franka::IK_SELF_COLLISION_CLEARANCE -
+                                                             positronic_franka::IK_SELF_COLLISION_PATH_TOLERANCE,
+        "the committed move takes two links closer than the floor");
+  check(arm_comes_to(robot, committed), "the arm does not come to the committed target");
+  check(st.guard.bindings.size() == 1 && st.guard.bindings.at("self") == 1, "the binding is not counted at 'self'");
+  robot.stop();
+}
+
+void a_clear_joint_target_under_the_clip_is_reached() {
+  Robot robot = make_clipping_robot();
+  const Vector7d target = offset_on_joint_1(current_q(robot), 0.3);
+  robot.set_target_joints(target);
+  check(wait_until([&] { return robot.goal().status != GoalStatus::IN_FLIGHT; }), "the move ends");
+  check(robot.goal().status == GoalStatus::REACHED, "a clear move does not end REACHED");
+  const auto st = robot.state();
+  check(*st.committed_target == target && st.guard.bindings.empty(), "the clip changed a clear target");
+  robot.stop();
+}
+
+// The torque loop's reference moves from where it is, so the clip starts there and the reference ends at the
+// committed target.
+void under_software_impedance_the_reference_stops_at_the_committed_target() {
+  Robot robot = make_clipping_robot(SoftwareImpedance{});
+  robot.set_target_joints(shoulder_back_elbow_folded());
+  const Vector7d committed = *robot.state().committed_target;
+  check(committed != shoulder_back_elbow_folded(), "the clip let the target through");
+  check(wait_until([&] { return robot.state().q_d == committed; }),
+        "the reference stops short of the committed target");
+  robot.stop();
+}
+
 // Moves joint 1 under software impedance with the tool point capped at `max_tool_point_speed` m/s, and returns
 // the joint 1 reference speed, rad/s, over the first 200 ms or more.
 double joint_1_reference_speed_under_tool_point_cap(double max_tool_point_speed) {
@@ -342,6 +424,13 @@ int main() {
       {"bounds_given_at_the_start_are_in_force", bounds_given_at_the_start_are_in_force},
       {"bounds_change_at_rest_and_go_with_none", bounds_change_at_rest_and_go_with_none},
       {"a_bounds_change_during_a_move_is_refused", a_bounds_change_during_a_move_is_refused},
+      {"with_no_clip_a_joint_target_into_the_arm_is_reached_as_commanded",
+       with_no_clip_a_joint_target_into_the_arm_is_reached_as_commanded},
+      {"the_clip_stops_a_joint_target_at_the_self_collision_floor_and_the_move_ends_bounded",
+       the_clip_stops_a_joint_target_at_the_self_collision_floor_and_the_move_ends_bounded},
+      {"a_clear_joint_target_under_the_clip_is_reached", a_clear_joint_target_under_the_clip_is_reached},
+      {"under_software_impedance_the_reference_stops_at_the_committed_target",
+       under_software_impedance_the_reference_stops_at_the_committed_target},
       {"the_tool_point_cap_slows_a_reference_that_would_move_the_tool_faster",
        the_tool_point_cap_slows_a_reference_that_would_move_the_tool_faster},
       {"a_tool_point_cap_above_the_joint_cap_leaves_the_joint_cap_in_charge",
