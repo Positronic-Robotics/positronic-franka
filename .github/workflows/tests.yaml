@@ -45,10 +45,14 @@ jobs:
       - name: Install Eigen
         run: sudo apt-get update && sudo apt-get install -y libeigen3-dev
 
+      # The pose IK and the robot run on the shared kinematics core, at the commit in shared_kinematics.ref.
+      - name: Fetch the shared kinematics core
+        run: .github/scripts/fetch-shared-kinematics.sh
+
       # The pose IK takes the kinematics as an argument, so this test runs on FR3 kinematics without libfranka.
       - name: Run the pose IK tests
         run: |
-          g++ -std=c++17 -Wall -Wextra -Werror -I src -isystem /usr/include/eigen3 \
+          g++ -std=c++17 -Wall -Wextra -Werror -I src -I shared-kinematics/include -isystem /usr/include/eigen3 \
             tests/test_pose_ik.cpp -o test_pose_ik
           ./test_pose_ik
 
@@ -110,13 +114,19 @@ jobs:
       - name: Install Eigen
         run: sudo apt-get update && sudo apt-get install -y libeigen3-dev
 
-      # Robot runs on the fake libfranka in tests/fake_franka, so this test needs Eigen and the vendored Ruckig only.
+      # The pose IK and the robot run on the shared kinematics core, at the commit in shared_kinematics.ref.
+      - name: Fetch the shared kinematics core
+        run: .github/scripts/fetch-shared-kinematics.sh
+
+      # Robot runs on the fake libfranka in tests/fake_franka, so this test needs Eigen, the vendored Ruckig and the
+      # shared kinematics core only.
       - name: Run the robot control link tests
         run: |
           for f in $(ls external/ruckig/src/ruckig/*.cpp | grep -v -e cloud_client -e python); do
             g++ -std=c++20 -O2 -I external/ruckig/include -c "$f" -o "$(basename "$f" .cpp).o"
           done
-          g++ -std=c++20 -pthread -Wall -Wextra -Werror -I tests/fake_franka -I src -I external/ruckig/include \
+          g++ -std=c++20 -pthread -Wall -Wextra -Werror -I tests/fake_franka -I src -I shared-kinematics/include \
+            -I external/ruckig/include \
             -isystem /usr/include/eigen3 \
             tests/test_robot_control_link.cpp *.o -o test_robot_control_link
           ./test_robot_control_link

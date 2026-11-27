@@ -14,6 +14,17 @@ add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/external/pybind11)
 find_package(Franka CONFIG REQUIRED)
 find_package(Eigen3 CONFIG REQUIRED)
 
+# The shared kinematics core, at the commit in shared_kinematics.ref. A local checkout replaces it:
+#   -DFETCHCONTENT_SOURCE_DIR_SHARED_KINEMATICS=/path/to/shared-kinematics
+include(FetchContent)
+file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/shared_kinematics.ref" SHARED_KINEMATICS_REF LIMIT_COUNT 1)
+set(SHARED_KINEMATICS_PYTHON OFF CACHE BOOL "" FORCE)
+set(SHARED_KINEMATICS_TESTS OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(shared_kinematics
+  GIT_REPOSITORY https://github.com/Positronic-Robotics/shared-kinematics.git
+  GIT_TAG ${SHARED_KINEMATICS_REF})
+FetchContent_MakeAvailable(shared_kinematics)
+
 set(BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(BUILD_PYTHON_MODULE OFF CACHE BOOL "" FORCE)
@@ -40,7 +51,7 @@ pybind11_add_module(_franka
 target_include_directories(_franka PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
-target_link_libraries(_franka PRIVATE Franka::Franka Eigen3::Eigen ruckig::ruckig)
+target_link_libraries(_franka PRIVATE Franka::Franka Eigen3::Eigen ruckig::ruckig shared_kinematics::shared_kinematics)
 
 add_executable(ik_verifier
     tests/ik_verifier.cpp
@@ -49,7 +60,7 @@ add_executable(ik_verifier
 target_include_directories(ik_verifier PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
-target_link_libraries(ik_verifier PRIVATE Franka::Franka Eigen3::Eigen ruckig::ruckig)
+target_link_libraries(ik_verifier PRIVATE Franka::Franka Eigen3::Eigen ruckig::ruckig shared_kinematics::shared_kinematics)
 
 install(TARGETS _franka
         LIBRARY DESTINATION "positronic_franka"
