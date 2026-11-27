@@ -459,6 +459,7 @@ class Robot {
     {
       std::lock_guard<std::mutex> lk(target_mutex_);
       target_q_ = guarded.q;
+      target_from_ = guarded.from;
       target_goal_id_ = goal_id;
       // Carried with the target, so a later call cannot retroactively change this move's deadline.
       target_deadline_s_ = deadline_s;
@@ -610,7 +611,7 @@ private:
           loop_watch_.tick();
           refresh_loop_guard_(guard);
           traj.set_phase_synchronization(static_cast<bool>(guard.target));
-          if (guard.box) record_deepest_(*guard.box, Eigen::Map<const Vector7d>(st.q.data()));
+          record_deepest_(guard, Eigen::Map<const Vector7d>(st.q.data()));
 
           if (first) {
             traj.start_at_rest(st.q_d);
@@ -645,10 +646,10 @@ private:
           if (plan_to_check) {
             checked_target = *plan_to_check;
             if (const auto side = plan_check.start(*guard.target, traj))
-              brake_before_a_floor_(*side, traj, goal_in_flight, checked_target);
+              brake_before_a_floor_(*side, traj, guard.version, goal_in_flight, checked_target);
           } else if (guard.target && plan_check.pending(traj)) {
             if (const auto side = plan_check.step(*guard.target, traj))
-              brake_before_a_floor_(*side, traj, goal_in_flight, checked_target);
+              brake_before_a_floor_(*side, traj, guard.version, goal_in_flight, checked_target);
           }
 
           auto pos = traj.step(period.toSec());
@@ -715,7 +716,8 @@ private:
          stop_ticks = 0,
          ref = Vector7d(Vector7d::Zero()),
          target = Vector7d(Vector7d::Zero()),
-         guard = LoopGuard{}](const franka::RobotState& st, franka::Duration period) mutable -> franka::Torques {
+         guard = LoopGuard{},
+         line_check = LineCheck{}](const franka::RobotState& st, franka::Duration period) mutable -> franka::Torques {
           const Vector7d q = Eigen::Map<const Vector7d>(st.q.data());
           const Vector7d dq = Eigen::Map<const Vector7d>(st.dq.data());
 
@@ -728,14 +730,27 @@ private:
             ref = target = q;
           }
 
+          refresh_loop_guard_(guard);
+          std::optional<Vector7d> checked_from;
           if (!stopping && has_target_.load()) {
             std::lock_guard<std::mutex> lk(target_mutex_);
             target = target_q_;
+            checked_from = target_from_;
             goal_in_flight = std::exchange(target_goal_id_, 0);
             elapsed_s = 0.0;
             deadline_s = std::exchange(target_deadline_s_, 0.0);
             has_target_.store(false);
+            line_check = LineCheck{};
+          } else if (stopping) {
+            line_check = LineCheck{};
           }
+          // The guard checked the move from where the reference was then. From where it is now, check its self pairs
+          // again.
+          if (checked_from && guard.target && *checked_from != ref && !guard.target->model().self.pairs.empty())
+            line_check.start(*guard.target, ref, target);
+          if (guard.target && line_check.pending() && line_check.step(*guard.target, PLAN_CHECK_SAMPLES))
+            target = end_the_torque_move_short_(SELF_COLLISION_KEY, line_check.checked_point(), guard.version,
+                                                goal_in_flight, target);
 
           if (has_new_gains_.load()) {
             std::lock_guard<std::mutex> lk(target_mutex_);
@@ -751,8 +766,7 @@ private:
             has_new_gains_.store(false);
           }
 
-          refresh_loop_guard_(guard);
-          if (guard.box) record_deepest_(*guard.box, q);
+          record_deepest_(guard, q);
 
           // No trajectory here: the impedance law moves the arm. The speed cap on q_d keeps a large jump in the
           // target from becoming a large spring pull, at any command rate.
@@ -763,8 +777,8 @@ private:
                                               period.toSec());
           }
           if (guard.box && next_ref != ref)
-            next_ref = slow_near_the_box_(*guard.box, ref, next_ref, target, period.toSec());
-          ref = next_ref;
+            next_ref = slow_near_the_box_(*guard.box, guard.version, ref, next_ref, target, period.toSec());
+          ref = line_check.within_checked(next_ref);
 
           // The position loop's arrival rule: there is no arrival to test while the reference still moves.
           if (goal_in_flight != 0) {
@@ -774,7 +788,10 @@ private:
               goal_in_flight = 0;
               // As above: hold position rather than keep pulling toward a target already reported
               // as not reached.
-              if (outcome == Arrival::Stalled) ref = target = q;
+              if (outcome == Arrival::Stalled) {
+                ref = target = q;
+                line_check = LineCheck{};
+              }
             }
           }
 
@@ -1005,17 +1022,20 @@ private:
     Vector7d q;
     // The sides, and SELF_COLLISION_KEY, at which the guard shortened the target.
     std::vector<std::string> bound;
+    // The reference that the guard checked the move from; empty with no guard.
+    std::optional<Vector7d> from;
   };
 
   // The target that the guard lets through: the clip of the joint move from the reference at the sides of the box,
   // and at the self-collision floor when the self-collision clip is on.
   GuardedTarget guard_target_(const Vector7d& q_target) {
     const std::shared_ptr<const sk::Guard> guard = guards_snapshot_().target;
-    if (!guard) return {q_target, {}};
-    const sk::ClipResult clip = guard->clip(reference_now_(), q_target);
+    if (!guard) return {q_target, {}, std::nullopt};
+    const Vector7d from = reference_now_();
+    const sk::ClipResult clip = guard->clip(from, q_target);
     const Vector7d q = clip.q;
-    if (q == q_target) return {q_target, {}};
-    GuardedTarget out{q, clip.bound_sides};
+    if (q == q_target) return {q_target, {}, from};
+    GuardedTarget out{q, clip.bound_sides, from};
     if (clip.self_bound) out.bound.push_back(SELF_COLLISION_KEY);
     return out;
   }
@@ -1031,6 +1051,7 @@ private:
     std::shared_ptr<const sk::Guard> box;
     // The guard that clips each joint target on the straight joint line from the reference; empty when none does.
     std::shared_ptr<const sk::Guard> target;
+    // The generation of these guards. The loop writes to the guard report only while it is the generation in force.
     std::uint64_t version = 0;
   };
 
@@ -1043,11 +1064,26 @@ private:
     guard.version = guards_version_.load();
   }
 
+  // Ends the torque-loop move to `target` at `stop`, the last point before a bounded part passes its floor at `side`, or
+  // two links come closer than the clearance at SELF_COLLISION_KEY. The goal ends BOUNDED, and the committed target
+  // becomes `stop`. Returns `stop`.
+  Vector7d end_the_torque_move_short_(const std::string& side, const Vector7d& stop, std::uint64_t version,
+                                      std::uint64_t goal, const Vector7d& target) {
+    {
+      std::lock_guard<std::mutex> lk(goal_mutex_);
+      if (goal_id_ == goal && goal_status_ == GoalStatus::IN_FLIGHT) goal_bounded_ = true;
+    }
+    std::lock_guard<std::mutex> lk(guard_mutex_);
+    if (guards_version_.load() == version) guard_report_.count_binding(side);
+    if (committed_target_ == target) committed_target_ = stop;
+    return stop;
+  }
+
   // Brakes the position loop, whose plan to `target` takes a bounded part past its floor at `side`, or two links closer
   // than the clearance at SELF_COLLISION_KEY. The goal ends BOUNDED, and the committed target becomes the point where
   // the brake stops. A refused brake stops the loop with an error.
-  void brake_before_a_floor_(const std::string& side, TrajectoryGenerator& traj, std::uint64_t goal,
-                             const Vector7d& target) {
+  void brake_before_a_floor_(const std::string& side, TrajectoryGenerator& traj, std::uint64_t version,
+                             std::uint64_t goal, const Vector7d& target) {
     if (!traj.brake_to_rest())
       throw std::runtime_error("the trajectory planner refused the brake before side " + side);
     {
@@ -1056,28 +1092,30 @@ private:
     }
     const std::array<double, 7> stop = traj.position_at(traj.duration());
     std::lock_guard<std::mutex> lk(guard_mutex_);
-    guard_report_.count_binding(side);
+    if (guards_version_.load() == version) guard_report_.count_binding(side);
     if (committed_target_ == target) committed_target_ = Eigen::Map<const Vector7d>(stop.data());
   }
 
   // Keeps, per side, the deepest pass of a bounded part past its floor at the measured joints.
-  void record_deepest_(const sk::Guard& box, const Vector7d& q) {
-    const sk::Distances rows = box.distances(q);
+  void record_deepest_(const LoopGuard& guard, const Vector7d& q) {
+    if (!guard.box) return;
+    const sk::Distances rows = guard.box->distances(q);
     std::lock_guard<std::mutex> lk(guard_mutex_);
+    if (guards_version_.load() != guard.version) return;
     for (const sk::PlaneDistance& row : rows.planes) guard_report_.record_depth(row.side, row.floor - row.distance);
   }
 
   // The step of the reference from `ref` to `next`, times the speed scale of the box. It keeps its direction. Near a
   // floor the scale falls toward 0, so within BOX_HOLD_TOLERANCE of the target, which the clip checked, the reference
   // takes the target when the caps let `next` reach it.
-  Vector7d slow_near_the_box_(const sk::Guard& box, const Vector7d& ref, const Vector7d& next, const Vector7d& target,
-                              double dt) {
+  Vector7d slow_near_the_box_(const sk::Guard& box, std::uint64_t version, const Vector7d& ref, const Vector7d& next,
+                              const Vector7d& target, double dt) {
     if (!(dt > 0.0)) return next;
     const sk::ScaleResult scale = box.speed_scale(ref, next - ref, dt);
     if (!(scale.s < 1.0)) return next;
     {
       std::lock_guard<std::mutex> lk(guard_mutex_);
-      if (scale.slowest) guard_report_.count_slowed(*scale.slowest);
+      if (scale.slowest && guards_version_.load() == version) guard_report_.count_slowed(*scale.slowest);
     }
     const Vector7d slowed = ref + scale.s * (next - ref);
     return next == target && (target - slowed).cwiseAbs().maxCoeff() <= BOX_HOLD_TOLERANCE ? target : slowed;
@@ -1167,6 +1205,8 @@ private:
   ControlMode control_mode_;
   std::mutex target_mutex_;
   Vector7d target_q_ = Vector7d::Zero();
+  // The reference that the guard checked the move to `target_q_` from; empty with no guard.
+  std::optional<Vector7d> target_from_;
   // The move `target_q_` belongs to, handed to the loop in the same critical section as the target;
   // 0 for a streamed target, which has none.
   std::uint64_t target_goal_id_ = 0;

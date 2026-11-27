@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -66,6 +67,67 @@ class PlanCheck {
   std::uint64_t plan_ = 0;
   double next_ = 0.0;
   shared_kinematics::Distances start_;
+};
+
+// The check of a straight joint move against the self pairs of a guard, as the clip checks them: at points close
+// enough that a pair falls at most the path tolerance below its floor between two of them, and at least the least
+// samples of the guard. The torque loop checks PLAN_CHECK_SAMPLES points at each tick, and moves its reference only on
+// the checked part of the move. The speed scale of the box keeps the reference off the sides.
+class LineCheck {
+ public:
+  // Starts the check of the move from `from` to `to`.
+  void start(const shared_kinematics::Guard& guard, const Vector7d& from, const Vector7d& to) {
+    from_ = from;
+    to_ = to;
+    const double change = guard.self_rate_bounds().dot((to - from).cwiseAbs());
+    samples_ = std::max(guard.params().least_samples,
+                        static_cast<int>(std::ceil(change / (2 * guard.params().path_tolerance))));
+    checked_ = 0;
+    end_ = samples_;
+    start_ = guard.distances(from).pairs;
+  }
+
+  // Whether points of the move are left to check.
+  bool pending() const { return checked_ < end_; }
+
+  // Checks the next points of the move, up to `count`. Returns whether a point brings two links closer than the
+  // clearance, or than at the start when that is less; the move then ends at the point before it.
+  bool step(const shared_kinematics::Guard& guard, int count) {
+    const double clearance = guard.model().self.clearance;
+    for (int i = 0; i < count && pending(); ++i) {
+      const std::vector<shared_kinematics::PairDistance> pairs = guard.distances(point_(checked_ + 1)).pairs;
+      for (std::size_t k = 0; k < pairs.size(); ++k)
+        if (pairs[k].clearance < std::min(clearance, start_[k].clearance)) {
+          end_ = checked_;
+          return true;
+        }
+      ++checked_;
+    }
+    return false;
+  }
+
+  // The last point of the move that the check let through.
+  Vector7d checked_point() const { return point_(checked_); }
+
+  // `next`, a point of the move, kept on its checked part. Any point with no check started.
+  Vector7d within_checked(const Vector7d& next) const {
+    if (samples_ == 0) return next;
+    const Vector7d move = to_ - from_;
+    const double squared = move.squaredNorm();
+    if (!(squared > 0.0)) return next;
+    const double along = (next - from_).dot(move) / squared;
+    return along * samples_ > checked_ ? checked_point() : next;
+  }
+
+ private:
+  Vector7d point_(int i) const { return i >= samples_ ? to_ : Vector7d(from_ + (to_ - from_) * i / samples_); }
+
+  Vector7d from_ = Vector7d::Zero();
+  Vector7d to_ = Vector7d::Zero();
+  int samples_ = 0;
+  int checked_ = 0;
+  int end_ = 0;
+  std::vector<shared_kinematics::PairDistance> start_;
 };
 
 }  // namespace positronic_franka

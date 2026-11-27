@@ -348,6 +348,29 @@ void the_clip_stops_a_joint_target_at_the_self_collision_floor_and_the_move_ends
   robot.stop();
 }
 
+// A hand pushes the arm between the read that the clip starts from and the start of the torque loop. The loop checks
+// the self pairs of the move again from its own reference, which ends at the committed target above the floor.
+void under_software_impedance_a_move_from_a_reference_that_moved_since_the_clip_is_checked_again() {
+  Robot robot = make_clipping_robot(SoftwareImpedance{});
+  const Vector7d start = current_q(robot);
+  link().drift_on_read({0.05, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0});
+  robot.set_target_joints(shoulder_back_elbow_folded());
+  link().drift_on_read({});
+  std::vector<Vector7d> refs;
+  check(wait_until([&] {
+          const auto st = robot.state();
+          refs.push_back(st.q_d);
+          return st.q_d == *st.committed_target;
+        }, milliseconds(60000)),
+        "the reference does not come to the committed target");
+  check(std::abs(robot.state().q(0) - start(0) - 0.1) < 1e-12, "the hand does not push the arm by two reads");
+  for (std::size_t i = 1; i < refs.size(); ++i)
+    check(least_clearance_on_the_move(refs[i - 1], refs[i]) >= positronic_franka::IK_SELF_COLLISION_CLEARANCE -
+                                                                  positronic_franka::IK_SELF_COLLISION_PATH_TOLERANCE,
+          "the reference takes two links closer than the floor");
+  robot.stop();
+}
+
 void a_clear_joint_target_under_the_clip_is_reached() {
   Robot robot = make_clipping_robot();
   const Vector7d target = offset_on_joint_1(current_q(robot), 0.3);
@@ -676,6 +699,8 @@ int main() {
        with_no_clip_a_joint_target_into_the_arm_is_reached_as_commanded},
       {"the_clip_stops_a_joint_target_at_the_self_collision_floor_and_the_move_ends_bounded",
        the_clip_stops_a_joint_target_at_the_self_collision_floor_and_the_move_ends_bounded},
+      {"under_software_impedance_a_move_from_a_reference_that_moved_since_the_clip_is_checked_again",
+       under_software_impedance_a_move_from_a_reference_that_moved_since_the_clip_is_checked_again},
       {"a_clear_joint_target_under_the_clip_is_reached", a_clear_joint_target_under_the_clip_is_reached},
       {"under_software_impedance_the_reference_stops_at_the_committed_target",
        under_software_impedance_the_reference_stops_at_the_committed_target},

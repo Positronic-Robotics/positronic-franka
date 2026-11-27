@@ -147,6 +147,7 @@ class Link {
     kinematics_setting().store(Kinematics::kConstant);
     state_ = RobotState{};
     paused_ = false;
+    drift_ = {};
     control_returns_ = 0;
   }
   // The kinematics of the model, until the next reset. With kFr3, O_T_EE follows q.
@@ -159,6 +160,19 @@ class Link {
   void guide(const std::array<double, 7>& dq) {
     std::lock_guard<std::mutex> lk(mutex_);
     state_.dq = dq;
+  }
+  // From now on each readOnce moves the joints by `step` after it reads them, as a hand that pushes the arm between two
+  // reads does, until the next reset.
+  void drift_on_read(const std::array<double, 7>& step) {
+    std::lock_guard<std::mutex> lk(mutex_);
+    drift_ = step;
+  }
+  RobotState read_once() {
+    std::lock_guard<std::mutex> lk(mutex_);
+    const RobotState read = state_;
+    for (size_t i = 0; i < 7; ++i) state_.q[i] += drift_[i];
+    follow_kinematics_();
+    return read;
   }
   void pause() {
     std::lock_guard<std::mutex> lk(mutex_);
@@ -221,6 +235,7 @@ class Link {
   std::condition_variable cv_;
   RobotState state_;
   bool paused_ = false;
+  std::array<double, 7> drift_{};
   int control_returns_ = 0;
 };
 
@@ -235,7 +250,7 @@ class Robot {
  public:
   Robot(const std::string&, RealtimeConfig) {}
   Model loadModel() { return Model{}; }
-  RobotState readOnce() { return fake::link().state(); }
+  RobotState readOnce() { return fake::link().read_once(); }
   void control(std::function<JointPositions(const RobotState&, Duration)> callback) {
     fake::link().run<JointPositions>(callback);
   }

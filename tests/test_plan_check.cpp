@@ -48,6 +48,14 @@ Vector7d leaning_forward() {
   return q;
 }
 
+// The move from the start to here brings two links closer than the clearance.
+Vector7d into_the_arm() {
+  Vector7d q;
+  q << 0.085685566353384424, -0.38185236011868895, -0.56080959107845052, -3.0, -0.014548021326547866,
+      1.4355515400008243, 0.86063895399797863;
+  return q;
+}
+
 // A front wall `x` ahead of the base.
 WorkspaceBounds a_front_wall(double x) {
   return WorkspaceBounds({{"front", SideKind::kSurface, -Eigen::Vector3d::UnitX(), x, 0.0, -0.005}});
@@ -199,9 +207,8 @@ void a_pass_between_the_points_of_a_long_plan_is_found() {
 // A retarget during a fast move gets a plan that leaves the joint line that the clip checked. With the self pairs in
 // the guard, the check finds the plan where it brings two links closer than the clearance.
 void a_retarget_plan_that_brings_two_links_too_close_is_found() {
-  Vector7d first, second;
-  first << 0.085685566353384424, -0.38185236011868895, -0.56080959107845052, -3.0, -0.014548021326547866,
-      1.4355515400008243, 0.86063895399797863;
+  const Vector7d first = into_the_arm();
+  Vector7d second;
   second << 0.82167226687014905, -0.62046024570859526, -0.46798736401990615, -1.9897270822297473, 0.45099503027404242,
       0.63539928011235092, 1.334850696122557;
   const sk::Guard& self = positronic_franka::fr3_self_guard();
@@ -260,6 +267,50 @@ void the_check_of_a_long_plan_reads_its_first_points_then_one_point_a_tick() {
   check(!plan_check.pending(braked), "the check of the old plan goes on after the brake");
 }
 
+// The least clearance of a self pair over the straight move from `from` to `to`, less the clearance.
+double least_above_the_clearance(const sk::Guard& self, const Vector7d& from, const Vector7d& to) {
+  double least = std::numeric_limits<double>::infinity();
+  for (int i = 0; i <= 1000; ++i)
+    for (const auto& pair : self.distances(from + i / 1000.0 * (to - from)).pairs)
+      least = std::min(least, pair.clearance - self.model().self.clearance);
+  return least;
+}
+
+// The check of a move into the arm ends it at its last point above the clearance, a few points a tick, and keeps a
+// point further on to that point.
+void the_check_of_a_move_into_the_arm_ends_it_before_the_clearance() {
+  const sk::Guard& self = positronic_franka::fr3_self_guard();
+  const double tolerance = positronic_franka::fr3_guard_params().path_tolerance;
+  check(least_above_the_clearance(self, start_q(), into_the_arm()) < -0.01, "the move does not go into the arm");
+  positronic_franka::LineCheck line;
+  line.start(self, start_q(), into_the_arm());
+  check(line.within_checked(into_the_arm()) == start_q(), "an unchecked point is let through");
+  bool found = false;
+  int ticks = 0;
+  while (!found && line.pending()) {
+    found = line.step(self, positronic_franka::PLAN_CHECK_SAMPLES);
+    ++ticks;
+  }
+  check(found && !line.pending(), "the move into the arm is not found");
+  check(ticks > 1, "the check reads the whole move in one tick");
+  const Vector7d stop = line.checked_point();
+  check(least_above_the_clearance(self, start_q(), stop) >= -tolerance, "the move to the stop goes into the arm");
+  check(line.within_checked(into_the_arm()) == stop, "a point past the stop is not kept to the stop");
+  const Vector7d halfway = start_q() + 0.5 * (stop - start_q());
+  check(line.within_checked(halfway) == halfway, "a checked point is moved");
+}
+
+void the_check_of_a_clear_move_reaches_its_target() {
+  const sk::Guard& self = positronic_franka::fr3_self_guard();
+  positronic_franka::LineCheck line;
+  line.start(self, start_q(), leaning_forward());
+  while (line.pending()) check(!line.step(self, positronic_franka::PLAN_CHECK_SAMPLES), "a clear move is reported");
+  check(line.checked_point() == leaning_forward() && line.within_checked(leaning_forward()) == leaning_forward(),
+        "the checked move does not reach its target");
+  check(positronic_franka::LineCheck{}.within_checked(leaning_forward()) == leaning_forward(),
+        "with no check, a point is moved");
+}
+
 }  // namespace
 
 int main() {
@@ -280,6 +331,9 @@ int main() {
       {"a_brake_reports_that_it_is_planned", a_brake_reports_that_it_is_planned},
       {"the_check_of_a_long_plan_reads_its_first_points_then_one_point_a_tick",
        the_check_of_a_long_plan_reads_its_first_points_then_one_point_a_tick},
+      {"the_check_of_a_move_into_the_arm_ends_it_before_the_clearance",
+       the_check_of_a_move_into_the_arm_ends_it_before_the_clearance},
+      {"the_check_of_a_clear_move_reaches_its_target", the_check_of_a_clear_move_reaches_its_target},
   };
   int failed = 0;
   for (const auto& [name, test] : tests) {
